@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Project-specific ignores
+data/
+out/
+demos/clips/
+demos/reel/
+*.npz
+*.tmp
+.DS_Store
+
+# Model weights (downloaded on first run)
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+
+# Misc
+.pytest_cache/
+.ipynb_checkpoints/
+*.log
+.idea/
+.vscode/

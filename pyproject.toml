@@ -1,0 +1,47 @@
+[project]
+name = "protectorai"
+version = "0.1.0"
+description = "Computer vision pipeline for school safety threat detection"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "av>=17.0.1",
+    "gradio>=6.15.0",
+    "huggingface-hub>=1.16.4",
+    "lap>=0.5.13",
+    "numpy>=2.4.6",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "shapely>=2.1.2",
+    "timm>=1.0.27",
+    "torch>=2.12.0",
+    "torchaudio>=2.11.0",
+    "torchvision>=0.27.0",
+    "tqdm>=4.67.3",
+    "transformers>=5.9.0",
+    "ultralytics>=8.4.56",
+]
+
+[dependency-groups]
+dev = [
+    "openpyxl>=3.1.5",
+    "pytest>=9.0.3",
+    "ruff>=0.15.14",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[project.scripts]
+protectorai = "cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

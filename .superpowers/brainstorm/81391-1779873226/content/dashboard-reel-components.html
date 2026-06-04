@@ -1,0 +1,94 @@
+<h2>Design Section 2: Exact Demo Components</h2>
+<p class="subtitle">Build one shared investor story across the dashboard and the pre-rendered reel.</p>
+
+<div class="section">
+  <div class="label">Dashboard: Scenario Review Console</div>
+  <div class="mockup">
+    <div class="mockup-header">First tab becomes the investor-ready control surface</div>
+    <div class="mockup-body">
+      <div style="display:grid;grid-template-columns:1fr 360px;gap:16px">
+        <div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <strong>ProtectorAI Scenario Review</strong>
+            <span style="font-size:12px;color:#22c55e">Local MVP · Replay Mode</span>
+          </div>
+          <div class="placeholder" style="height:260px;margin-bottom:12px">Annotated video replay</div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+            <button class="mock-button">All Clear</button>
+            <button class="mock-button">Zone Breach</button>
+            <button class="mock-button">Violence</button>
+            <button class="mock-button">Fire/Smoke</button>
+          </div>
+        </div>
+        <div>
+          <div class="placeholder" style="height:72px;margin-bottom:10px">Verdict: All clear / Incident</div>
+          <div class="placeholder" style="height:112px;margin-bottom:10px">Evidence timeline</div>
+          <div class="placeholder" style="height:94px;margin-bottom:10px">Detection details from JSON</div>
+          <div class="placeholder" style="height:92px">Telegram preview · Demo mode</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="label">Reel: Product-Led Proof</div>
+  <div class="options" data-multiselect>
+    <div class="option" data-choice="scene-1" onclick="toggleSelect(this)">
+      <div class="letter">1</div>
+      <div class="content">
+        <h3>Dashboard Opening</h3>
+        <p>Show the console first: replay mode, modules available, incident queue empty.</p>
+      </div>
+    </div>
+    <div class="option" data-choice="scene-2" onclick="toggleSelect(this)">
+      <div class="letter">2</div>
+      <div class="content">
+        <h3>All Clear Proof</h3>
+        <p>Play calm monitoring with skeletons/zones and a visible “0 incidents” verdict.</p>
+      </div>
+    </div>
+    <div class="option" data-choice="scene-3" onclick="toggleSelect(this)">
+      <div class="letter">3</div>
+      <div class="content">
+        <h3>Restricted Zone</h3>
+        <p>Show zone breach or loitering, then evidence timeline and alert preview.</p>
+      </div>
+    </div>
+    <div class="option" data-choice="scene-4" onclick="toggleSelect(this)">
+      <div class="letter">4</div>
+      <div class="content">
+        <h3>High-Confidence Threats</h3>
+        <p>Use institutional violence footage and fire/smoke, with concise proof cards between them.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="label">Implementation Shape</div>
+  <div class="split">
+    <div class="mockup">
+      <div class="mockup-header">New demo data layer</div>
+      <div class="mockup-body">
+        <ul>
+          <li>Curated scenario metadata in the manifest or a small helper module.</li>
+          <li>Scenario ids map to annotated MP4 + JSON event log.</li>
+          <li>Derived summaries: verdict, incident count, confidence, first event time.</li>
+          <li>Generated Telegram preview message from the selected scenario.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="mockup">
+      <div class="mockup-header">No overclaiming</div>
+      <div class="mockup-body">
+        <ul>
+          <li>Dashboard says “Replay Mode,” not “live deployment.”</li>
+          <li>Telegram panel says “Demo preview,” not “sent.”</li>
+          <li>Weapon detection stays out of investor reel unless a clean clip exists.</li>
+          <li>Generated reel avoids repeated zone incident spam.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>

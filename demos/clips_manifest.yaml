@@ -1,0 +1,73 @@
+clips:
+  - id: benign_hug
+    clip: clips/benign_hug_pexels.mp4
+    category: benign_contact
+    expected_modules: []
+    title: "Без ложной тревоги — дружеский контакт"
+    modules: [violence, pose]
+    zones: []
+
+  - id: weapon_gun
+    clip: clips/weapon_gun_youtube.mp4
+    category: weapon
+    expected_modules: [weapon]
+    title: "Оружие — выстрел у входа"
+    modules: [weapons]
+    zones: []
+
+  - id: weapon_knife
+    clip: clips/weapon_knife_youtube.mp4
+    category: weapon
+    expected_modules: [weapon]
+    title: "Оружие — нож в общественном пространстве"
+    modules: [weapons]
+    zones: []
+
+  - id: fire_detection
+    clip: clips/fire_youtube.mp4
+    category: fire_smoke
+    expected_modules: [fire_smoke]
+    title: "Дым / огонь — камера в здании"
+    modules: [fire_smoke]
+    zones: []
+
+  - id: fight_institution
+    clip: clips/fight_institution.mp4
+    category: violence
+    expected_modules: [violence]
+    title: "Агрессия — институциональная камера"
+    modules: [violence, pose]
+    zones: []
+
+  - id: calm_monitoring
+    clip: clips/nonfight_001.mp4
+    category: benign_monitoring
+    expected_modules: []
+    title: "Без инцидентов — спокойный коридор"
+    include_in_reel: false
+    modules: [pose]
+    zones: []
+
+  - id: fight_hallway
+    clip: clips/fight_hallway.mp4
+    category: violence
+    expected_modules: [violence]
+    title: "Агрессия — дополнительный пример"
+    include_in_reel: false
+    modules: [violence, pose]
+    zones: []
+
+reel:
+  output: reel/kuzet_ai_investor_reel.mp4
+  fps: 30
+  resolution: [1280, 720]
+  opening_card:
+    duration_s: 2.5
+    title: "Kuzet AI"
+    subtitle: "ИИ-видеоаналитика для безопасности школ и кампусов"
+  closing_card:
+    duration_s: 3.0
+    title: "Kuzet AI"
+    subtitle: "Оружие, агрессия и дым / огонь.\nСдержанная детекция без лишних тревог."
+    contact: "baknurtaizhanov@gmail.com"
+  inter_clip_duration_s: 0.9
