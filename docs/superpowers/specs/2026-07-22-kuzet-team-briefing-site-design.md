@@ -6,13 +6,17 @@ Date: 2026-07-22
 
 Create a self-contained Russian briefing that Nurbek can send to teammates who understand basic computer science but are not specialists in computer vision, model deployment, infrastructure, or AI product delivery. The audience also includes a business teammate.
 
-The briefing must be comprehensive without reading like a tender response or engineering audit. It must let a reader answer five questions correctly after one pass:
+The briefing must explain the project and the required work, not revolve around a deadline. It must be comprehensive without reading like a tender response or engineering audit. After one pass, a reader must be able to answer these questions correctly:
 
-1. What does Kuzet AI actually have today?
-2. What can the team honestly deliver to the customer in 20 days?
-3. What is experimental, deferred, or excluded?
-4. How will 20 cameras work, what equipment is required, and why is an H100 unnecessary?
-5. What price, team, dependencies, acceptance tests, and risks should the team communicate?
+1. What problem is the customer asking Kuzet AI to solve?
+2. What are the actual functional and non-functional requirements?
+3. What does Kuzet AI already have, and what still has to be built or replaced?
+4. Which implementation workstreams make up the real project?
+5. How do the cameras, AI models, event logic, evidence, dashboard, security, and operator workflow connect?
+6. Which capabilities are straightforward, conditional on testing/licensing, or inappropriate to promise?
+7. What equipment, people, dependencies, acceptance tests, and budget are required?
+
+The 20-day period is a constraint and a planning guideline. It is not the main information architecture of the briefing. The site may show an indicative work sequence, but it must organise the project around requirements, components, deliverables, and proof of completion.
 
 ## Deliverables
 
@@ -38,43 +42,69 @@ Where older materials conflict with the approved meeting position, the site uses
 - **19.8 million KZT excluding VAT** is the fixed software/integration price for the bounded 20-day pilot.
 - **Up to 20.6 million KZT** is the indicative first-month Kazakhstan-cloud envelope.
 - **Up to 31.3 million KZT** is the indicative on-premises envelope with an L4 server allowance.
-- The 12–20-week and 6–12-month estimates describe later production hardening, broader OEM/VMS integration, certification, high availability, or the full original specification. They are not alternative prices for the same Day-20 pilot.
+- The 12–20-week and 6–12-month estimates describe later production hardening, broader OEM/VMS integration, certification, high availability, or the full original specification. They are not alternative prices for the same controlled pilot.
+
+Requirements are the primary organising unit. Each requirement must state: why it exists, current readiness, required implementation, dependencies, and how completion will be verified. Dates appear only where they explain sequencing or a contractual constraint.
 
 ## Information architecture
 
 The site has one route and a sticky section menu. It is read in this order:
 
-### 1. Главное за 2 минуты
+### 1. Проект простыми словами
 
-Lead with the decision, not the technology:
+Explain the complete operator story without jargon:
 
-- Kuzet AI today is an investor MVP, not a production VMS.
-- A controlled 20-camera pilot is feasible in 20 calendar days after Ready-to-Start.
-- The fixed core price is 19.8 million KZT excluding VAT.
-- All critical events require human confirmation.
-- Fire/smoke and weapon analytics are conditional; faces, emotions, native mobile applications, autonomous action, HA, and certification are outside Day 20.
+- twenty cameras continuously provide video streams;
+- the system checks selected frames for configured safety events;
+- a stable event is created only after temporal/rule checks;
+- the system preserves a short evidence clip and records the model/configuration used;
+- an operator reviews the event and decides whether to dismiss or escalate it;
+- the existing NVR remains responsible for continuous archive footage.
 
-Include a copyable “Что сказать на встрече” statement.
+Then state the current truth: Kuzet AI has a working investor MVP, while a reliable 20-camera platform, operator workflow, persistence, security, model governance, and field validation are the actual project to be implemented.
 
-### 2. Три разных уровня готовности
+### 2. Карта требований заказчика
 
-Visually separate:
+Group the requirements by system area rather than by day:
 
-- **Сегодня:** curated investor demo and single-camera/file processing.
-- **День 20:** bounded, human-in-the-loop pilot on the exact 20 streams.
-- **После пилота:** production hardening, certification, HA, wider integrations, face entrance subsystem, and native mobile if separately contracted.
+- camera input and stream supervision;
+- safety analytics;
+- zones, loitering, and line crossing;
+- event creation and evidence clips;
+- dashboard and operator workflow;
+- users, access control, 2FA, audit, and security;
+- notifications and external integrations;
+- storage, backup, monitoring, and recovery;
+- face/attendance/watchlist requirements;
+- reporting, mobile access, languages, support, and certification.
 
-This section prevents the team from confusing the demo with the deliverable or the deliverable with a certified production product.
+Each row uses five understandable fields: **что требуется**, **зачем это нужно**, **что есть сейчас**, **что надо сделать**, and **как проверить**. A status label identifies the requirement as straightforward, conditional, separately scoped, legally blocked, or excluded.
 
-### 3. Что входит на День 20
+### 3. Что уже есть и чего не хватает
 
-Use a three-state scope matrix:
+Show an evidence-based readiness matrix for the current repository:
 
-- **Твёрдо включено:** 20 RTSP feeds, camera health/reconnect/timestamps, dashboard/search, evidence clips, person tracking, zones/loitering/line crossing, TOTP/RBAC/TLS/audit/backup, one notification connector, operator workflow.
-- **Условно:** fire/smoke and weapon candidate alerts after commercial-rights, target-site, and capacity gates.
-- **Не входит / Этап 2:** fight/fall operational promises, face/watchlist/attendance, emotion inference, native mobile apps, autonomous calls/actions, formal certification, HA/SLA, continuous archive inside Kuzet.
+- existing: file/video processing, single webcam path, curated demo scenarios, pose/tracking concepts, weapon cascade, fire/smoke detector, violence experiments, zones, incident fusion concept, overlay, and demo audit;
+- missing or unsuitable for deployment: 20-stream supervisor, shared GPU batching, durable event database, event-time semantics, bounded evidence ring, secure dashboard, real notifications, model registry, licence register, health/metrics, backup/restore, deployment manifests, site benchmark, and soak/failure tests.
 
-### 4. Что происходит с AI-моделями
+Explain the most important technical defects in plain language: the current three-pass file cache cannot serve 20 live cameras; curated 7/7 demo results are not accuracy; current model rights are not fully documented; fire fallback must fail closed; and frame-based fusion must become timestamp-based event logic.
+
+### 4. Что именно предстоит построить
+
+This is the central section of the site. Present eight implementation workstreams. Each workstream has a plain-language purpose, concrete outputs, dependencies, and definition of done.
+
+1. **Потоки с 20 камер:** RTSP connection, hardware decoding, shared batching, timestamps, reconnect, health, and bounded queues.
+2. **Логика событий:** per-camera tracking, zones/lines/loitering, timestamp-based fusion, cooldown, deduplication, and stable event IDs.
+3. **Видеодоказательства:** encoded pre/post-event ring, 4–10 second clips, thumbnails, integrity hashes, retention, and storage limits.
+4. **AI-модели:** commercially cleared artifacts, TensorRT export, per-model cadence, candidate verification, versioning, site evaluation, and fail-closed gates.
+5. **Backend и данные:** PostgreSQL schema, event/evidence repositories, crash journal, search, filters, audit, and idempotency.
+6. **Интерфейс оператора:** camera health, event queue, evidence review, confirm/reject, notes, model/gate status, and mobile-browser layout.
+7. **Безопасность и уведомления:** TOTP, roles, TLS, secrets, signed evidence links, human-approved notification outbox, and delivery audit.
+8. **Эксплуатация и проверка:** metrics, degraded states, log rotation, backup/restore, retention, replay testing, failure injection, and acceptance reporting.
+
+The site should make clear that these workstreams can proceed in parallel, but their dependencies matter. For example, model integration cannot become operational before rights, artifact, site-quality, and capacity gates pass.
+
+### 5. Что происходит с AI-моделями
 
 For each model family, explain four fields in plain Russian:
 
@@ -85,7 +115,7 @@ For each model family, explain four fields in plain Russian:
 
 Explain that a model confidence such as 96% is not system accuracy. The site must use a short example showing the difference between confidence, precision, recall, and false alarms per camera-day.
 
-### 5. Как работают 20 камер
+### 6. Как части системы соединяются
 
 Use a simple visual flow:
 
@@ -96,7 +126,19 @@ Use a simple visual flow:
 
 Explain shared batching, 2–5 Hz analytics, hardware decoding, timestamped per-camera state, bounded queues, encoded evidence rings, and the existing NVR in accessible language. Technical detail is placed under expandable “Подробнее” panels.
 
-### 6. Сервер, облако и хранение
+Add a second diagram that maps each implementation workstream to the runtime flow and clearly distinguishes the video data plane from the web/control plane.
+
+### 7. Что система сможет делать, а что требует условий
+
+Use a capability matrix rather than a deadline-based promise:
+
+- **Можно реализовать как базовую функцию:** exact 20-stream supervision, dashboard/search, evidence, person tracking, zones/loitering/lines, roles/2FA/audit/TLS/backup, and one reviewed notification connector.
+- **Можно реализовать как candidate/shadow capability, then validate:** fire/smoke, weapon, fight, and fall. Operational status depends on model rights, site data, quality, and capacity.
+- **Separate subsystem and legal/product decision:** entrance-only face recognition, attendance, and official watchlist integration.
+- **Do not implement as a claimed reliable safety function:** emotion or intention inference.
+- **Later production work:** HA/SLA, formal security/fire certification, broad OEM/VMS compatibility, native mobile applications, and unlimited integrations.
+
+### 8. Сервер, облако и хранение
 
 Show the baseline server in one card:
 
@@ -111,7 +153,19 @@ Explain why H100 is unnecessary. Include the storage example that 20 cameras at 
 
 Compare Kazakhstan cloud, on-premises L4, and customer-provided infrastructure. Clearly label infrastructure figures as allowances, not supplier quotes.
 
-### 7. Цена и договорная граница
+### 9. Как принимаем работу
+
+Separate platform acceptance from AI quality:
+
+- exact 20 streams in a long soak test;
+- availability, queue age, reconnect time, scheduled drops, GPU/VRAM, evidence latency, and bounded disk;
+- no crash, OOM, cross-camera state leakage, silent model failure, or notification before operator confirmation;
+- per-model site matrix with positives and hard negatives;
+- each conditional module ends as operator, shadow, or disabled with reasons.
+
+Explain why “96% confidence” is not an acceptance criterion and why event-level precision, recall, missed events, false alarms per camera-day, latency, and evidence completeness are.
+
+### 10. Цена и договорная граница
 
 Present one approved price table and payment schedule:
 
@@ -125,49 +179,42 @@ Present one approved price table and payment schedule:
 
 List exclusions in plain language and state that changes after Day 12 require a change request.
 
-### 8. Программа на 20 дней
+### 11. Зависимости, риски и решения
 
-Show six understandable phases rather than a dense Gantt chart:
-
-1. Before Day 1: complete Ready-to-Start and freeze customer inputs.
-2. Days 1–2: verify the exact feeds, model rights, test matrix, and target infrastructure.
-3. Days 3–7: 20-stream platform, dashboard, security, evidence, and zones.
-4. Days 8–12: conditional analytics, notification, measurement, and scope freeze.
-5. Days 13–18: site tests, hard negatives, tuning, and the 72-hour soak.
-6. Days 19–20: restore drill, training, acceptance pack, and handover.
-
-Show the required parallel team and explain that fewer people means reducing scope or extending the date.
-
-### 9. Как принимаем работу
-
-Separate platform acceptance from AI quality:
-
-- 20 exact streams for 72 hours;
-- availability, queue age, reconnect time, scheduled drops, GPU/VRAM, evidence latency, bounded disk;
-- no crash, OOM, cross-camera state leakage, silent model failure, or notification before operator confirmation;
-- per-model site matrix with positives and hard negatives;
-- each conditional module ends as operator, shadow, or disabled with reasons.
-
-### 10. Риски и зависимости
-
-Use a short risk register with owner and mitigation:
+Use a practical requirement-to-risk register with owner and mitigation:
 
 - missing camera/network access;
-- unsuitable codec or camera view;
+- unsuitable codec, GOP, bitrate, clock, or camera view;
 - missing commercial model rights;
-- insufficient L4 capacity;
-- insufficient site test data;
+- insufficient target-GPU capacity;
+- insufficient site positives and hard negatives;
 - customer changes after scope freeze;
 - privacy/biometric risk;
-- hardware delivery risk.
+- hardware or cloud availability;
+- fewer engineers than the parallel work requires.
 
-### 11. Словарь
+For every dependency, state what work can continue, what work must pause, and what evidence closes the risk.
+
+### 12. Рекомендуемая последовательность реализации
+
+Show dependency order and parallel tracks first. Do not make dates the organising concept:
+
+1. Freeze requirements, camera matrix, legal boundaries, acceptance definitions, and model rights.
+2. Build the multistream runtime, durable event contract, evidence path, and basic control plane in parallel.
+3. Add person/zones/lines and operator review before conditional high-risk models.
+4. Integrate cleared fire/weapon models through shadow gates and capacity profiling.
+5. Add hardening, observability, backup/restore, notifications, and operator training.
+6. Run site scenarios, hard negatives, replay, failure drills, and the uninterrupted soak before handover.
+
+Include a collapsed “Как это может лечь в 20 дней” planning example, but label it as a scheduling aid rather than the definition of the project. Show the required parallel team and explain that fewer people means reducing parallel scope or extending the date.
+
+### 13. Словарь
 
 Define at least these terms using one or two sentences and an example where helpful:
 
 `RTSP`, `NVR`, `inference`, `model weight`, `confidence`, `precision`, `recall`, `false positive`, `shadow mode`, `operator mode`, `TensorRT`, `DeepStream`, `NVDEC`, `batching`, `latency`, `p95`, `RBAC`, `TOTP 2FA`, `audit log`, `Ready-to-Start`, `acceptance gate`, and `change request`.
 
-### 12. Материалы
+### 14. Материалы
 
 Provide the new accessible PDF plus the approved meeting offer and implementation plan. Label internal documents so teammates do not forward them to the customer by mistake.
 
@@ -203,7 +250,7 @@ The site has no authentication, form submission, analytics tracker, database, or
 
 ## PDF design
 
-The PDF mirrors the website's section order and terminology. It is A4, uses the same status system, includes a contents page, page numbers, source links, and a clear “Внутренний материал для команды” label. Expandable website details are represented as concise “Техническая справка” blocks.
+The PDF mirrors the website's requirement- and workstream-led section order and terminology. It is A4, uses the same status system, includes a contents page, page numbers, source links, and a clear “Внутренний материал для команды” label. Expandable website details are represented as concise “Техническая справка” blocks. The work sequence appears after requirements, architecture, implementation workstreams, and acceptance—not before them.
 
 The PDF and website use one canonical content dataset so price, scope, and status cannot diverge.
 
@@ -235,15 +282,17 @@ Before publishing:
 
 ## Success criteria
 
-A second- or third-year CS student and a business teammate should be able to read the first two sections in under five minutes and correctly explain:
+A second- or third-year CS student and a business teammate should be able to read the first sections and correctly explain:
 
-- why the current demo is not production;
-- what the 20-day pilot includes;
-- why fire/weapon are conditional;
-- why faces and emotions are excluded;
+- what the customer is asking the product to do;
+- what currently exists in the repository and what does not;
+- the eight concrete implementation workstreams;
+- how a camera frame becomes a reviewed event and evidence clip;
+- why fire/weapon require gates and why faces are a separate subsystem;
+- why emotions are excluded;
 - why one L4 is the starting point rather than an H100;
-- why the price is 19.8 million KZT plus a separate infrastructure allowance;
-- what the customer must provide before Day 1;
-- how the pilot will be accepted.
+- which requirements depend on customer access, model rights, site data, or later production work;
+- how each major subsystem will be tested and accepted;
+- why the price is 19.8 million KZT plus a separate infrastructure allowance.
 
 The full site must remain useful as an internal reference without requiring access to the original Codex conversation.
