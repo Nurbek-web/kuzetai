@@ -26,6 +26,7 @@ demos/reel/
 *.bin
 
 # Misc
+.worktrees/
 .pytest_cache/
 .ipynb_checkpoints/
 *.log
