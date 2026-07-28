@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import stat
@@ -817,20 +818,44 @@ class SourceTimeMappingError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class _SourceTimeAnchor:
+class _SourceTimeTransform:
     stream_epoch: str
-    running_time_ns: int
-    source_time: datetime
+    canonical_running_time_ns: int
+    canonical_source_time: datetime
+    validated_running_time_ns: int
+    validated_source_time: datetime
+
+
+_GST_CLOCK_TIME_NONE = 2**64 - 1
+
+
+def _require_gstreamer_running_time(value: object) -> int:
+    if type(value) is not int or not 0 <= value < _GST_CLOCK_TIME_NONE:
+        raise SourceTimeMappingError(
+            "GStreamer running time must be a non-negative integer clock value"
+        )
+    return value
 
 
 class SourceTimeMapper:
-    """Map GStreamer running time to source UTC inside one camera stream epoch."""
+    """Map one stream epoch through an immutable running-time-to-UTC transform."""
 
-    def __init__(self, *, max_delta_seconds: float = 60.0) -> None:
-        if max_delta_seconds <= 0:
+    def __init__(
+        self,
+        *,
+        max_delta_seconds: float = 60.0,
+        max_anchor_error_seconds: float = 0.250,
+    ) -> None:
+        if not math.isfinite(max_delta_seconds) or max_delta_seconds <= 0:
             raise ValueError("source-time mapping delta must be finite and positive")
+        if (
+            not math.isfinite(max_anchor_error_seconds)
+            or max_anchor_error_seconds <= 0
+        ):
+            raise ValueError("source-time anchor error must be finite and positive")
         self.max_delta_seconds = max_delta_seconds
-        self._anchors: dict[str, _SourceTimeAnchor] = {}
+        self.max_anchor_error_seconds = max_anchor_error_seconds
+        self._transforms: dict[str, _SourceTimeTransform] = {}
         self._lock = threading.RLock()
 
     def anchor(
@@ -841,21 +866,40 @@ class SourceTimeMapper:
         running_time_ns: int,
         source_time: datetime,
     ) -> None:
-        if not camera_id or not stream_epoch or running_time_ns < 0:
+        if not camera_id or not stream_epoch:
             raise SourceTimeMappingError("invalid source-time anchor")
+        running_time_ns = _require_gstreamer_running_time(running_time_ns)
         source_time = _require_utc(source_time, field="source_time")
         with self._lock:
-            current = self._anchors.get(camera_id)
-            if (
-                current is not None
-                and current.stream_epoch == stream_epoch
-                and running_time_ns < current.running_time_ns
-            ):
+            current = self._transforms.get(camera_id)
+            if current is None or current.stream_epoch != stream_epoch:
+                self._transforms[camera_id] = _SourceTimeTransform(
+                    stream_epoch=stream_epoch,
+                    canonical_running_time_ns=running_time_ns,
+                    canonical_source_time=source_time,
+                    validated_running_time_ns=running_time_ns,
+                    validated_source_time=source_time,
+                )
+                return
+            if running_time_ns < current.validated_running_time_ns:
                 raise SourceTimeMappingError("running time regressed within a stream epoch")
-            self._anchors[camera_id] = _SourceTimeAnchor(
+            predicted_source_time = current.canonical_source_time + timedelta(
+                seconds=(
+                    running_time_ns - current.canonical_running_time_ns
+                )
+                / 1_000_000_000
+            )
+            anchor_error = abs((source_time - predicted_source_time).total_seconds())
+            if anchor_error > self.max_anchor_error_seconds:
+                raise SourceTimeMappingError(
+                    "source clock discontinuity requires a new stream epoch"
+                )
+            self._transforms[camera_id] = _SourceTimeTransform(
                 stream_epoch=stream_epoch,
-                running_time_ns=running_time_ns,
-                source_time=source_time,
+                canonical_running_time_ns=current.canonical_running_time_ns,
+                canonical_source_time=current.canonical_source_time,
+                validated_running_time_ns=running_time_ns,
+                validated_source_time=source_time,
             )
 
     def map(
@@ -865,16 +909,22 @@ class SourceTimeMapper:
         stream_epoch: str,
         running_time_ns: int,
     ) -> datetime:
-        if running_time_ns < 0:
-            raise SourceTimeMappingError("running time must be non-negative")
+        running_time_ns = _require_gstreamer_running_time(running_time_ns)
         with self._lock:
-            anchor = self._anchors.get(camera_id)
-        if anchor is None or anchor.stream_epoch != stream_epoch:
+            transform = self._transforms.get(camera_id)
+        if transform is None or transform.stream_epoch != stream_epoch:
             raise SourceTimeMappingError("source-time mapping is not anchored for this epoch")
-        delta_seconds = (running_time_ns - anchor.running_time_ns) / 1_000_000_000
-        if abs(delta_seconds) > self.max_delta_seconds:
+        validation_delta_seconds = (
+            running_time_ns - transform.validated_running_time_ns
+        ) / 1_000_000_000
+        if abs(validation_delta_seconds) > self.max_delta_seconds:
             raise SourceTimeMappingError("splitmux timestamp is outside the mapping horizon")
-        return anchor.source_time + timedelta(seconds=delta_seconds)
+        canonical_delta_seconds = (
+            running_time_ns - transform.canonical_running_time_ns
+        ) / 1_000_000_000
+        return transform.canonical_source_time + timedelta(
+            seconds=canonical_delta_seconds
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1045,8 +1095,12 @@ class SplitMuxEvidenceSinkFactory:
             return None
         location_value = self._structure_value(structure, "location")
         running_value = self._structure_value(structure, "running-time")
-        if not isinstance(location_value, str) or not isinstance(running_value, int):
+        if not isinstance(location_value, str):
             raise ValueError("splitmux message omitted location or running-time")
+        try:
+            running_value = _require_gstreamer_running_time(running_value)
+        except SourceTimeMappingError as exc:
+            raise ValueError("splitmux message has invalid running-time") from exc
         location = Path(location_value).absolute()
         key = (camera_id, location)
         if name == "splitmuxsink-fragment-opened":

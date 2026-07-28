@@ -8,14 +8,17 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import event, select
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from protector.pilot.domain import CandidateEventV1
 from protector.pilot.gates import CommercialRightsRecordV1, ModelArtifactV1
 from protector.pilot.storage.db import create_engine, create_session_factory
 from protector.pilot.storage.journal import (
+    EvidenceJournalReplayWorker,
     JournalFullError,
     JournalPayloadConflictError,
     SQLiteWALJournal,
+    is_retryable_database_error,
 )
 from protector.pilot.storage.models import Base, CandidateEventModel
 from protector.pilot.storage.repositories import PilotRepository
@@ -298,3 +301,205 @@ def test_evidence_finalization_replay_orders_converge_to_ready(
     assert journal.replay(repository.persist_journal_item) == 2
     assert journal.depth() == 0
     assert repository.get_event(event_contract.event_id).evidence_status == "ready"
+
+
+def test_replay_worker_backs_off_retryable_database_lock_without_busy_loop(
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    journal = SQLiteWALJournal(tmp_path / "retry-worker.sqlite3", max_items=4)
+    journal.enqueue_event(_event())
+    calls: list[int] = []
+
+    def processor(item: object) -> None:
+        calls.append(item.item_id)  # type: ignore[attr-defined]
+        if len(calls) == 1:
+            raise OperationalError(
+                "UPDATE candidate_events",
+                {},
+                sqlite3.OperationalError("database is locked"),
+            )
+
+    worker = EvidenceJournalReplayWorker(
+        journal=journal,
+        processor=processor,
+        batch_size=2,
+        retry_backoff_seconds=5,
+        monotonic_clock=clock,
+    )
+
+    assert worker.startup_drain() == 0
+    assert worker.status.degraded is True
+    assert worker.status.depth == 1
+    assert worker.run_periodic_batch() == 0
+    assert calls == [1]
+    clock.now = 5
+    assert worker.run_periodic_batch() == 1
+    assert worker.status.degraded is False
+    assert worker.status.depth == 0
+    assert worker.status.processed_total == 1
+
+
+def test_replay_worker_quarantines_poison_and_processes_later_valid_work(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteWALJournal(
+        tmp_path / "poison-worker.sqlite3",
+        max_items=4,
+        max_quarantine_items=4,
+    )
+    poison = journal.enqueue_event(_event())
+    valid = journal.enqueue_event(
+        _event().model_copy(
+            update={
+                "opened_at": NOW + timedelta(minutes=1),
+                "last_seen_at": NOW + timedelta(minutes=1, seconds=2),
+            }
+        )
+    )
+    processed: list[int] = []
+
+    def processor(item: object) -> None:
+        if item.item_id == poison.item_id:  # type: ignore[attr-defined]
+            raise IntegrityError("INSERT", {}, ValueError("deterministic constraint"))
+        processed.append(item.item_id)  # type: ignore[attr-defined]
+
+    worker = EvidenceJournalReplayWorker(
+        journal=journal,
+        processor=processor,
+        batch_size=4,
+        retry_backoff_seconds=5,
+    )
+
+    assert worker.startup_drain() == 1
+    assert processed == [valid.item_id]
+    assert journal.depth() == 0
+    assert journal.quarantine_depth() == 1
+    assert worker.status.quarantine_depth == 1
+    assert worker.status.last_error == "IntegrityError"
+
+
+def test_replay_worker_quarantines_legacy_schema_poison_without_blocking_queue(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-poison-worker.sqlite3"
+    journal = SQLiteWALJournal(path, max_items=4, max_quarantine_items=4)
+    poison = journal.enqueue_event(_event())
+    valid = journal.enqueue_event(
+        _event().model_copy(
+            update={
+                "opened_at": NOW + timedelta(minutes=2),
+                "last_seen_at": NOW + timedelta(minutes=2, seconds=2),
+            }
+        )
+    )
+    journal.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE journal_items
+            SET schema_version = ?, payload_json = ?
+            WHERE item_id = ?
+            """,
+            (
+                "candidate-event.v0",
+                json.dumps({"schema_version": "candidate-event.v0"}),
+                poison.item_id,
+            ),
+        )
+    restarted = SQLiteWALJournal(path, max_items=4, max_quarantine_items=4)
+    processed: list[int] = []
+    worker = EvidenceJournalReplayWorker(
+        journal=restarted,
+        processor=lambda item: processed.append(item.item_id),
+        batch_size=4,
+        retry_backoff_seconds=5,
+    )
+
+    assert worker.startup_drain() == 1
+    assert processed == [valid.item_id]
+    assert restarted.depth() == 0
+    assert restarted.quarantine_depth() == 1
+
+
+def test_replay_worker_quarantines_malformed_json_and_continues(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "malformed-json-worker.sqlite3"
+    journal = SQLiteWALJournal(path, max_items=4, max_quarantine_items=4)
+    poison = journal.enqueue_event(_event())
+    valid = journal.enqueue_event(
+        _event().model_copy(
+            update={
+                "opened_at": NOW + timedelta(minutes=3),
+                "last_seen_at": NOW + timedelta(minutes=3, seconds=2),
+            }
+        )
+    )
+    journal.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE journal_items SET payload_json = ? WHERE item_id = ?",
+            ("{not-json", poison.item_id),
+        )
+    restarted = SQLiteWALJournal(path, max_items=4, max_quarantine_items=4)
+    processed: list[int] = []
+    worker = EvidenceJournalReplayWorker(
+        journal=restarted,
+        processor=lambda item: processed.append(item.item_id),
+        batch_size=4,
+        retry_backoff_seconds=5,
+    )
+
+    assert worker.startup_drain() == 1
+    assert processed == [valid.item_id]
+    assert restarted.depth() == 0
+    assert restarted.quarantine_depth() == 1
+
+
+def test_replay_worker_never_swallows_process_control_exceptions(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteWALJournal(tmp_path / "interrupt-worker.sqlite3", max_items=2)
+    journal.enqueue_event(_event())
+    worker = EvidenceJournalReplayWorker(
+        journal=journal,
+        processor=lambda _: (_ for _ in ()).throw(KeyboardInterrupt()),
+        batch_size=1,
+        retry_backoff_seconds=5,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.startup_drain()
+    assert journal.depth() == 1
+    assert journal.quarantine_depth() == 0
+
+
+def test_retry_classifier_rejects_deterministic_sql_and_accepts_connection_states() -> None:
+    assert not is_retryable_database_error(
+        IntegrityError("INSERT", {}, ValueError("unique constraint"))
+    )
+    assert is_retryable_database_error(
+        OperationalError(
+            "UPDATE evidence",
+            {},
+            sqlite3.OperationalError("database is locked"),
+        )
+    )
+    assert is_retryable_database_error(sqlite3.OperationalError("database is busy"))
+    assert not is_retryable_database_error(
+        sqlite3.OperationalError("no such table: evidence")
+    )
+
+    class PostgreSQLConnectionFailure(Exception):
+        pgcode = "08006"
+
+    assert is_retryable_database_error(
+        OperationalError("SELECT 1", {}, PostgreSQLConnectionFailure())
+    )

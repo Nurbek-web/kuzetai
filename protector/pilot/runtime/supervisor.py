@@ -6,7 +6,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from protector.pilot.domain import ObservationV1, RuntimeState, SampleKind, TimestampQuality
 
@@ -73,6 +73,7 @@ class CameraSupervisor:
         observation_queue_size: int,
         monotonic_clock: Clock,
         wall_clock: WallClock,
+        runtime_session_seed: UUID | str | None = None,
         stale_after_seconds: float = 5.0,
         reconnect_initial_seconds: float = 1.0,
         reconnect_max_seconds: float = 30.0,
@@ -85,6 +86,10 @@ class CameraSupervisor:
             raise ValueError("stale_after_seconds must be non-negative")
         if reconnect_initial_seconds <= 0 or reconnect_max_seconds < reconnect_initial_seconds:
             raise ValueError("invalid reconnect backoff bounds")
+        session_seed = str(uuid4() if runtime_session_seed is None else runtime_session_seed)
+        if not session_seed or len(session_seed) > 128:
+            raise ValueError("runtime_session_seed must be non-empty and bounded")
+        self._runtime_session_seed = session_seed
         self._monotonic = monotonic_clock
         self._wall = wall_clock
         self._stale_after_seconds = stale_after_seconds
@@ -105,9 +110,14 @@ class CameraSupervisor:
             for camera_id in camera_ids
         }
 
-    @staticmethod
-    def _epoch_for(camera_id: str, epoch_number: int) -> UUID:
-        return uuid5(NAMESPACE_URL, f"kuzet-pilot:{camera_id}:epoch:{epoch_number}")
+    def _epoch_for(self, camera_id: str, epoch_number: int) -> UUID:
+        return uuid5(
+            NAMESPACE_URL,
+            (
+                f"kuzet-pilot:{self._runtime_session_seed}:"
+                f"{camera_id}:epoch:{epoch_number}"
+            ),
+        )
 
     def _state_for(self, camera_id: str) -> _CameraState:
         try:

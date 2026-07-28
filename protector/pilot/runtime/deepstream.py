@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+from uuid import UUID, uuid4
 
 from pydantic import Field, field_validator
 
@@ -635,12 +636,14 @@ class DeepStreamDataPlane:
         binding_loader: BindingLoader = _load_nvidia_bindings,
         fatal_callback: Callable[[], None] | None = None,
         evidence_sink_factory: EvidenceSinkFactory | None = None,
+        runtime_session_seed_factory: Callable[[], UUID | str] = uuid4,
     ) -> None:
         self._manifest = runtime_manifest
         self._runtime_info = runtime_info
         self._binding_loader = binding_loader
         self._fatal_callback = fatal_callback or (lambda: None)
         self._evidence_sink_factory = evidence_sink_factory
+        self._runtime_session_seed_factory = runtime_session_seed_factory
         self._graph: DeepStreamGraphSpec | None = None
         self._pipeline: Any | None = None
         self._supervisor: CameraSupervisor | None = None
@@ -687,6 +690,7 @@ class DeepStreamDataPlane:
             observation_queue_size=site.queues.events,
             monotonic_clock=time.monotonic,
             wall_clock=lambda: datetime.now(UTC),
+            runtime_session_seed=self._runtime_session_seed_factory(),
         )
         self._recovery = SourceRecoveryCoordinator(
             supervisor=self._supervisor,
@@ -994,7 +998,13 @@ class DeepStreamDataPlane:
         source_id = getattr(frame_meta, "source_id", getattr(frame_meta, "pad_index", -1))
         if not isinstance(source_id, int) or not 0 <= source_id < len(self._graph.sources):
             raise ValueError("invalid source ID")
-        ntp_timestamp = int(getattr(frame_meta, "ntp_timestamp", 0))
+        raw_ntp_timestamp = getattr(frame_meta, "ntp_timestamp", 0)
+        ntp_timestamp = (
+            raw_ntp_timestamp
+            if type(raw_ntp_timestamp) is int
+            and 0 < raw_ntp_timestamp < 2**64 - 1
+            else 0
+        )
         source_time = (
             datetime.fromtimestamp(ntp_timestamp / 1_000_000_000, UTC)
             if ntp_timestamp > 0
@@ -1013,8 +1023,29 @@ class DeepStreamDataPlane:
             if self._recovery is not None:
                 self._recovery.handle_camera_failure(camera_id, "invalid_frame_heartbeat")
             return
-        running_time_ns = int(getattr(frame_meta, "buf_pts", -1))
-        if ntp_timestamp > 0 and running_time_ns >= 0 and self._supervisor is not None:
+        running_time_ns = getattr(frame_meta, "buf_pts", -1)
+        if ntp_timestamp <= 0 and self._evidence_sink_factory is not None:
+            if self._recovery is not None:
+                self._recovery.handle_camera_failure(
+                    camera_id,
+                    "evidence_source_time_unavailable",
+                )
+            return
+        running_time_is_valid = (
+            type(running_time_ns) is int and 0 <= running_time_ns < 2**64 - 1
+        )
+        if (
+            ntp_timestamp > 0
+            and not running_time_is_valid
+            and self._evidence_sink_factory is not None
+        ):
+            if self._recovery is not None:
+                self._recovery.handle_camera_failure(
+                    camera_id,
+                    "evidence_source_time_mapping_failed",
+                )
+            return
+        if ntp_timestamp > 0 and running_time_is_valid and self._supervisor is not None:
             stream_epoch = str(self._supervisor.health_for(camera_id).stream_epoch)
             try:
                 self._source_time_mapper.anchor(

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+import pytest
 
 from protector.pilot.runtime.supervisor import CameraSupervisor
 
@@ -61,6 +64,72 @@ def test_supervisor_follows_legal_recovery_states_with_capped_backoff() -> None:
 
     supervisor.accept_sample(camera_id="camera-a", source_time=clocks.wall(), monotonic_seq=1)
     assert supervisor.health_for("camera-a").state == "online"
+
+
+def test_runtime_session_seed_makes_initial_epochs_process_unique_and_injectable() -> None:
+    clocks = Clocks()
+    first = CameraSupervisor(
+        camera_ids=("camera-a",),
+        observation_queue_size=2,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+        runtime_session_seed=UUID("11111111-1111-1111-1111-111111111111"),
+    )
+    second = CameraSupervisor(
+        camera_ids=("camera-a",),
+        observation_queue_size=2,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+        runtime_session_seed=UUID("22222222-2222-2222-2222-222222222222"),
+    )
+
+    first_observation = first.accept_sample(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=0,
+    )
+
+    assert first.health_for("camera-a").stream_epoch != second.health_for(
+        "camera-a"
+    ).stream_epoch
+    assert first_observation is not None
+    assert (
+        first_observation.stream_epoch
+        == first.health_for("camera-a").stream_epoch
+    )
+
+
+def test_default_runtime_session_seed_never_reuses_a_fresh_process_epoch() -> None:
+    clocks = Clocks()
+    first = CameraSupervisor(
+        camera_ids=("camera-a",),
+        observation_queue_size=2,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    second = CameraSupervisor(
+        camera_ids=("camera-a",),
+        observation_queue_size=2,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+
+    assert first.health_for("camera-a").stream_epoch != second.health_for(
+        "camera-a"
+    ).stream_epoch
+
+
+def test_explicit_empty_runtime_session_seed_is_rejected() -> None:
+    clocks = Clocks()
+
+    with pytest.raises(ValueError, match="runtime_session_seed"):
+        CameraSupervisor(
+            camera_ids=("camera-a",),
+            observation_queue_size=2,
+            monotonic_clock=clocks.monotonic,
+            wall_clock=clocks.wall,
+            runtime_session_seed="",
+        )
 
 
 def test_source_time_regression_starts_an_isolated_epoch_and_resets_sequence() -> None:

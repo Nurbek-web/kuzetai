@@ -17,6 +17,7 @@ from protector.pilot.runtime.evidence import (
     MediaInfo,
     NvencCapacityError,
     SourceTimeMapper,
+    SourceTimeMappingError,
     SplitMuxEvidenceSinkFactory,
     SpoolCapacityError,
     gstreamer_splitmux_sink_spec,
@@ -770,6 +771,155 @@ def test_splitmux_messages_map_source_time_adopt_immediately_and_survive_rebuild
     assert len(restarted.fragments("camera-01")) == 2
 
 
+def test_source_time_mapping_keeps_one_canonical_transform_across_rtcp_jitter() -> None:
+    mapper = SourceTimeMapper(
+        max_delta_seconds=120,
+        max_anchor_error_seconds=0.020,
+    )
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=0,
+        source_time=NOW,
+    )
+    shared_boundary = mapper.map(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=2_000_000_000,
+    )
+
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=2_000_000_000,
+        source_time=NOW + timedelta(seconds=2, milliseconds=10),
+    )
+    assert mapper.map(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=2_000_000_000,
+    ) == shared_boundary
+
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=4_000_000_000,
+        source_time=NOW + timedelta(seconds=3, milliseconds=995),
+    )
+    assert mapper.map(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=4_000_000_000,
+    ) == NOW + timedelta(seconds=4)
+    intervals = tuple(
+        (
+            mapper.map(
+                camera_id="camera-01",
+                stream_epoch="epoch-1",
+                running_time_ns=start,
+            ),
+            mapper.map(
+                camera_id="camera-01",
+                stream_epoch="epoch-1",
+                running_time_ns=start + 2_000_000_000,
+            ),
+        )
+        for start in (0, 2_000_000_000)
+    )
+    assert intervals[0][1] == intervals[1][0]
+
+
+def test_source_time_mapping_horizon_uses_latest_validated_anchor() -> None:
+    mapper = SourceTimeMapper(max_delta_seconds=60)
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=0,
+        source_time=NOW,
+    )
+    seventy_two_hours_ns = 72 * 60 * 60 * 1_000_000_000
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=seventy_two_hours_ns,
+        source_time=NOW + timedelta(hours=72),
+    )
+
+    assert mapper.map(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=seventy_two_hours_ns - 2_000_000_000,
+    ) == NOW + timedelta(hours=72, seconds=-2)
+    with pytest.raises(SourceTimeMappingError, match="horizon"):
+        mapper.map(
+            camera_id="camera-01",
+            stream_epoch="epoch-1",
+            running_time_ns=0,
+        )
+
+
+@pytest.mark.parametrize("invalid_running_time", [True, -1, 2**64 - 1])
+def test_source_time_mapping_rejects_invalid_gstreamer_clock_values(
+    invalid_running_time: object,
+) -> None:
+    mapper = SourceTimeMapper()
+
+    with pytest.raises(SourceTimeMappingError, match="running time|anchor"):
+        mapper.anchor(
+            camera_id="camera-01",
+            stream_epoch="epoch-1",
+            running_time_ns=invalid_running_time,  # type: ignore[arg-type]
+            source_time=NOW,
+        )
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=0,
+        source_time=NOW,
+    )
+    with pytest.raises(SourceTimeMappingError, match="running time"):
+        mapper.map(
+            camera_id="camera-01",
+            stream_epoch="epoch-1",
+            running_time_ns=invalid_running_time,  # type: ignore[arg-type]
+        )
+
+
+def test_source_time_discontinuity_requires_a_new_stream_epoch() -> None:
+    mapper = SourceTimeMapper(max_anchor_error_seconds=0.050)
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=0,
+        source_time=NOW,
+    )
+
+    with pytest.raises(SourceTimeMappingError, match="discontinuity"):
+        mapper.anchor(
+            camera_id="camera-01",
+            stream_epoch="epoch-1",
+            running_time_ns=2_000_000_000,
+            source_time=NOW + timedelta(seconds=3),
+        )
+    assert mapper.map(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=2_000_000_000,
+    ) == NOW + timedelta(seconds=2)
+
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-2",
+        running_time_ns=100_000_000,
+        source_time=NOW + timedelta(seconds=10),
+    )
+    assert mapper.map(
+        camera_id="camera-01",
+        stream_epoch="epoch-2",
+        running_time_ns=1_100_000_000,
+    ) == NOW + timedelta(seconds=11)
+
+
 def test_delayed_old_writer_close_cannot_inherit_replacement_stream_epoch(
     tmp_path: Path,
 ) -> None:
@@ -912,6 +1062,44 @@ def test_fragment_interval_cannot_overlap_or_regress_within_one_stream_epoch(
         _append(ring, offset=-2, payload=b"late-old-fragment")
 
     assert ring.fragments("camera-01") == (first, second)
+
+
+def test_persisted_ring_accepts_first_restart_fragment_without_cross_epoch_reservation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "spool"
+    before_restart = _ring(root, Clock())
+    old = before_restart.append(
+        camera_id="camera-01",
+        payload=b"same-encoded-fragment",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=2),
+        codec="h264",
+        starts_with_keyframe=True,
+        stream_epoch="runtime-session-a:camera-01:0",
+    )
+
+    after_restart = _ring(root, Clock())
+    new = after_restart.append(
+        camera_id="camera-01",
+        payload=b"same-encoded-fragment",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=2),
+        codec="h264",
+        starts_with_keyframe=True,
+        stream_epoch="runtime-session-b:camera-01:0",
+    )
+    reservation = after_restart.reserve(
+        reservation_id="restart-reservation",
+        camera_id="camera-01",
+        event_at=NOW + timedelta(seconds=2),
+        pre_roll=2,
+        post_roll=2,
+    )
+
+    assert old.fragment_id != new.fragment_id
+    assert len(after_restart.fragments("camera-01")) == 2
+    assert len({fragment.stream_epoch for fragment in reservation.fragments}) == 1
 
 
 def test_time_bound_is_source_span_not_sum_of_fragment_durations(tmp_path: Path) -> None:

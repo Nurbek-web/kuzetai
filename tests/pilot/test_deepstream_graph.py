@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 import yaml
 
+import protector.pilot.runtime.deepstream as deepstream_module
 from protector.pilot.config import (
     CameraFeed,
     EvidenceRetention,
@@ -48,6 +50,7 @@ from protector.pilot.runtime.deepstream import (
 from protector.pilot.runtime.evidence import (
     EncodedFragmentRing,
     SourceTimeMapper,
+    SourceTimeMappingError,
     SplitMuxEvidenceSinkFactory,
 )
 from protector.pilot.runtime.supervisor import CameraSupervisor
@@ -482,6 +485,74 @@ def test_nvidia_bindings_are_loaded_only_when_the_target_adapter_starts(tmp_path
 
     with pytest.raises(NvidiaBindingsUnavailable, match="NVIDIA DeepStream bindings"):
         runtime.start(_site())
+
+
+def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Gst:
+        class State:
+            NULL = "NULL"
+            PLAYING = "PLAYING"
+
+        class StateChangeReturn:
+            FAILURE = "FAILURE"
+
+    class Glib:
+        @staticmethod
+        def timeout_add(*_: object) -> None:
+            return None
+
+    class Bus:
+        def add_signal_watch(self) -> None:
+            return None
+
+        def connect(self, *_: object) -> None:
+            return None
+
+    class Pipeline:
+        def get_bus(self) -> Bus:
+            return Bus()
+
+        def set_state(self, _: object) -> str:
+            return "SUCCESS"
+
+    for number in range(1, 21):
+        monkeypatch.setenv(
+            f"PILOT_CAMERA_{number:02d}_RTSP",
+            f"rtsp://camera-{number:02d}.example.test/live",
+        )
+    seeds = iter(
+        (
+            UUID("11111111-1111-1111-1111-111111111111"),
+            UUID("22222222-2222-2222-2222-222222222222"),
+        )
+    )
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest_with_files(tmp_path),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        binding_loader=lambda: deepstream_module._NvidiaBindings(
+            gst=Gst,
+            glib=Glib,
+            pyds=object(),
+        ),
+        runtime_session_seed_factory=lambda: next(seeds),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_build_pipeline",
+        lambda *_: Pipeline(),
+    )
+
+    runtime.start(_site())
+    first_epoch = runtime.health()[0].stream_epoch
+    runtime.stop()
+    runtime.start(_site())
+    second_epoch = runtime.health()[0].stream_epoch
+    runtime.stop()
+
+    assert first_epoch != second_epoch
 
 
 def test_rtsp_locations_are_resolved_only_at_startup_and_never_embedded_in_graph(
@@ -1260,6 +1331,129 @@ def test_frame_metadata_anchors_splitmux_running_time_to_camera_rtcp_utc() -> No
         stream_epoch=epoch,
         running_time_ns=8_000_000_000,
     ) == clocks.wall() + timedelta(seconds=1)
+
+
+def test_host_timestamp_fallback_never_claims_an_rtcp_evidence_mapping() -> None:
+    clocks = Clocks()
+    graph = DeepStreamGraphSpec.from_site(_site())
+    camera_id = graph.sources[0].camera_id
+    supervisor = CameraSupervisor(
+        camera_ids=tuple(source.camera_id for source in graph.sources),
+        observation_queue_size=4,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    failures: list[tuple[str, str]] = []
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+    )
+    runtime._graph = graph
+    runtime._supervisor = supervisor
+    runtime._metadata_publisher = MetadataPublisher(
+        supervisor=supervisor,
+        model_artifact_id="person-primary-v1",
+    )
+    runtime._evidence_sink_factory = lambda _gst, _source: None
+    runtime._recovery = type(
+        "Recovery",
+        (),
+        {
+            "handle_camera_failure": lambda _self, camera, reason: failures.append(
+                (camera, reason)
+            )
+        },
+    )()
+    frame = type(
+        "Frame",
+        (),
+        {
+            "source_id": 0,
+            "ntp_timestamp": 0,
+            "buf_pts": 7_000_000_000,
+            "source_frame_width": 1920,
+            "source_frame_height": 1080,
+            "frame_num": 1,
+            "obj_meta_list": None,
+        },
+    )()
+
+    runtime._publish_frame_metadata(frame, type("Pyds", (), {})())
+
+    assert failures == [(camera_id, "evidence_source_time_unavailable")]
+    with pytest.raises(SourceTimeMappingError, match="not anchored"):
+        runtime._source_time_mapper.map(
+            camera_id=camera_id,
+            stream_epoch=str(supervisor.health_for(camera_id).stream_epoch),
+            running_time_ns=7_000_000_000,
+        )
+
+
+def test_rtcp_discontinuity_enters_recovery_and_reanchors_only_in_new_epoch() -> None:
+    clocks = Clocks()
+    graph = DeepStreamGraphSpec.from_site(_site())
+    camera_id = graph.sources[0].camera_id
+    supervisor = CameraSupervisor(
+        camera_ids=tuple(source.camera_id for source in graph.sources),
+        observation_queue_size=4,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    recovery = SourceRecoveryCoordinator(
+        supervisor=supervisor,
+        source_ids={camera_id: 0},
+        rebuild_source=lambda _: None,
+        monotonic_clock=clocks.monotonic,
+    )
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+    )
+    runtime._graph = graph
+    runtime._supervisor = supervisor
+    runtime._metadata_publisher = MetadataPublisher(
+        supervisor=supervisor,
+        model_artifact_id="person-primary-v1",
+    )
+    runtime._recovery = recovery
+    runtime._source_time_mapper = SourceTimeMapper(max_anchor_error_seconds=0.050)
+    initial_epoch = supervisor.health_for(camera_id).stream_epoch
+
+    def frame(*, source_time: datetime, running_time_ns: int, number: int) -> object:
+        return type(
+            "Frame",
+            (),
+            {
+                "source_id": 0,
+                "ntp_timestamp": int(source_time.timestamp() * 1_000_000_000),
+                "buf_pts": running_time_ns,
+                "source_frame_width": 1920,
+                "source_frame_height": 1080,
+                "frame_num": number,
+                "obj_meta_list": None,
+            },
+        )()
+
+    runtime._publish_frame_metadata(
+        frame(source_time=clocks.wall(), running_time_ns=0, number=1),
+        type("Pyds", (), {})(),
+    )
+    runtime._publish_frame_metadata(
+        frame(
+            source_time=clocks.wall() + timedelta(seconds=3),
+            running_time_ns=2_000_000_000,
+            number=2,
+        ),
+        type("Pyds", (), {})(),
+    )
+
+    assert supervisor.health_for(camera_id).state == "offline"
+    assert supervisor.health_for(camera_id).degraded_reason == (
+        "evidence_source_time_mapping_failed"
+    )
+    clocks.advance(1)
+    recovery.advance()
+    assert supervisor.health_for(camera_id).stream_epoch != initial_epoch
 
 
 def test_objects_from_one_frame_publish_distinct_deterministic_observation_sequences() -> None:

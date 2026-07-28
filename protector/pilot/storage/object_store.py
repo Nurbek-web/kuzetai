@@ -5,18 +5,19 @@ from __future__ import annotations
 import base64
 import errno
 import hashlib
+import json
 import os
 import re
 import shutil
 import stat
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
-
-from sqlalchemy.exc import SQLAlchemyError
+from uuid import uuid4
 
 from protector.pilot.config import SiteConfig
 from protector.pilot.runtime.evidence import (
@@ -27,7 +28,11 @@ from protector.pilot.runtime.evidence import (
     FfprobeMediaProbe,
     MediaProbe,
 )
-from protector.pilot.storage.journal import SQLiteWALJournal
+from protector.pilot.storage.journal import (
+    EvidenceJournalReplayWorker,
+    SQLiteWALJournal,
+    is_retryable_database_error,
+)
 from protector.pilot.storage.repositories import EvidenceInput, PilotRepository
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -640,8 +645,8 @@ class EvidencePublisher:
     ) -> None:
         try:
             self._repository.finalize_evidence(evidence, status=status)
-        except (OSError, SQLAlchemyError):
-            if self._journal is None:
+        except Exception as exc:
+            if self._journal is None or not is_retryable_database_error(exc):
                 raise
             payload = {
                 "schema_version": "evidence-work.v1",
@@ -663,6 +668,399 @@ class EvidencePublisher:
             )
 
 
+class PreviewWorkspaceCapacityError(RuntimeError):
+    """The finite preview workspace cannot accept another temporary clip."""
+
+
+class PreviewWorkspace:
+    """Owned finite workspace for preview/final temporary media only."""
+
+    _MARKER = ".kuzet-evidence-preview-workspace.v1"
+    _MARKER_PAYLOAD = b"kuzet-evidence-preview-workspace.v1\n"
+    _MAX_METADATA_BYTES = 8_192
+    _MEDIA_PATTERN = re.compile(r"^(?P<key>[0-9a-f]{64})\.(preview|final)\.mp4$")
+    _METADATA_PATTERN = re.compile(r"^(?P<key>[0-9a-f]{64})\.json$")
+    _TEMP_PATTERN = re.compile(r"^\.kuzet-preview-[0-9a-f]{32}\.tmp$")
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        ttl: timedelta,
+        max_items: int,
+        max_bytes: int,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if ttl <= timedelta(0):
+            raise ValueError("preview workspace TTL must be positive")
+        if max_items < 1 or max_bytes < 1:
+            raise ValueError("preview workspace bounds must be positive")
+        self.root = Path(root).absolute()
+        if self.root == Path(self.root.anchor):
+            raise ValueError("preview workspace must be a dedicated directory")
+        if self.root.exists() and self.root.is_symlink():
+            raise ValueError("preview workspace must not be a symlink")
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_stat = self.root.stat(follow_symlinks=False)
+        if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o022:
+            raise ValueError("preview workspace ownership or permissions are unsafe")
+        marker = self.root / self._MARKER
+        existing = tuple(self.root.iterdir())
+        if not marker.exists() and existing:
+            raise ValueError("preview workspace is not an owned empty namespace")
+        if marker.is_symlink():
+            raise ValueError("preview workspace marker must not be a symlink")
+        if not marker.exists():
+            self._atomic_write(marker, self._MARKER_PAYLOAD)
+        if self._read_private_file(
+            marker,
+            max_bytes=len(self._MARKER_PAYLOAD),
+        ) != self._MARKER_PAYLOAD:
+            raise ValueError("preview workspace marker content is invalid")
+        self.ttl = ttl
+        self.max_items = max_items
+        self.max_bytes = max_bytes
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._lock = threading.RLock()
+        self._assert_owned_namespace()
+
+    @property
+    def item_count(self) -> int:
+        return len(self._records())
+
+    @property
+    def used_bytes(self) -> int:
+        self._assert_owned_namespace()
+        total = 0
+        for path in self.root.iterdir():
+            if self._MEDIA_PATTERN.fullmatch(path.name) or self._TEMP_PATTERN.fullmatch(
+                path.name
+            ):
+                try:
+                    file_stat = path.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(file_stat.st_mode):
+                    total += file_stat.st_size
+        return total
+
+    def path_for(self, reservation_id: str, *, kind: Literal["preview", "final"]) -> Path:
+        key = self._key(reservation_id)
+        return self.root / f"{key}.{kind}.mp4"
+
+    def prepare(
+        self,
+        reservation_id: str,
+        *,
+        kind: Literal["preview", "final"],
+        evidence: EvidenceInput | None = None,
+    ) -> Path:
+        with self._lock:
+            key = self._key(reservation_id)
+            records = self._records()
+            current = records.get(key)
+            if current is None and len(records) >= self.max_items:
+                raise PreviewWorkspaceCapacityError(
+                    "preview workspace item bound reached"
+                )
+            if self.used_bytes >= self.max_bytes:
+                raise PreviewWorkspaceCapacityError(
+                    "preview workspace byte bound reached"
+                )
+            self._write_record(
+                key=key,
+                reservation_id=reservation_id,
+                created_at=(
+                    self._now()
+                    if current is None
+                    else datetime.fromisoformat(str(current["created_at"]))
+                ),
+                paths=[] if current is None else current["paths"],
+                evidence=(
+                    evidence
+                    if evidence is not None
+                    else None if current is None else current["evidence"]
+                ),
+            )
+            return self.path_for(reservation_id, kind=kind)
+
+    def register(
+        self,
+        reservation_id: str,
+        *,
+        kind: Literal["preview", "final"],
+        path: Path,
+        evidence: EvidenceInput | None = None,
+    ) -> None:
+        expected = self.path_for(reservation_id, kind=kind)
+        if Path(path).absolute() != expected:
+            raise ValueError("temporary evidence path escaped the preview workspace")
+        file_stat = expected.stat(follow_symlinks=False)
+        if not stat.S_ISREG(file_stat.st_mode) or expected.is_symlink():
+            raise ValueError("temporary evidence must be a regular owned file")
+        with self._lock:
+            key = self._key(reservation_id)
+            records = self._records()
+            current = records.get(key)
+            created_at = (
+                self._now()
+                if current is None
+                else datetime.fromisoformat(str(current["created_at"]))
+            )
+            paths = set(() if current is None else current["paths"])
+            paths.add(expected.name)
+            self._write_record(
+                key=key,
+                reservation_id=reservation_id,
+                created_at=created_at,
+                paths=sorted(paths),
+                evidence=(
+                    evidence
+                    if evidence is not None
+                    else None if current is None else current["evidence"]
+                ),
+            )
+            if self.item_count > self.max_items or self.used_bytes > self.max_bytes:
+                cleanup_errors = self.cleanup(reservation_id)
+                if cleanup_errors:
+                    raise ExceptionGroup(
+                        "preview workspace capacity cleanup failed",
+                        [
+                            PreviewWorkspaceCapacityError(
+                                "preview workspace bound reached"
+                            ),
+                            *cleanup_errors,
+                        ],
+                    )
+                raise PreviewWorkspaceCapacityError(
+                    "preview workspace bound reached"
+                )
+
+    def abandoned_records(
+        self,
+    ) -> tuple[tuple[str, EvidenceInput | None], ...]:
+        return tuple(
+            sorted(
+                [
+                    (
+                        str(record["reservation_id"]),
+                        record["evidence"],
+                    )
+                    for record in self._records().values()
+                ],
+                key=lambda item: item[0],
+            )
+        )
+
+    def expired_reservation_ids(self) -> tuple[str, ...]:
+        now = self._now()
+        return tuple(
+            sorted(
+                str(record["reservation_id"])
+                for record in self._records().values()
+                if now - datetime.fromisoformat(str(record["created_at"])) >= self.ttl
+            )
+        )
+
+    def cleanup(self, reservation_id: str) -> list[Exception]:
+        key = self._key(reservation_id)
+        errors: list[Exception] = []
+        for path in (
+            self.root / f"{key}.preview.mp4",
+            self.root / f"{key}.final.mp4",
+            self.root / f"{key}.json",
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            self._fsync_root()
+        except Exception as exc:
+            errors.append(exc)
+        return errors
+
+    def cleanup_orphans(self) -> list[Exception]:
+        errors: list[Exception] = []
+        known_keys = set(self._records())
+        for path in self.root.iterdir():
+            media_match = self._MEDIA_PATTERN.fullmatch(path.name)
+            metadata_match = self._METADATA_PATTERN.fullmatch(path.name)
+            is_orphan = (
+                self._TEMP_PATTERN.fullmatch(path.name) is not None
+                or (media_match is not None and media_match.group("key") not in known_keys)
+                or (metadata_match is not None and metadata_match.group("key") not in known_keys)
+            )
+            if not is_orphan:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            self._fsync_root()
+        except Exception as exc:
+            errors.append(exc)
+        return errors
+
+    def _records(self) -> dict[str, dict[str, Any]]:
+        self._assert_owned_namespace()
+        records: dict[str, dict[str, Any]] = {}
+        for path in self.root.iterdir():
+            match = self._METADATA_PATTERN.fullmatch(path.name)
+            if match is None or path.is_symlink():
+                continue
+            try:
+                raw = json.loads(
+                    self._read_private_file(
+                        path,
+                        max_bytes=self._MAX_METADATA_BYTES,
+                    )
+                )
+                reservation_id = str(raw["reservation_id"])
+                if self._key(reservation_id) != match.group("key"):
+                    continue
+                created_at = datetime.fromisoformat(str(raw["created_at"]))
+                if created_at.tzinfo is None or created_at.utcoffset() is None:
+                    continue
+                paths = raw["paths"]
+                if not isinstance(paths, list) or not all(
+                    isinstance(item, str)
+                    and self._MEDIA_PATTERN.fullmatch(item)
+                    and item.startswith(match.group("key"))
+                    for item in paths
+                ):
+                    continue
+                evidence_payload = raw.get("evidence")
+                evidence = (
+                    None
+                    if evidence_payload is None
+                    else EvidenceInput.from_payload(evidence_payload)
+                )
+            except (OSError, TypeError, ValueError, KeyError) as exc:
+                raise PreviewWorkspaceCapacityError(
+                    "preview workspace contains invalid bounded metadata"
+                ) from exc
+            records[match.group("key")] = {
+                "reservation_id": reservation_id,
+                "created_at": created_at.astimezone(UTC).isoformat(),
+                "paths": paths,
+                "evidence": evidence,
+            }
+        return records
+
+    def _assert_owned_namespace(self) -> None:
+        for path in self.root.iterdir():
+            if path.name == self._MARKER:
+                continue
+            if not (
+                self._MEDIA_PATTERN.fullmatch(path.name)
+                or self._METADATA_PATTERN.fullmatch(path.name)
+                or self._TEMP_PATTERN.fullmatch(path.name)
+            ):
+                raise PreviewWorkspaceCapacityError(
+                    "preview workspace contains an unexpected entry"
+                )
+            file_stat = path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(file_stat.st_mode) or path.is_symlink():
+                raise PreviewWorkspaceCapacityError(
+                    "preview workspace entry is not a regular owned file"
+                )
+
+    def _write_record(
+        self,
+        *,
+        key: str,
+        reservation_id: str,
+        created_at: datetime,
+        paths: list[str],
+        evidence: EvidenceInput | None,
+    ) -> None:
+        payload = {
+            "reservation_id": reservation_id,
+            "created_at": created_at.isoformat(),
+            "paths": paths,
+            "evidence": (
+                None
+                if evidence is None
+                else {
+                    "evidence_id": str(evidence.evidence_id),
+                    "event_id": str(evidence.event_id),
+                    "object_key": evidence.object_key,
+                    "sha256": evidence.sha256,
+                    "codec": evidence.codec,
+                    "start_at": evidence.start_at.isoformat(),
+                    "end_at": evidence.end_at.isoformat(),
+                    "source_reference": evidence.source_reference,
+                    "status": evidence.status,
+                }
+            ),
+        }
+        encoded_payload = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        if len(encoded_payload) > self._MAX_METADATA_BYTES:
+            raise ValueError("preview workspace metadata exceeds finite bound")
+        self._atomic_write(self.root / f"{key}.json", encoded_payload)
+
+    @staticmethod
+    def _read_private_file(path: Path, *, max_bytes: int) -> bytes:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_bytes:
+                raise ValueError("preview workspace metadata is not a finite regular file")
+            payload = bytearray()
+            while block := os.read(descriptor, min(4_096, max_bytes + 1 - len(payload))):
+                payload.extend(block)
+                if len(payload) > max_bytes:
+                    raise ValueError("preview workspace metadata exceeds finite bound")
+            return bytes(payload)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _key(reservation_id: str) -> str:
+        if not reservation_id or len(reservation_id) > 128:
+            raise ValueError("reservation_id must be non-empty and bounded")
+        return hashlib.sha256(reservation_id.encode()).hexdigest()
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("preview workspace clock must be timezone-aware")
+        return value.astimezone(UTC)
+
+    def _atomic_write(self, destination: Path, payload: bytes) -> None:
+        temporary = self.root / f".kuzet-preview-{uuid4().hex}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, destination)
+            self._fsync_root()
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _fsync_root(self) -> None:
+        descriptor = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 class EvidenceCoordinator:
     """Own the complete evidence lifecycle, including pins and temporary media."""
 
@@ -672,46 +1070,80 @@ class EvidenceCoordinator:
         ring: Any,
         assembler: Any,
         publisher: EvidencePublisher,
+        preview_workspace: PreviewWorkspace,
     ) -> None:
         self._ring = ring
         self._assembler = assembler
         self._publisher = publisher
-        self._previews: dict[str, Path] = {}
-        self._consumed_reservations: set[str] = set()
+        self.preview_workspace = preview_workspace
+        startup_errors: list[Exception] = []
+        for reservation_id, evidence in preview_workspace.abandoned_records():
+            if evidence is not None:
+                try:
+                    self._publisher.mark_failed(evidence)
+                except Exception as exc:
+                    startup_errors.append(exc)
+            startup_errors.extend(self._release_and_cleanup(reservation_id))
+        startup_errors.extend(preview_workspace.cleanup_orphans())
+        if startup_errors:
+            raise ExceptionGroup(
+                "abandoned preview workspace recovery failed",
+                startup_errors,
+            )
 
     def create_preview(
         self,
         reservation: Any,
-        output: str | Path,
         *,
         evidence: EvidenceInput | None = None,
     ) -> Any:
-        output_path = Path(output).absolute()
         try:
+            output_path = self.preview_workspace.prepare(
+                reservation.reservation_id,
+                kind="preview",
+                evidence=evidence,
+            )
             preview = self._assembler.assemble_preview(reservation, output_path)
-            self._previews[reservation.reservation_id] = preview.path
+            self.preview_workspace.register(
+                reservation.reservation_id,
+                kind="preview",
+                path=preview.path,
+                evidence=evidence,
+            )
             return preview
-        except Exception:
+        except Exception as primary:
+            cleanup_errors: list[Exception] = []
             if evidence is not None:
-                self._publisher.mark_failed(evidence)
-            self._release_and_cleanup(reservation.reservation_id, output_path)
-            raise
+                try:
+                    self._publisher.mark_failed(evidence)
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+            cleanup_errors.extend(
+                self._release_and_cleanup(reservation.reservation_id)
+            )
+            self._raise_lifecycle_failure(primary, cleanup_errors)
 
     def complete(
         self,
         reservation: Any,
         evidence: EvidenceInput,
-        output: str | Path,
     ) -> EvidenceInput:
-        output_path = Path(output).absolute()
-        if reservation.reservation_id in self._consumed_reservations:
-            raise ValueError("retry requires a fresh pinned evidence reservation")
+        primary: Exception | None = None
+        result: EvidenceInput | None = None
+        phase: Literal["assemble", "publish"] = "assemble"
         try:
-            try:
-                assembled = self._assembler.assemble(reservation, output_path)
-            except Exception:
-                self._publisher.mark_failed(evidence)
-                raise
+            output_path = self.preview_workspace.prepare(
+                reservation.reservation_id,
+                kind="final",
+                evidence=evidence,
+            )
+            assembled = self._assembler.assemble(reservation, output_path)
+            self.preview_workspace.register(
+                reservation.reservation_id,
+                kind="final",
+                path=assembled.path,
+                evidence=evidence,
+            )
             bounded = replace(
                 evidence,
                 sha256=assembled.sha256,
@@ -720,29 +1152,84 @@ class EvidenceCoordinator:
                 end_at=assembled.end_at,
                 status="pending",
             )
-            return self._publisher.publish(assembled.path, bounded)
-        finally:
-            self._consumed_reservations.add(reservation.reservation_id)
-            self._release_and_cleanup(reservation.reservation_id, output_path)
+            phase = "publish"
+            result = self._publisher.publish(assembled.path, bounded)
+        except Exception as exc:
+            primary = exc
+        cleanup_errors: list[Exception] = []
+        if primary is not None and phase == "assemble":
+            try:
+                self._publisher.mark_failed(evidence)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        cleanup_errors.extend(self._release_and_cleanup(reservation.reservation_id))
+        if primary is not None:
+            self._raise_lifecycle_failure(primary, cleanup_errors)
+        if cleanup_errors:
+            raise ExceptionGroup("evidence lifecycle cleanup failed", cleanup_errors)
+        assert result is not None
+        return result
 
     def retry(
         self,
         reservation: Any,
         evidence: EvidenceInput,
-        output: str | Path,
     ) -> EvidenceInput:
         """Retry with a newly acquired reservation; consumed pins are never reused."""
-        return self.complete(reservation, evidence, output)
+        return self.complete(reservation, evidence)
 
-    def _release_and_cleanup(self, reservation_id: str, *paths: Path) -> None:
-        self._ring.release(reservation_id)
-        preview = self._previews.pop(reservation_id, None)
-        for path in (*paths, *((preview,) if preview is not None else ())):
+    def cancel(
+        self,
+        reservation_id: str,
+        *,
+        evidence: EvidenceInput | None = None,
+    ) -> None:
+        errors: list[Exception] = []
+        if evidence is not None:
             try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                # Pin release must not be skipped because a UI preview cleanup failed.
-                continue
+                self._publisher.mark_failed(evidence)
+            except Exception as exc:
+                errors.append(exc)
+        errors.extend(self._release_and_cleanup(reservation_id))
+        if errors:
+            raise ExceptionGroup("evidence cancellation failed", errors)
+
+    def sweep_expired(self) -> tuple[str, ...]:
+        expired = self.preview_workspace.expired_reservation_ids()
+        errors: list[Exception] = []
+        for reservation_id in expired:
+            try:
+                self.cancel(reservation_id)
+            except ExceptionGroup as exc:
+                errors.extend(
+                    error
+                    for error in exc.exceptions
+                    if isinstance(error, Exception)
+                )
+        if errors:
+            raise ExceptionGroup("expired preview cleanup failed", errors)
+        return expired
+
+    def _release_and_cleanup(self, reservation_id: str) -> list[Exception]:
+        errors: list[Exception] = []
+        try:
+            self._ring.release(reservation_id)
+        except Exception as exc:
+            errors.append(exc)
+        errors.extend(self.preview_workspace.cleanup(reservation_id))
+        return errors
+
+    @staticmethod
+    def _raise_lifecycle_failure(
+        primary: Exception,
+        cleanup_errors: list[Exception],
+    ) -> None:
+        if cleanup_errors:
+            raise ExceptionGroup(
+                "evidence lifecycle failed",
+                [primary, *cleanup_errors],
+            )
+        raise primary
 
 
 @dataclass(frozen=True, slots=True)
@@ -753,6 +1240,8 @@ class EvidenceDeliveryServices:
     publisher: EvidencePublisher
     assembler: ClipAssembler
     coordinator: EvidenceCoordinator
+    replay_worker: EvidenceJournalReplayWorker
+    preview_workspace: PreviewWorkspace
 
 
 def build_s3_evidence_delivery(
@@ -765,6 +1254,12 @@ def build_s3_evidence_delivery(
     max_nvenc_jobs: int,
     codec_tool: CodecTool | None = None,
     media_probe: MediaProbe | None = None,
+    journal_replay_batch_size: int = 32,
+    journal_retry_backoff_seconds: float = 5.0,
+    preview_workspace_root: str | Path | None = None,
+    preview_ttl: timedelta = timedelta(minutes=5),
+    preview_max_items: int = 64,
+    preview_max_bytes: int | None = None,
 ) -> EvidenceDeliveryServices:
     """Construct the configured non-secret evidence policy around injected credentials."""
     storage = site.storage
@@ -788,14 +1283,38 @@ def build_s3_evidence_delivery(
         media_probe or FfprobeMediaProbe(),
         max_nvenc_jobs=max_nvenc_jobs,
     )
+    preview_workspace = PreviewWorkspace(
+        (
+            Path(preview_workspace_root)
+            if preview_workspace_root is not None
+            else ring.root.parent / f"{ring.root.name}-previews"
+        ),
+        ttl=preview_ttl,
+        max_items=preview_max_items,
+        max_bytes=(
+            storage.max_evidence_object_bytes * 2
+            if preview_max_bytes is None
+            else preview_max_bytes
+        ),
+    )
     coordinator = EvidenceCoordinator(
         ring=ring,
         assembler=assembler,
         publisher=publisher,
+        preview_workspace=preview_workspace,
     )
+    replay_worker = EvidenceJournalReplayWorker(
+        journal=journal,
+        processor=repository.persist_journal_item,
+        batch_size=journal_replay_batch_size,
+        retry_backoff_seconds=journal_retry_backoff_seconds,
+    )
+    replay_worker.startup_drain()
     return EvidenceDeliveryServices(
         store=store,
         publisher=publisher,
         assembler=assembler,
         coordinator=coordinator,
+        replay_worker=replay_worker,
+        preview_workspace=preview_workspace,
     )
