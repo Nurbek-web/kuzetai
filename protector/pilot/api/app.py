@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -19,6 +22,48 @@ from protector.pilot.api.routes_internal import router as internal_router
 from protector.pilot.storage.repositories import PilotRepository
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024
+DEFAULT_RUNTIME_LOCK_PATH = Path("/tmp/kuzet-ai-pilot-api.lock")
+
+
+class ProcessSingletonLock:
+    """Non-blocking inter-process lock released automatically on process exit."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._file_descriptor: int | None = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, str(os.getpid()).encode())
+            os.fsync(descriptor)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise RuntimeError(
+                f"API singleton lock is already held: {self.path}; "
+                "shared session/throttle state is required for extra workers"
+            ) from exc
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self._file_descriptor = descriptor
+
+    def release(self) -> None:
+        if self._file_descriptor is None:
+            return
+        descriptor = self._file_descriptor
+        self._file_descriptor = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 class RequestBodyLimitMiddleware:
@@ -125,6 +170,7 @@ def create_app(
     throttle: LoginThrottle | None = None,
     worker_count: int | None = None,
     max_request_body_bytes: int = MAX_REQUEST_BODY_BYTES,
+    runtime_lock_path: str | Path | None = None,
 ) -> FastAPI:
     """Construct an explicitly configured app; secrets have no committed defaults."""
 
@@ -136,11 +182,26 @@ def create_app(
         raise ValueError("in-process sessions and throttling require exactly one API worker")
     if max_request_body_bytes < 1:
         raise ValueError("request body limit must be positive")
+    singleton = ProcessSingletonLock(
+        runtime_lock_path
+        or os.getenv("PILOT_API_LOCK_PATH")
+        or DEFAULT_RUNTIME_LOCK_PATH
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> Any:
+        singleton.acquire()
+        try:
+            yield
+        finally:
+            singleton.release()
+
     app = FastAPI(
         title="Kuzet AI Pilot Control Plane",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     app.state.pilot_context = ApiContext(
         repository=repository,

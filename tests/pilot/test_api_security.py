@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import multiprocessing
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from uuid import UUID, uuid4
 
 import pyotp
@@ -32,6 +35,36 @@ from protector.pilot.storage.repositories import PilotRepository
 UTC = timezone.utc
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 TOTP_KEY = base64.urlsafe_b64encode(b"t" * 32).decode()
+
+
+def _lifespan_lock_worker(
+    lock_path: str,
+    barrier: object,
+    result_connection: object,
+) -> None:
+    repository = PilotRepository(
+        create_session_factory(create_engine("sqlite+pysqlite:///:memory:"))
+    )
+    try:
+        app = create_app(
+            repository=repository,
+            session_secret="session-secret-at-least-32-characters",
+            totp_encryption_key=TOTP_KEY,
+            machine_token="machine-token-at-least-16",
+            runtime_lock_path=lock_path,
+        )
+        barrier.wait(timeout=10)
+
+        async def run_lifespan() -> None:
+            async with app.router.lifespan_context(app):
+                result_connection.send(("acquired", os.getpid()))
+                Event().wait(timeout=30)
+
+        asyncio.run(run_lifespan())
+    except BaseException as exc:
+        result_connection.send(("rejected", f"{type(exc).__name__}: {exc}"))
+    finally:
+        result_connection.close()
 
 
 def _repository(tmp_path: Path) -> PilotRepository:
@@ -106,12 +139,14 @@ def test_totp_counter_advance_is_atomic_and_persists_across_repository_instances
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
+    totp = TotpService(encryption_key=TOTP_KEY)
+    encrypted_seed = totp.encrypt_secret(totp.enrol("operator").secret)
     repository.add_user(
         user_id="operator-1",
         username="operator",
         password_hash="argon2id-placeholder",
         role="operator",
-        totp_secret_encrypted="encrypted-seed",
+        totp_secret_encrypted=encrypted_seed,
     )
     counter = 123_456
     barrier = Barrier(8)
@@ -122,7 +157,7 @@ def test_totp_counter_advance_is_atomic_and_persists_across_repository_instances
             user_id="operator-1",
             counter=counter,
             expected_password_hash="argon2id-placeholder",
-            expected_encrypted_secret="encrypted-seed",
+            expected_encrypted_secret=encrypted_seed,
         )
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -135,7 +170,7 @@ def test_totp_counter_advance_is_atomic_and_persists_across_repository_instances
             user_id="operator-1",
             counter=counter,
             expected_password_hash="argon2id-placeholder",
-            expected_encrypted_secret="encrypted-seed",
+            expected_encrypted_secret=encrypted_seed,
         )
         is False
     )
@@ -143,7 +178,7 @@ def test_totp_counter_advance_is_atomic_and_persists_across_repository_instances
         user_id="operator-1",
         counter=counter + 1,
         expected_password_hash="argon2id-placeholder",
-        expected_encrypted_secret="encrypted-seed",
+        expected_encrypted_secret=encrypted_seed,
     )
 
 
@@ -196,6 +231,60 @@ def test_app_rejects_multi_worker_mode(tmp_path: Path, monkeypatch: pytest.Monke
             totp_encryption_key=TOTP_KEY,
             machine_token="machine-token-at-least-16",
         )
+
+
+def test_two_real_app_lifespans_admit_one_process_and_stale_exit_releases_lock(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    lock_path = str(tmp_path / "api-singleton.lock")
+    pipes = [context.Pipe(duplex=False) for _ in range(2)]
+    workers = [
+        context.Process(
+            target=_lifespan_lock_worker,
+            args=(lock_path, barrier, child_connection),
+        )
+        for _, child_connection in pipes
+    ]
+    for worker in workers:
+        worker.start()
+    for _, child_connection in pipes:
+        child_connection.close()
+
+    results = []
+    for parent_connection, _ in pipes:
+        assert parent_connection.poll(15)
+        results.append(parent_connection.recv())
+        parent_connection.close()
+    assert sorted(result[0] for result in results) == ["acquired", "rejected"]
+    assert "already held" in next(result[1] for result in results if result[0] == "rejected")
+
+    acquired_pid = next(result[1] for result in results if result[0] == "acquired")
+    acquired_worker = next(worker for worker in workers if worker.pid == acquired_pid)
+    acquired_worker.terminate()
+    acquired_worker.join(timeout=10)
+    for worker in workers:
+        if worker is not acquired_worker:
+            worker.join(timeout=10)
+            assert worker.exitcode == 0
+
+    repository = PilotRepository(
+        create_session_factory(create_engine("sqlite+pysqlite:///:memory:"))
+    )
+    recovered = create_app(
+        repository=repository,
+        session_secret="session-secret-at-least-32-characters",
+        totp_encryption_key=TOTP_KEY,
+        machine_token="machine-token-at-least-16",
+        runtime_lock_path=lock_path,
+    )
+
+    async def run_recovered_lifespan() -> None:
+        async with recovered.router.lifespan_context(recovered):
+            pass
+
+    asyncio.run(run_recovered_lifespan())
 
 
 def test_redaction_is_conservative_for_uris_headers_and_credential_like_keys() -> None:

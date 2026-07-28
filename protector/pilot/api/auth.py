@@ -18,6 +18,8 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
+from protector.pilot.totp_envelope import decode_totp_envelope, encode_totp_envelope
+
 Role = Literal["viewer", "operator", "admin"]
 
 
@@ -89,11 +91,11 @@ class TotpService:
             self._AAD + authenticated,
             "sha256",
         )
-        return base64.urlsafe_b64encode(authenticated + tag).decode()
+        return encode_totp_envelope(authenticated + tag)
 
     def decrypt_secret(self, encrypted: str) -> str:
         try:
-            envelope = base64.b64decode(encrypted, altchars=b"-_", validate=True)
+            envelope = decode_totp_envelope(encrypted)
             minimum = 1 + self._NONCE_BYTES + 1 + self._TAG_BYTES
             if len(envelope) < minimum or envelope[:1] != self._VERSION:
                 raise ValueError

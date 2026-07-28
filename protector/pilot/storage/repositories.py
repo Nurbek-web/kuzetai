@@ -32,6 +32,7 @@ from protector.pilot.storage.models import (
     SiteModel,
     UserModel,
 )
+from protector.pilot.totp_envelope import validate_totp_envelope
 
 
 class IdempotencyConflictError(ValueError):
@@ -344,6 +345,8 @@ class PilotRepository:
         totp_secret_encrypted: str | None = None,
         is_active: bool = True,
     ) -> UserModel:
+        if totp_secret_encrypted is not None:
+            validate_totp_envelope(totp_secret_encrypted)
         with self.session_factory.begin() as session:
             row = UserModel(
                 user_id=user_id,

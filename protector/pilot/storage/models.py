@@ -362,6 +362,12 @@ class UserModel(Base):
     __tablename__ = "users"
     __table_args__ = (
         CheckConstraint("role IN ('viewer', 'operator', 'admin')", name="ck_users_role"),
+        CheckConstraint(
+            "totp_secret_encrypted IS NULL OR "
+            "(totp_secret_encrypted LIKE 'totp:v1:%' "
+            "AND length(totp_secret_encrypted) >= 76)",
+            name="ck_users_totp_encrypted_envelope",
+        ),
     )
 
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
