@@ -11,9 +11,8 @@ from pydantic import Field, computed_field, field_validator, model_validator
 from protector.pilot.config import FrozenModel, NonEmptyString
 
 TimestampQuality = Literal["camera_rtcp", "host_ntp_fallback"]
+SampleKind = Literal["fresh", "cached_display"]
 RuntimeState = Literal[
-    "fresh",
-    "cached_display",
     "starting",
     "online",
     "degraded",
@@ -57,6 +56,7 @@ class ObservationV1(FrozenModel):
     bbox: NormalisedBoundingBox
     track_id: NonEmptyString | None = None
     model_artifact_id: NonEmptyString
+    sample_kind: SampleKind
     runtime_state: RuntimeState
     received_at: datetime
 
@@ -97,7 +97,7 @@ class ObservationV1(FrozenModel):
     @property
     def is_fresh(self) -> bool:
         """Cached display data cannot count as an event-engine observation."""
-        return self.runtime_state == "fresh"
+        return self.sample_kind == "fresh"
 
 
 class CandidateEventV1(FrozenModel):
@@ -115,6 +115,7 @@ class CandidateEventV1(FrozenModel):
     gate_mode: GateMode
     evidence_status: EvidenceStatus
     review_status: ReviewStatus
+    transition_history: tuple[ReviewStatus, ...] = ("observation", "candidate")
 
     @model_validator(mode="before")
     @classmethod
@@ -134,6 +135,15 @@ class CandidateEventV1(FrozenModel):
     def event_time_is_ordered(self) -> CandidateEventV1:
         if self.last_seen_at < self.opened_at:
             raise ValueError("last_seen_at must not precede opened_at")
+        if not self.transition_history:
+            raise ValueError("transition_history must contain the initial observation")
+        if self.transition_history[0] != "observation":
+            raise ValueError("transition_history must start at observation")
+        for source, target in zip(self.transition_history, self.transition_history[1:]):
+            if target not in _EVENT_TRANSITIONS[source]:
+                raise ValueError(f"illegal transition_history transition: {source} -> {target}")
+        if self.transition_history[-1] != self.review_status:
+            raise ValueError("transition_history must end at review_status")
         return self
 
     @computed_field(return_type=str)
@@ -147,7 +157,12 @@ class CandidateEventV1(FrozenModel):
     def transition_to(self, target: ReviewStatus) -> CandidateEventV1:
         if target not in _EVENT_TRANSITIONS[self.review_status]:
             raise ValueError(f"illegal event transition: {self.review_status} -> {target}")
-        return self.model_copy(update={"review_status": target})
+        return self.model_copy(
+            update={
+                "review_status": target,
+                "transition_history": (*self.transition_history, target),
+            }
+        )
 
 
 class NotificationOutboxRecordV1(FrozenModel):

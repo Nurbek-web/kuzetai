@@ -1,12 +1,24 @@
 """Fail-closed, evidence-based promotion decisions for conditional analytics."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
 
 from protector.pilot.config import FrozenModel, NonEmptyString
 from protector.pilot.domain import GateMode
+
+_OPERATOR_ELIGIBLE_ANALYTICS = frozenset(
+    {"person", "zone", "loitering", "line_crossing", "weapon", "fire_smoke"}
+)
+_SHADOW_ONLY_ANALYTICS = frozenset({"violence", "xclip", "vit", "fight", "fall"})
+
+
+def _require_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("signed_at must be UTC-aware")
+    return value.astimezone(timezone.utc)
 
 
 class CommercialRightsRecordV1(FrozenModel):
@@ -40,17 +52,39 @@ class ModelArtifactV1(FrozenModel):
         return value
 
 
-class TargetSiteReportV1(FrozenModel):
+class AuditedReportV1(FrozenModel):
+    """Immutable report provenance; a pass/fail boolean is never sufficient evidence alone."""
+
+    artifact_id: NonEmptyString
+    passed: bool
+    report_reference: NonEmptyString
+    report_sha256: str
+    signed_by: NonEmptyString
+    signed_at: datetime
+
+    @field_validator("report_sha256")
+    @classmethod
+    def report_hash_is_a_digest(cls, value: str) -> str:
+        if len(value) != 64:
+            raise ValueError("report_sha256 must be a 64-character digest")
+        if any(character not in "0123456789abcdef" for character in value.lower()):
+            raise ValueError("report_sha256 must be hexadecimal")
+        return value
+
+    @field_validator("signed_at")
+    @classmethod
+    def signed_at_is_utc(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
+class TargetSiteReportV1(AuditedReportV1):
     """Signed target-site validation for one exact model artifact."""
 
     schema_version: Literal["target-site-report.v1"]
-    artifact_id: NonEmptyString
     site_id: NonEmptyString
-    passed: bool
-    report_reference: NonEmptyString
 
 
-class CapacityReportV1(FrozenModel):
+class CapacityReportV1(AuditedReportV1):
     """Signed capacity result for the pilot's exact stream count."""
 
     schema_version: Literal["capacity-report.v1"]
@@ -58,6 +92,12 @@ class CapacityReportV1(FrozenModel):
     stream_count: Annotated[int, Field(ge=1)]
     passed: bool
     report_reference: NonEmptyString
+
+
+class ShadowStageReportV1(AuditedReportV1):
+    """Recorded successful shadow evaluation required before operator promotion."""
+
+    schema_version: Literal["shadow-stage-report.v1"]
 
 
 class ModelGateResultV1(FrozenModel):
@@ -77,8 +117,13 @@ class ModelGate:
         artifact: ModelArtifactV1 | None,
         target_site_report: TargetSiteReportV1 | None,
         capacity_report: CapacityReportV1 | None,
+        *,
+        current_mode: GateMode = "disabled",
+        shadow_stage_report: ShadowStageReportV1 | None = None,
     ) -> ModelGateResultV1:
         reasons: list[str] = []
+        if current_mode not in {"disabled", "shadow", "operator"}:
+            return ModelGateResultV1(mode="disabled", reasons=("invalid current gate mode",))
         if artifact is None:
             reasons.append("missing model artifact")
         else:
@@ -116,9 +161,34 @@ class ModelGate:
         if reasons:
             return ModelGateResultV1(mode="disabled", reasons=tuple(reasons))
         assert artifact is not None
-        if artifact.analytic in {"fight", "fall"}:
+        if artifact.analytic in _SHADOW_ONLY_ANALYTICS:
             return ModelGateResultV1(
                 mode="shadow",
                 reasons=(f"{artifact.analytic} remains shadow-only for this pilot",),
+            )
+        if artifact.analytic not in _OPERATOR_ELIGIBLE_ANALYTICS:
+            return ModelGateResultV1(
+                mode="disabled",
+                reasons=("analytic is not approved for operator promotion",),
+            )
+        if current_mode == "disabled":
+            return ModelGateResultV1(
+                mode="shadow",
+                reasons=("successful shadow-stage report is required before operator promotion",),
+            )
+        if shadow_stage_report is None:
+            return ModelGateResultV1(
+                mode="shadow",
+                reasons=("successful shadow-stage report is required before operator promotion",),
+            )
+        if shadow_stage_report.artifact_id != artifact.artifact_id:
+            return ModelGateResultV1(
+                mode="disabled",
+                reasons=("shadow-stage report artifact does not match",),
+            )
+        if not shadow_stage_report.passed:
+            return ModelGateResultV1(
+                mode="disabled",
+                reasons=("shadow-stage report did not pass",),
             )
         return ModelGateResultV1(mode="operator", reasons=())
