@@ -14,7 +14,9 @@ from protector.pilot.runtime.evidence import (
     ClipAssemblyError,
     EncodedFragmentRing,
     FfmpegCodecTool,
+    MediaInfo,
     NvencCapacityError,
+    SourceTimeMapper,
     SplitMuxEvidenceSinkFactory,
     SpoolCapacityError,
     gstreamer_splitmux_sink_spec,
@@ -37,23 +39,56 @@ class Clock:
 class RecordingCodecTool:
     def __init__(self, *, nvenc_available: bool = True) -> None:
         self.nvenc_available = nvenc_available
-        self.calls: list[tuple[str, tuple[Path, ...], Path]] = []
+        self.calls: list[tuple[str, tuple[Path, ...], Path, tuple[int, ...]]] = []
         self.entered = threading.Event()
         self.release = threading.Event()
         self.block = False
 
-    def remux_h264(self, inputs: tuple[Path, ...], output: Path) -> None:
-        self.calls.append(("remux", inputs, output))
+    def remux_h264(
+        self,
+        inputs: tuple[Path, ...],
+        output: Path,
+        *,
+        pass_fds: tuple[int, ...],
+    ) -> None:
+        self.calls.append(("remux", inputs, output, pass_fds))
         output.write_bytes(b"browser-h264-remux")
 
-    def transcode_h265_nvenc(self, inputs: tuple[Path, ...], output: Path) -> None:
+    def transcode_h265_nvenc(
+        self,
+        inputs: tuple[Path, ...],
+        output: Path,
+        *,
+        pass_fds: tuple[int, ...],
+    ) -> None:
         if not self.nvenc_available:
             raise ClipAssemblyError("NVENC H.264 encoder is unavailable")
-        self.calls.append(("nvenc", inputs, output))
+        self.calls.append(("nvenc", inputs, output, pass_fds))
         self.entered.set()
         if self.block:
             assert self.release.wait(timeout=2)
         output.write_bytes(b"browser-h264-nvenc")
+
+
+class RecordingMediaProbe:
+    def __init__(
+        self,
+        *,
+        source_compatible: bool = True,
+        output_duration: float = 6.0,
+    ) -> None:
+        self.source_compatible = source_compatible
+        self.output_duration = output_duration
+
+    def probe(self, path: Path, *, pass_fds: tuple[int, ...] = ()) -> MediaInfo:
+        is_output = ".part.mp4" in path.name
+        return MediaInfo(
+            duration_seconds=self.output_duration if is_output else 2.0,
+            codec="h264",
+            profile="High" if self.source_compatible or is_output else "High 10",
+            pixel_format="yuv420p" if self.source_compatible or is_output else "yuv420p10le",
+            browser_compatible=self.source_compatible or is_output,
+        )
 
 
 def _ring(
@@ -110,6 +145,39 @@ def test_fragment_write_is_atomic_hashed_and_restart_validated(tmp_path: Path) -
     assert restarted.fragments("camera-01") == (fragment,)
 
 
+def test_spool_requires_owned_dedicated_root_and_preserves_unrelated_siblings(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="dedicated"):
+        EncodedFragmentRing(
+            Path("/"),
+            ring_seconds=15,
+            max_camera_bytes=1_000,
+            max_spool_bytes=2_000,
+        )
+    non_owned = tmp_path / "shared"
+    non_owned.mkdir()
+    unrelated = non_owned / "customer-video.mp4"
+    unrelated.write_bytes(b"customer-owned")
+    with pytest.raises(ValueError, match="not owned"):
+        _ring(non_owned, Clock())
+    assert unrelated.read_bytes() == b"customer-owned"
+
+    unsafe = tmp_path / "unsafe-spool"
+    unsafe.mkdir(mode=0o770)
+    unsafe.chmod(0o770)
+    with pytest.raises(ValueError, match="permissions"):
+        _ring(unsafe, Clock())
+
+    owned = tmp_path / "kuzet-spool"
+    ring = _ring(owned, Clock())
+    sibling = tmp_path / "customer-sibling.mp4"
+    sibling.write_bytes(b"keep")
+    _append(ring, offset=0)
+    _ring(owned, Clock())
+    assert sibling.read_bytes() == b"keep"
+
+
 def test_restart_ignores_corrupt_metadata_or_symlinks_outside_spool(tmp_path: Path) -> None:
     clock = Clock()
     root = tmp_path / "spool"
@@ -123,13 +191,44 @@ def test_restart_ignores_corrupt_metadata_or_symlinks_outside_spool(tmp_path: Pa
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["path"] = "../../outside.mp4"
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    (root / "orphan.part").write_bytes(b"incomplete")
+    unrelated = root / "orphan.part"
+    unrelated.write_bytes(b"unrelated")
+    incomplete = root / ".incomplete" / "atomic-write"
+    incomplete.parent.mkdir()
+    incomplete.write_bytes(b"incomplete")
 
     restarted = _ring(root, clock)
 
     assert restarted.fragments("camera-01") == ()
     assert outside.read_bytes() == b"customer-nvr-video"
-    assert not (root / "orphan.part").exists()
+    assert unrelated.read_bytes() == b"unrelated"
+    assert not incomplete.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("start_at", (NOW + timedelta(seconds=1)).isoformat()),
+        ("starts_with_keyframe", "false"),
+    ],
+)
+def test_restart_recomputes_identity_and_requires_real_boolean_metadata(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    clock = Clock()
+    root = tmp_path / "spool"
+    ring = _ring(root, clock)
+    fragment = _append(ring, offset=0)
+    metadata_path = fragment.path.with_suffix(".json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata[field] = value
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    restarted = _ring(root, clock)
+
+    assert restarted.fragments("camera-01") == ()
 
 
 def test_rotation_bounds_time_bytes_and_keeps_cameras_isolated(tmp_path: Path) -> None:
@@ -248,7 +347,7 @@ def test_h264_is_remuxed_without_decode_and_published_by_atomic_rename(tmp_path:
         post_roll=3,
     )
     tool = RecordingCodecTool()
-    assembler = ClipAssembler(tool, max_nvenc_jobs=1)
+    assembler = ClipAssembler(tool, RecordingMediaProbe(), max_nvenc_jobs=1)
 
     result = assembler.assemble(reservation, tmp_path / "evidence.mp4")
 
@@ -272,13 +371,19 @@ def test_h265_fails_closed_without_nvenc_and_limits_concurrency(tmp_path: Path) 
     )
 
     with pytest.raises(ClipAssemblyError, match="NVENC"):
-        ClipAssembler(RecordingCodecTool(nvenc_available=False), max_nvenc_jobs=1).assemble(
-            reservation, tmp_path / "unavailable.mp4"
-        )
+        ClipAssembler(
+            RecordingCodecTool(nvenc_available=False),
+            RecordingMediaProbe(source_compatible=False),
+            max_nvenc_jobs=1,
+        ).assemble(reservation, tmp_path / "unavailable.mp4")
 
     tool = RecordingCodecTool()
     tool.block = True
-    assembler = ClipAssembler(tool, max_nvenc_jobs=1)
+    assembler = ClipAssembler(
+        tool,
+        RecordingMediaProbe(source_compatible=False),
+        max_nvenc_jobs=1,
+    )
     failure: list[BaseException] = []
 
     def first_job() -> None:
@@ -295,6 +400,102 @@ def test_h265_fails_closed_without_nvenc_and_limits_concurrency(tmp_path: Path) 
     tool.release.set()
     thread.join(timeout=2)
     assert not failure
+
+
+def test_assembler_reopens_and_rehashes_pinned_fragments_before_ffmpeg(
+    tmp_path: Path,
+) -> None:
+    ring = _ring(tmp_path / "spool", Clock())
+    for offset in (0, 2, 4):
+        _append(ring, offset=offset)
+    reservation = ring.reserve(
+        reservation_id="event-attest",
+        camera_id="camera-01",
+        event_at=NOW + timedelta(seconds=3),
+        pre_roll=3,
+        post_roll=3,
+    )
+    reservation.fragments[0].path.write_bytes(b"tamper!")
+    tool = RecordingCodecTool()
+
+    with pytest.raises(ClipAssemblyError, match="integrity"):
+        ClipAssembler(tool, RecordingMediaProbe(), max_nvenc_jobs=1).assemble(
+            reservation, tmp_path / "tampered.mp4"
+        )
+
+    assert tool.calls == []
+
+
+def test_browser_incompatible_h264_is_probed_and_uses_bounded_nvenc(tmp_path: Path) -> None:
+    ring = _ring(tmp_path / "spool", Clock())
+    for offset in (0, 2, 4):
+        _append(ring, offset=offset, codec="h264")
+    reservation = ring.reserve(
+        reservation_id="event-incompatible-h264",
+        camera_id="camera-01",
+        event_at=NOW + timedelta(seconds=3),
+        pre_roll=3,
+        post_roll=3,
+    )
+    tool = RecordingCodecTool()
+
+    ClipAssembler(
+        tool,
+        RecordingMediaProbe(source_compatible=False),
+        max_nvenc_jobs=1,
+    ).assemble(reservation, tmp_path / "compatible.mp4")
+
+    assert [call[0] for call in tool.calls] == ["nvenc"]
+    assert all(str(path).startswith("/dev/fd/") for path in tool.calls[0][1])
+    assert tool.calls[0][3]
+
+
+def test_assembler_verifies_actual_media_duration_before_ready(tmp_path: Path) -> None:
+    ring = _ring(tmp_path / "spool", Clock())
+    for offset in (0, 2, 4):
+        _append(ring, offset=offset)
+    reservation = ring.reserve(
+        reservation_id="event-duration",
+        camera_id="camera-01",
+        event_at=NOW + timedelta(seconds=3),
+        pre_roll=3,
+        post_roll=3,
+    )
+
+    with pytest.raises(ClipAssemblyError, match="duration"):
+        ClipAssembler(
+            RecordingCodecTool(),
+            RecordingMediaProbe(output_duration=9.0),
+            max_nvenc_jobs=1,
+        ).assemble(reservation, tmp_path / "wrong-duration.mp4")
+
+
+def test_pending_h265_reservation_produces_browser_playable_preview(tmp_path: Path) -> None:
+    ring = _ring(tmp_path / "spool", Clock())
+    for offset in (0, 2, 4):
+        _append(ring, offset=offset, codec="h265")
+    pending = ring.reserve(
+        reservation_id="event-preview",
+        camera_id="camera-01",
+        event_at=NOW + timedelta(seconds=5),
+        pre_roll=3,
+        post_roll=3,
+    )
+    assert pending.status == "pending"
+    tool = RecordingCodecTool()
+
+    preview = ClipAssembler(
+        tool,
+        RecordingMediaProbe(
+            source_compatible=False,
+            output_duration=pending.duration_seconds,
+        ),
+        max_nvenc_jobs=1,
+    ).assemble_preview(pending, tmp_path / "preview.mp4")
+
+    assert preview.path.exists()
+    assert preview.codec == "h264"
+    assert [call[0] for call in tool.calls] == ["nvenc"]
 
 
 def test_ffmpeg_commands_keep_h264_copy_only_and_h265_target_only_nvenc() -> None:
@@ -321,6 +522,8 @@ def test_ffmpeg_commands_keep_h264_copy_only_and_h265_target_only_nvenc() -> Non
         "clip.part",
     )
     assert "h264_nvenc" in h265
+    assert "yuv420p" in h265
+    assert "high" in h265
     assert "videotoolbox" not in h265
 
 
@@ -331,14 +534,18 @@ def test_splitmux_contract_is_encoded_bounded_and_uses_incomplete_paths(tmp_path
         codec="h264",
         fragment_seconds=2,
         max_fragment_bytes=4_000_000,
+        ring_seconds=15,
+        max_camera_bytes=64_000_000,
     )
 
     assert spec.factory == "splitmuxsink"
     assert spec.properties["max-size-time"] == 2_000_000_000
-    assert spec.properties["max-size-bytes"] == 4_000_000
+    assert spec.properties["max-size-bytes"] == 0
     assert spec.properties["send-keyframe-requests"] is True
     assert spec.properties["muxer-factory"] == "mp4mux"
     assert str(spec.properties["location"]).endswith(".part.mp4")
+    assert spec.properties["max-files"] == 8
+    assert spec.properties["async-finalize"] is False
     assert spec.decoded_frame_spool is False
 
 
@@ -365,7 +572,7 @@ def test_splitmux_factory_attaches_bounded_writer_and_atomically_adopts_closed_f
     factory = SplitMuxEvidenceSinkFactory(
         ring=ring,
         fragment_seconds=2,
-        max_fragment_bytes=1_000,
+        max_fragment_bytes=100,
     )
     source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
 
@@ -373,8 +580,8 @@ def test_splitmux_factory_attaches_bounded_writer_and_atomically_adopts_closed_f
 
     assert sink.factory == "splitmuxsink"
     assert sink.name == "evidence-writer-0"
-    assert sink.properties["max-files"] == 10
-    assert sink.properties["async-finalize"] is True
+    assert sink.properties["max-files"] == 8
+    assert sink.properties["async-finalize"] is False
 
     incoming = Path(str(sink.properties["location"]).replace("%05d", "00001"))
     incoming.parent.mkdir(parents=True, exist_ok=True)
@@ -391,6 +598,258 @@ def test_splitmux_factory_attaches_bounded_writer_and_atomically_adopts_closed_f
     assert fragment in ring.fragments("camera-01")
     assert fragment.path.read_bytes() == b"splitmux-encoded-fragment"
     assert not incoming.exists()
+
+
+def test_open_and_closed_splitmux_staging_consumes_camera_and_global_budgets(
+    tmp_path: Path,
+) -> None:
+    class Element:
+        def __init__(self) -> None:
+            self.properties: dict[str, object] = {}
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+    class Gst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                return Element()
+
+    ring = _ring(
+        tmp_path / "spool",
+        Clock(),
+        max_camera_bytes=100,
+        max_spool_bytes=150,
+    )
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=80,
+    )
+    first = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
+    second = SimpleNamespace(camera_id="camera-02", source_id=1, codec="h264")
+
+    first_sink = factory(Gst, first)
+    assert ring.used_bytes == 80
+    with pytest.raises(SpoolCapacityError, match="capacity|bound"):
+        factory(Gst, second)
+
+    incoming = Path(str(first_sink.properties["location"]).replace("%05d", "00001"))
+    incoming.parent.mkdir(parents=True, exist_ok=True)
+    incoming.write_bytes(b"a" * 50)
+    incoming.with_name("00002.part.mp4").write_bytes(b"b" * 50)
+    assert ring.used_bytes == 100
+    incoming.with_name("00003.part.mp4").write_bytes(b"c")
+    with pytest.raises(SpoolCapacityError, match="capacity"):
+        ring.assert_staging_within_bounds("camera-01")
+
+    factory.disable("camera-01")
+
+
+def test_splitmux_messages_map_source_time_adopt_immediately_and_survive_rebuild(
+    tmp_path: Path,
+) -> None:
+    class Element:
+        def __init__(self) -> None:
+            self.properties: dict[str, object] = {}
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+    class Gst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                return Element()
+
+    class Structure:
+        def __init__(self, name: str, **values: object) -> None:
+            self.name = name
+            self.values = values
+
+        def get_name(self) -> str:
+            return self.name
+
+        def get_value(self, name: str) -> object:
+            return self.values[name]
+
+    root = tmp_path / "spool"
+    ring = _ring(root, Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
+    sink = factory(Gst, source)
+    part = Path(str(sink.properties["location"]).replace("%05d", "00001"))
+    part.write_bytes(b"first-closed-fragment")
+    mapper = SourceTimeMapper()
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=10_000_000_000,
+        source_time=NOW,
+    )
+
+    assert (
+        factory.handle_splitmux_message(
+            camera_id="camera-01",
+            codec="h264",
+            stream_epoch="epoch-1",
+            structure=Structure(
+                "splitmuxsink-fragment-opened",
+                location=str(part),
+                **{"running-time": 9_000_000_000, "starts-with-keyframe": True},
+            ),
+            source_time_mapper=mapper,
+        )
+        is None
+    )
+    first = factory.handle_splitmux_message(
+        camera_id="camera-01",
+        codec="h264",
+        stream_epoch="epoch-1",
+        structure=Structure(
+            "splitmuxsink-fragment-closed",
+            location=str(part),
+            **{"running-time": 11_000_000_000},
+        ),
+        source_time_mapper=mapper,
+    )
+
+    assert first is not None
+    assert first.start_at == NOW - timedelta(seconds=1)
+    assert first.end_at == NOW + timedelta(seconds=1)
+    assert not part.exists()
+    restarted = _ring(root, Clock())
+    assert restarted.fragments("camera-01") == (first,)
+
+    rebuilt = SplitMuxEvidenceSinkFactory(
+        ring=restarted,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    rebuilt_sink = rebuilt(Gst, source)
+    second_part = Path(
+        str(rebuilt_sink.properties["location"]).replace("%05d", "00002")
+    )
+    second_part.write_bytes(b"second-closed-fragment")
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-2",
+        running_time_ns=1_000_000_000,
+        source_time=NOW + timedelta(seconds=10),
+    )
+    rebuilt.handle_splitmux_message(
+        camera_id="camera-01",
+        codec="h264",
+        stream_epoch="epoch-2",
+        structure=Structure(
+            "splitmuxsink-fragment-opened",
+            location=str(second_part),
+            **{"running-time": 0, "starts-with-keyframe": True},
+        ),
+        source_time_mapper=mapper,
+    )
+    second = rebuilt.handle_splitmux_message(
+        camera_id="camera-01",
+        codec="h264",
+        stream_epoch="epoch-2",
+        structure=Structure(
+            "splitmuxsink-fragment-closed",
+            location=str(second_part),
+            **{"running-time": 2_000_000_000},
+        ),
+        source_time_mapper=mapper,
+    )
+
+    assert second is not None
+    assert second.stream_epoch == "epoch-2"
+    assert len(restarted.fragments("camera-01")) == 2
+
+
+def test_delayed_old_writer_close_cannot_inherit_replacement_stream_epoch(
+    tmp_path: Path,
+) -> None:
+    class Element:
+        def __init__(self) -> None:
+            self.properties: dict[str, object] = {}
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+    class Gst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                return Element()
+
+    class Structure:
+        def __init__(self, name: str, **values: object) -> None:
+            self.name = name
+            self.values = values
+
+        def get_name(self) -> str:
+            return self.name
+
+        def get_value(self, name: str) -> object:
+            return self.values[name]
+
+    ring = _ring(tmp_path / "spool", Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
+    old_writer = factory(Gst, source)
+    factory.bind_writer(old_writer, stream_epoch="epoch-old")
+    old_part = Path(
+        str(old_writer.properties["location"]).replace("%05d", "00001")
+    )
+    old_part.write_bytes(b"old-unadopted")
+    mapper = SourceTimeMapper()
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-old",
+        running_time_ns=1_000_000_000,
+        source_time=NOW,
+    )
+    factory.handle_writer_message(
+        writer=old_writer,
+        structure=Structure(
+            "splitmuxsink-fragment-opened",
+            location=str(old_part),
+            **{"running-time": 0},
+        ),
+        source_time_mapper=mapper,
+    )
+
+    replacement = factory(Gst, source)
+    factory.bind_writer(replacement, stream_epoch="epoch-new")
+    factory.unbind_writer(old_writer)
+    assert not old_part.exists()
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-new",
+        running_time_ns=1_000_000_000,
+        source_time=NOW + timedelta(seconds=10),
+    )
+
+    delayed = factory.handle_writer_message(
+        writer=old_writer,
+        structure=Structure(
+            "splitmuxsink-fragment-closed",
+            location=str(old_part),
+            **{"running-time": 2_000_000_000},
+        ),
+        source_time_mapper=mapper,
+    )
+
+    assert delayed is None
+    assert ring.fragments("camera-01") == ()
 
 
 @pytest.mark.parametrize(
@@ -440,17 +899,36 @@ def test_fragment_rejects_non_utc_or_non_one_to_two_second_ranges(tmp_path: Path
         )
 
 
-def test_fragment_identity_is_not_reused_for_different_payload(tmp_path: Path) -> None:
+def test_fragment_interval_cannot_overlap_or_regress_within_one_stream_epoch(
+    tmp_path: Path,
+) -> None:
     ring = _ring(tmp_path, Clock())
     first = _append(ring, offset=0, payload=b"first")
-    second = _append(ring, offset=0, payload=b"second")
+    second = _append(ring, offset=2, payload=b"second")
 
-    assert first.fragment_id != second.fragment_id
-    assert first.sha256 != second.sha256
-    assert {item.fragment_id for item in ring.fragments("camera-01")} == {
-        first.fragment_id,
-        second.fragment_id,
-    }
+    with pytest.raises(ValueError, match="overlap|regress"):
+        _append(ring, offset=2, payload=b"different-same-interval")
+    with pytest.raises(ValueError, match="overlap|regress"):
+        _append(ring, offset=-2, payload=b"late-old-fragment")
+
+    assert ring.fragments("camera-01") == (first, second)
+
+
+def test_time_bound_is_source_span_not_sum_of_fragment_durations(tmp_path: Path) -> None:
+    ring = _ring(
+        tmp_path,
+        Clock(),
+        ring_seconds=4,
+        max_camera_bytes=1_000,
+        max_spool_bytes=1_000,
+    )
+    second = _append(ring, offset=2, payload=b"second")
+    third = _append(ring, offset=4, payload=b"third")
+
+    assert ring.fragments("camera-01") == (second, third)
+    assert (
+        ring.fragments("camera-01")[-1].end_at - ring.fragments("camera-01")[0].start_at
+    ).total_seconds() <= 4
 
 
 def test_reservation_requires_four_to_ten_second_window(tmp_path: Path) -> None:

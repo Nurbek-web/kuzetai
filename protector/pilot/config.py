@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Annotated, Literal
 
@@ -124,6 +124,9 @@ class EvidenceRetention(FrozenModel):
     encoded_ring_buffer_seconds: RingBufferSeconds
     encoded_ring_max_camera_bytes: FiniteStorageBytes = 64_000_000
     encoded_ring_max_spool_bytes: FiniteStorageBytes = 1_280_000_000
+    encoded_spool_root: Path = Path("/srv/kuzet/evidence-spool")
+    encoded_fragment_seconds: Literal[1, 2] = 2
+    encoded_fragment_max_bytes: FiniteStorageBytes = 8_000_000
     evidence_retention_days: EvidenceRetentionDays
     metadata_retention_days: MetadataRetentionDays
 
@@ -131,6 +134,10 @@ class EvidenceRetention(FrozenModel):
     def total_spool_covers_one_camera(self) -> EvidenceRetention:
         if self.encoded_ring_max_spool_bytes < self.encoded_ring_max_camera_bytes:
             raise ValueError("total encoded ring byte bound must cover one camera")
+        if not self.encoded_spool_root.is_absolute():
+            raise ValueError("encoded_spool_root must be an absolute target path")
+        if self.encoded_fragment_max_bytes > self.encoded_ring_max_camera_bytes:
+            raise ValueError("encoded fragment byte bound must fit one camera spool")
         return self
 
 
@@ -138,6 +145,10 @@ class KazakhstanStorage(FrozenModel):
     country_code: Literal["KZ"]
     endpoint: HttpUrl
     bucket: NonEmptyString
+    evidence_prefix: NonEmptyString = "pilot-evidence"
+    max_evidence_object_bytes: FiniteStorageBytes = 64_000_000
+    server_side_encryption: Literal["AES256", "aws:kms"] = "AES256"
+    kms_key_id: NonEmptyString | None = None
     retention: EvidenceRetention
 
     @field_validator("endpoint")
@@ -145,7 +156,37 @@ class KazakhstanStorage(FrozenModel):
     def endpoint_must_use_https(cls, endpoint: HttpUrl) -> HttpUrl:
         if endpoint.scheme != "https":
             raise ValueError("storage endpoint must use HTTPS")
+        if (
+            endpoint.username is not None
+            or endpoint.password is not None
+            or endpoint.query is not None
+            or endpoint.fragment is not None
+            or endpoint.path not in (None, "", "/")
+        ):
+            raise ValueError(
+                "storage endpoint must not contain credentials or ambiguous components"
+            )
         return endpoint
+
+    @model_validator(mode="after")
+    def evidence_object_policy_is_canonical(self) -> KazakhstanStorage:
+        prefix = self.evidence_prefix
+        path = PurePosixPath(prefix)
+        if (
+            prefix.startswith("/")
+            or "\\" in prefix
+            or "//" in prefix
+            or any(part in ("", ".", "..") for part in path.parts)
+            or path.as_posix() != prefix
+            or prefix == ".incomplete"
+            or prefix.startswith(".incomplete/")
+        ):
+            raise ValueError("evidence_prefix must be a canonical scoped object prefix")
+        if self.server_side_encryption == "aws:kms" and self.kms_key_id is None:
+            raise ValueError("aws:kms storage requires kms_key_id")
+        if self.server_side_encryption == "AES256" and self.kms_key_id is not None:
+            raise ValueError("kms_key_id is only valid with aws:kms")
+        return self
 
 
 class QueueLimits(FrozenModel):

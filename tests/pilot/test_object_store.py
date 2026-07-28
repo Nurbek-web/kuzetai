@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
+import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -11,17 +16,26 @@ from sqlalchemy import func, select
 
 from protector.pilot.domain import CandidateEventV1
 from protector.pilot.gates import CommercialRightsRecordV1, ModelArtifactV1
+from protector.pilot.runtime.evidence import EncodedFragmentRing
 from protector.pilot.storage.db import create_engine, create_session_factory
+from protector.pilot.storage.journal import SQLiteWALJournal
 from protector.pilot.storage.models import Base, EvidenceModel
 from protector.pilot.storage.object_store import (
     EncryptedLocalObjectStore,
+    EncryptedVolumeAttestation,
+    EvidenceCoordinator,
     EvidencePublisher,
     ObjectIntegrityError,
     ObjectPublishError,
     S3CompatibleObjectStore,
+    build_s3_evidence_delivery,
     validate_object_key,
 )
-from protector.pilot.storage.repositories import EvidenceInput, PilotRepository
+from protector.pilot.storage.repositories import (
+    EvidenceInput,
+    IdempotencyConflictError,
+    PilotRepository,
+)
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 
@@ -30,17 +44,28 @@ class FakeS3Client:
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], dict[str, Any]] = {}
         self.calls: list[tuple[str, str]] = []
-        self.fail_copy_once = False
+        self.fail_put_once = False
 
-    def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+    def head_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        ChecksumMode: str,
+    ) -> dict[str, Any]:
+        assert ChecksumMode == "ENABLED"
         try:
             stored = self.objects[(Bucket, Key)]
         except KeyError as exc:
             raise KeyError(Key) from exc
-        return {
+        head = {
             "ContentLength": len(stored["Body"]),
-            "Metadata": dict(stored["Metadata"]),
+            "ChecksumSHA256": stored["ChecksumSHA256"],
+            "ServerSideEncryption": stored["ServerSideEncryption"],
         }
+        if "SSEKMSKeyId" in stored:
+            head["SSEKMSKeyId"] = stored["SSEKMSKeyId"]
+        return head
 
     def put_object(
         self,
@@ -48,32 +73,29 @@ class FakeS3Client:
         Bucket: str,
         Key: str,
         Body: bytes,
-        Metadata: dict[str, str],
+        IfNoneMatch: str,
+        ChecksumAlgorithm: str,
+        ChecksumSHA256: str,
+        ServerSideEncryption: str,
+        **kwargs: object,
     ) -> None:
         self.calls.append(("put", Key))
+        if self.fail_put_once:
+            self.fail_put_once = False
+            raise OSError("simulated interrupted upload")
+        if (Bucket, Key) in self.objects:
+            error = RuntimeError("precondition failed")
+            error.response = {"Error": {"Code": "PreconditionFailed"}}  # type: ignore[attr-defined]
+            raise error
+        assert IfNoneMatch == "*"
+        assert ChecksumAlgorithm == "SHA256"
+        assert ChecksumSHA256 == base64.b64encode(hashlib.sha256(Body).digest()).decode()
         self.objects[(Bucket, Key)] = {
             "Body": bytes(Body),
-            "Metadata": dict(Metadata),
+            "ChecksumSHA256": ChecksumSHA256,
+            "ServerSideEncryption": ServerSideEncryption,
             "LastModified": NOW,
-        }
-
-    def copy_object(
-        self,
-        *,
-        Bucket: str,
-        Key: str,
-        CopySource: dict[str, str],
-        MetadataDirective: str,
-    ) -> None:
-        self.calls.append(("copy", Key))
-        if self.fail_copy_once:
-            self.fail_copy_once = False
-            raise OSError("simulated interrupted upload")
-        source = self.objects[(CopySource["Bucket"], CopySource["Key"])]
-        self.objects[(Bucket, Key)] = {
-            "Body": source["Body"],
-            "Metadata": dict(source["Metadata"]),
-            "LastModified": NOW,
+            **kwargs,
         }
 
     def delete_object(self, *, Bucket: str, Key: str) -> None:
@@ -89,6 +111,47 @@ class FakeS3Client:
             ],
             "IsTruncated": False,
         }
+
+
+def _s3_store(client: FakeS3Client, **overrides: object) -> S3CompatibleObjectStore:
+    arguments: dict[str, object] = {
+        "client": client,
+        "endpoint": "https://objects.example.test",
+        "bucket": "evidence",
+        "country_code": "KZ",
+        "evidence_prefix": "pilot-evidence",
+        "max_object_bytes": 1_000_000,
+        "server_side_encryption": "AES256",
+    }
+    arguments.update(overrides)
+    return S3CompatibleObjectStore(**arguments)
+
+
+def _attestation(root: Path) -> EncryptedVolumeAttestation:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
+    return EncryptedVolumeAttestation(
+        volume_id="kuzet-evidence-01",
+        mount_path=root,
+        record_id="attestation-2026-07-28",
+        verified_at=NOW,
+        verifier="customer-security",
+        signature_sha256="a" * 64,
+        encryption="luks2",
+    )
+
+
+def _local_store(root: Path, **overrides: object) -> EncryptedLocalObjectStore:
+    arguments: dict[str, object] = {
+        "encrypted_volume_attestation": _attestation(root),
+        "attestation_verifier": lambda record: record.signature_sha256 == "a" * 64,
+        "attestation_max_age": timedelta(days=1),
+        "evidence_prefix": "pilot-evidence",
+        "max_object_bytes": 1_000_000,
+        "clock": lambda: NOW,
+    }
+    arguments.update(overrides)
+    return EncryptedLocalObjectStore(root, **arguments)
 
 
 def _repository() -> PilotRepository:
@@ -175,27 +238,28 @@ def test_object_keys_cannot_escape_or_impersonate_incomplete_uploads(key: str) -
 def test_s3_requires_kz_https_boundary_and_never_accepts_credentials() -> None:
     client = FakeS3Client()
     with pytest.raises(ValueError, match="HTTPS"):
-        S3CompatibleObjectStore(
-            client=client,
+        _s3_store(
+            client,
             endpoint="http://objects.example.test",
-            bucket="evidence",
-            country_code="KZ",
         )
     with pytest.raises(ValueError, match="Kazakhstan"):
-        S3CompatibleObjectStore(
-            client=client,
-            endpoint="https://objects.example.test",
-            bucket="evidence",
+        _s3_store(
+            client,
             country_code="US",
         )
     with pytest.raises(TypeError):
-        S3CompatibleObjectStore(
-            client=client,
-            endpoint="https://objects.example.test",
-            bucket="evidence",
-            country_code="KZ",
+        _s3_store(
+            client,
             access_key="must-not-be-accepted",
         )
+    for endpoint in (
+        "https://access:TOPSECRET@objects.example.test",
+        "https://objects.example.test?credential=secret",
+        "https://objects.example.test/#ambiguous",
+        "https://objects.example.test/tenant/path",
+    ):
+        with pytest.raises(ValueError, match="credential|ambiguous"):
+            _s3_store(client, endpoint=endpoint)
 
 
 def test_s3_publish_verifies_digest_promotes_then_cleans_incomplete_key(
@@ -205,20 +269,16 @@ def test_s3_publish_verifies_digest_promotes_then_cleans_incomplete_key(
     source.write_bytes(b"encoded-browser-evidence")
     digest = "e539eda43d4506254c73453ab5d57b9ae99c09847fdf7451055ae9b927958306"
     client = FakeS3Client()
-    store = S3CompatibleObjectStore(
-        client=client,
-        endpoint="https://objects.example.test",
-        bucket="evidence",
-        country_code="KZ",
-    )
+    store = _s3_store(client)
 
     stored = store.publish(source, "events/camera-01/evidence.mp4", sha256=digest)
 
     assert stored.key == "events/camera-01/evidence.mp4"
     assert stored.sha256 == digest
-    assert client.objects[("evidence", stored.key)]["Body"] == source.read_bytes()
-    assert not any(key.startswith(".incomplete/") for _, key in client.objects)
-    assert [operation for operation, _ in client.calls] == ["put", "copy", "delete"]
+    remote_key = f"pilot-evidence/{stored.key}"
+    assert client.objects[("evidence", remote_key)]["Body"] == source.read_bytes()
+    assert client.objects[("evidence", remote_key)]["ServerSideEncryption"] == "AES256"
+    assert [operation for operation, _ in client.calls] == ["put"]
 
 
 def test_s3_interrupted_upload_is_cleaned_and_retry_is_idempotent(tmp_path: Path) -> None:
@@ -226,13 +286,8 @@ def test_s3_interrupted_upload_is_cleaned_and_retry_is_idempotent(tmp_path: Path
     source.write_bytes(b"encoded-browser-evidence")
     digest = "e539eda43d4506254c73453ab5d57b9ae99c09847fdf7451055ae9b927958306"
     client = FakeS3Client()
-    client.fail_copy_once = True
-    store = S3CompatibleObjectStore(
-        client=client,
-        endpoint="https://objects.example.test",
-        bucket="evidence",
-        country_code="KZ",
-    )
+    client.fail_put_once = True
+    store = _s3_store(client)
 
     with pytest.raises(ObjectPublishError, match="publish"):
         store.publish(source, "events/camera-01/evidence.mp4", sha256=digest)
@@ -250,12 +305,7 @@ def test_publish_rejects_wrong_digest_before_any_remote_write(tmp_path: Path) ->
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"encoded-browser-evidence")
     client = FakeS3Client()
-    store = S3CompatibleObjectStore(
-        client=client,
-        endpoint="https://objects.example.test",
-        bucket="evidence",
-        country_code="KZ",
-    )
+    store = _s3_store(client)
 
     with pytest.raises(ObjectIntegrityError, match="SHA-256"):
         store.publish(source, "events/camera-01/evidence.mp4", sha256="0" * 64)
@@ -268,12 +318,17 @@ def test_encrypted_local_volume_requires_attestation_and_publishes_atomically(
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"encoded-browser-evidence")
     digest = "e539eda43d4506254c73453ab5d57b9ae99c09847fdf7451055ae9b927958306"
-    with pytest.raises(ValueError, match="attestation"):
-        EncryptedLocalObjectStore(tmp_path / "volume", encrypted_volume_attestation="")
-    store = EncryptedLocalObjectStore(
-        tmp_path / "volume",
-        encrypted_volume_attestation="LUKS2 volume /dev/mapper/kuzet-evidence verified 2026-07-28",
-    )
+    root = tmp_path / "volume"
+    with pytest.raises((TypeError, ValueError), match="attestation"):
+        EncryptedLocalObjectStore(
+            root,
+            encrypted_volume_attestation="x",  # type: ignore[arg-type]
+            attestation_verifier=lambda _: True,
+            attestation_max_age=timedelta(days=1),
+            evidence_prefix="pilot-evidence",
+            max_object_bytes=1_000_000,
+        )
+    store = _local_store(root)
 
     stored = store.publish(source, "events/camera-01/evidence.mp4", sha256=digest)
 
@@ -283,6 +338,45 @@ def test_encrypted_local_volume_requires_attestation_and_publishes_atomically(
     assert store.publish(source, stored.key, sha256=digest) == stored
 
 
+def test_encrypted_local_attestation_rejects_forged_wrong_mount_and_stale_records(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "volume"
+    attestation = _attestation(root)
+    common = {
+        "evidence_prefix": "pilot-evidence",
+        "max_object_bytes": 1_000_000,
+        "attestation_max_age": timedelta(days=1),
+        "clock": lambda: NOW,
+    }
+    with pytest.raises(ValueError, match="signature"):
+        EncryptedLocalObjectStore(
+            root,
+            encrypted_volume_attestation=replace(attestation, signature_sha256="b" * 64),
+            attestation_verifier=lambda record: record.signature_sha256 == "a" * 64,
+            **common,
+        )
+    other = tmp_path / "other"
+    other.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="mounted root"):
+        EncryptedLocalObjectStore(
+            root,
+            encrypted_volume_attestation=replace(attestation, mount_path=other),
+            attestation_verifier=lambda _: True,
+            **common,
+        )
+    with pytest.raises(ValueError, match="stale"):
+        EncryptedLocalObjectStore(
+            root,
+            encrypted_volume_attestation=replace(
+                attestation,
+                verified_at=NOW - timedelta(days=2),
+            ),
+            attestation_verifier=lambda _: True,
+            **common,
+        )
+
+
 def test_local_store_refuses_symlink_escape_and_retention_deletes_only_expired(
     tmp_path: Path,
 ) -> None:
@@ -290,10 +384,7 @@ def test_local_store_refuses_symlink_escape_and_retention_deletes_only_expired(
     source.write_bytes(b"encoded-browser-evidence")
     digest = "e539eda43d4506254c73453ab5d57b9ae99c09847fdf7451055ae9b927958306"
     root = tmp_path / "volume"
-    store = EncryptedLocalObjectStore(
-        root,
-        encrypted_volume_attestation="encrypted-volume-ticket-KUZET-42",
-    )
+    store = _local_store(root)
     old = store.publish(source, "events/camera-01/old.mp4", sha256=digest)
     current = store.publish(source, "events/camera-01/current.mp4", sha256=digest)
     assert old.path is not None and current.path is not None
@@ -301,9 +392,11 @@ def test_local_store_refuses_symlink_escape_and_retention_deletes_only_expired(
     os.utime(current.path, (NOW.timestamp(), NOW.timestamp()))
     outside = tmp_path / "outside"
     outside.mkdir()
-    (root / "events" / "linked").symlink_to(outside, target_is_directory=True)
+    (root / "pilot-evidence" / "events" / "linked").symlink_to(
+        outside, target_is_directory=True
+    )
 
-    with pytest.raises(ValueError, match="symlink"):
+    with pytest.raises(ObjectPublishError, match="publish"):
         store.publish(source, "events/linked/escape.mp4", sha256=digest)
     assert store.delete_older_than(NOW - timedelta(seconds=50)) == ("events/camera-01/old.mp4",)
     assert current.path.exists()
@@ -315,42 +408,175 @@ def test_s3_retention_deletes_expired_final_objects_not_incomplete(tmp_path: Pat
     source.write_bytes(b"encoded-browser-evidence")
     digest = "e539eda43d4506254c73453ab5d57b9ae99c09847fdf7451055ae9b927958306"
     client = FakeS3Client()
-    store = S3CompatibleObjectStore(
-        client=client,
-        endpoint="https://objects.example.test",
-        bucket="evidence",
-        country_code="KZ",
-    )
+    store = _s3_store(client)
     store.publish(source, "events/camera-01/old.mp4", sha256=digest)
-    client.objects[("evidence", "events/camera-01/old.mp4")]["LastModified"] = NOW - timedelta(
-        days=2
-    )
-    client.objects[("evidence", ".incomplete/crash.part")] = {
+    client.objects[("evidence", "pilot-evidence/events/camera-01/old.mp4")][
+        "LastModified"
+    ] = NOW - timedelta(days=2)
+    client.objects[("evidence", "pilot-evidence/.incomplete/crash.part")] = {
         "Body": b"partial",
-        "Metadata": {},
+        "ChecksumSHA256": "",
+        "ServerSideEncryption": "AES256",
         "LastModified": NOW - timedelta(days=2),
+    }
+    client.objects[("evidence", "unrelated/customer-data.bin")] = {
+        "Body": b"must-stay",
+        "ChecksumSHA256": "",
+        "ServerSideEncryption": "AES256",
+        "LastModified": NOW - timedelta(days=20),
     }
 
     assert store.delete_older_than(NOW - timedelta(days=1)) == (
         ".incomplete/crash.part",
         "events/camera-01/old.mp4",
     )
-    assert ("evidence", ".incomplete/crash.part") not in client.objects
+    assert ("evidence", "pilot-evidence/.incomplete/crash.part") not in client.objects
+    assert ("evidence", "unrelated/customer-data.bin") in client.objects
 
 
 def test_local_store_removes_crash_left_incomplete_files_on_restart(tmp_path: Path) -> None:
     root = tmp_path / "volume"
     root.mkdir()
-    incomplete = root / "events" / ".clip.crash.part"
-    incomplete.parent.mkdir()
+    unrelated = root / "events" / ".clip.crash.part"
+    unrelated.parent.mkdir()
+    unrelated.write_bytes(b"unrelated")
+    incomplete = root / "pilot-evidence" / ".incomplete" / "crash.part"
+    incomplete.parent.mkdir(parents=True)
     incomplete.write_bytes(b"partial")
 
-    EncryptedLocalObjectStore(
-        root,
-        encrypted_volume_attestation="encrypted-volume-ticket-KUZET-42",
-    )
+    _local_store(root)
 
     assert not incomplete.exists()
+    assert unrelated.exists()
+
+
+def test_s3_existing_object_requires_service_checksum_and_is_never_deleted_on_conflict(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"declared-evidence")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    client = FakeS3Client()
+    remote_key = "pilot-evidence/events/camera-01/conflict.mp4"
+    conflicting = b"different-bytes!!"
+    assert len(conflicting) == source.stat().st_size
+    client.objects[("evidence", remote_key)] = {
+        "Body": conflicting,
+        "ChecksumSHA256": base64.b64encode(hashlib.sha256(conflicting).digest()).decode(),
+        "ServerSideEncryption": "AES256",
+        "LastModified": NOW,
+    }
+
+    with pytest.raises(ObjectIntegrityError, match="checksum"):
+        _s3_store(client).publish(
+            source,
+            "events/camera-01/conflict.mp4",
+            sha256=digest,
+        )
+
+    assert client.objects[("evidence", remote_key)]["Body"] == conflicting
+    assert not [call for call in client.calls if call == ("delete", remote_key)]
+
+
+def test_s3_kms_head_must_match_the_configured_key(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"kms-evidence")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    client = FakeS3Client()
+    store = _s3_store(
+        client,
+        server_side_encryption="aws:kms",
+        kms_key_id="arn:kms:kz:approved-key",
+    )
+    stored = store.publish(source, "events/camera-01/kms.mp4", sha256=digest)
+    remote = client.objects[("evidence", f"pilot-evidence/{stored.key}")]
+    assert remote["SSEKMSKeyId"] == "arn:kms:kz:approved-key"
+    remote["SSEKMSKeyId"] = "arn:kms:other-key"
+
+    with pytest.raises(ObjectIntegrityError, match="KMS key"):
+        store.publish(source, stored.key, sha256=digest)
+
+
+def test_s3_conditional_create_keeps_one_immutable_owner_under_conflicting_publishers(
+    tmp_path: Path,
+) -> None:
+    first_source = tmp_path / "first.mp4"
+    second_source = tmp_path / "second.mp4"
+    first_source.write_bytes(b"first-immutable")
+    second_source.write_bytes(b"other-immutable")
+    client = FakeS3Client()
+    store = _s3_store(client)
+    outcomes: list[object] = []
+
+    def publish(source: Path) -> None:
+        try:
+            outcomes.append(
+                store.publish(
+                    source,
+                    "events/camera-01/one-key.mp4",
+                    sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            outcomes.append(exc)
+
+    workers = [
+        threading.Thread(target=publish, args=(first_source,)),
+        threading.Thread(target=publish, args=(second_source,)),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=2)
+
+    assert sum(isinstance(item, ObjectIntegrityError) for item in outcomes) == 1
+    assert sum(not isinstance(item, BaseException) for item in outcomes) == 1
+    final = client.objects[("evidence", "pilot-evidence/events/camera-01/one-key.mp4")]
+    assert final["Body"] in {first_source.read_bytes(), second_source.read_bytes()}
+
+
+@pytest.mark.parametrize("backend", ("s3", "local"))
+def test_object_upload_size_is_bounded_before_publication(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    source = tmp_path / "large.mp4"
+    source.write_bytes(b"12345")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    client = FakeS3Client()
+    store = (
+        _s3_store(client, max_object_bytes=4)
+        if backend == "s3"
+        else _local_store(tmp_path / "volume", max_object_bytes=4)
+    )
+
+    with pytest.raises(ObjectPublishError, match="maximum"):
+        store.publish(source, "events/camera-01/large.mp4", sha256=digest)
+
+    assert client.calls == []
+
+
+def test_local_existing_object_readback_is_bounded(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"1234")
+    store = _local_store(tmp_path / "volume", max_object_bytes=4)
+    existing = (
+        tmp_path
+        / "volume"
+        / "pilot-evidence"
+        / "events"
+        / "camera-01"
+        / "bounded.mp4"
+    )
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"oversized")
+
+    with pytest.raises(ObjectIntegrityError, match="maximum"):
+        store.publish(
+            source,
+            "events/camera-01/bounded.mp4",
+            sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        )
 
 
 def test_publisher_marks_failed_upload_visible_but_never_ready(tmp_path: Path) -> None:
@@ -361,14 +587,9 @@ def test_publisher_marks_failed_upload_visible_but_never_ready(tmp_path: Path) -
     clip.write_bytes(b"encoded-browser-evidence")
     evidence = _evidence(event, clip)
     client = FakeS3Client()
-    client.fail_copy_once = True
+    client.fail_put_once = True
     publisher = EvidencePublisher(
-        store=S3CompatibleObjectStore(
-            client=client,
-            endpoint="https://objects.example.test",
-            bucket="evidence",
-            country_code="KZ",
-        ),
+        store=_s3_store(client),
         repository=repository,
     )
 
@@ -392,12 +613,7 @@ def test_upload_success_and_database_finalization_are_atomic_and_retryable(
     clip.write_bytes(b"encoded-browser-evidence")
     evidence = _evidence(event, clip)
     client = FakeS3Client()
-    store = S3CompatibleObjectStore(
-        client=client,
-        endpoint="https://objects.example.test",
-        bucket="evidence",
-        country_code="KZ",
-    )
+    store = _s3_store(client)
     publisher = EvidencePublisher(store=store, repository=repository)
 
     ready = publisher.publish(clip, evidence)
@@ -431,3 +647,197 @@ def test_database_finalization_failure_rolls_back_row_and_candidate_status(
     assert repository.get_event(event.event_id).evidence_status == "pending"
     with repository.session_factory() as session:
         assert session.scalar(select(func.count()).select_from(EvidenceModel)) == 0
+
+
+@pytest.mark.parametrize("upload_succeeds", (True, False))
+def test_database_outage_journals_ready_or_failed_finalization_for_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    upload_succeeds: bool,
+) -> None:
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"encoded-browser-evidence")
+    evidence = _evidence(event, clip)
+    client = FakeS3Client()
+    client.fail_put_once = not upload_succeeds
+    journal = SQLiteWALJournal(tmp_path / "evidence-journal.sqlite3", max_items=10)
+    publisher = EvidencePublisher(
+        store=_s3_store(client),
+        repository=repository,
+        journal=journal,
+    )
+    original_finalize = repository.finalize_evidence
+
+    def unavailable(*_: object, **__: object) -> object:
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(repository, "finalize_evidence", unavailable)
+    if upload_succeeds:
+        assert publisher.publish(clip, evidence).status == "ready"
+    else:
+        with pytest.raises(ObjectPublishError):
+            publisher.publish(clip, evidence)
+    assert journal.depth() == 1
+
+    monkeypatch.setattr(repository, "finalize_evidence", original_finalize)
+    assert journal.replay(repository.persist_journal_item) == 1
+    expected = "ready" if upload_succeeds else "failed"
+    assert repository.get_event(event.event_id).evidence_status == expected
+    with repository.session_factory() as session:
+        row = session.scalar(select(EvidenceModel))
+        assert row is not None
+        assert row.status == expected
+
+
+def test_evidence_coordinator_owns_preview_finalization_failure_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    class Ring:
+        def __init__(self) -> None:
+            self.released: list[str] = []
+
+        def release(self, reservation_id: str) -> int:
+            self.released.append(reservation_id)
+            return 1
+
+    class Assembler:
+        fail = False
+
+        def assemble_preview(self, reservation: object, output: Path) -> object:
+            output.write_bytes(b"preview")
+            return SimpleNamespace(path=output)
+
+        def assemble(self, reservation: object, output: Path) -> object:
+            if self.fail:
+                raise OSError("assembly failed")
+            output.write_bytes(b"final")
+            return SimpleNamespace(
+                path=output,
+                sha256=hashlib.sha256(b"final").hexdigest(),
+                start_at=NOW - timedelta(seconds=2),
+                end_at=NOW + timedelta(seconds=4),
+            )
+
+    class Publisher:
+        def __init__(self) -> None:
+            self.published: list[EvidenceInput] = []
+            self.failed: list[EvidenceInput] = []
+
+        def publish(self, source: Path, evidence: EvidenceInput) -> EvidenceInput:
+            assert source.read_bytes() == b"final"
+            self.published.append(evidence)
+            return replace(evidence, status="ready")
+
+        def mark_failed(self, evidence: EvidenceInput) -> EvidenceInput:
+            self.failed.append(evidence)
+            return replace(evidence, status="failed")
+
+    ring = Ring()
+    assembler = Assembler()
+    publisher = Publisher()
+    coordinator = EvidenceCoordinator(
+        ring=ring,  # type: ignore[arg-type]
+        assembler=assembler,  # type: ignore[arg-type]
+        publisher=publisher,  # type: ignore[arg-type]
+    )
+    reservation = SimpleNamespace(reservation_id="reservation-1", status="pending")
+    preview_path = tmp_path / "preview.mp4"
+
+    coordinator.create_preview(reservation, preview_path)
+    assert preview_path.read_bytes() == b"preview"
+    assert ring.released == []
+
+    event = _event()
+    seed = tmp_path / "seed.mp4"
+    seed.write_bytes(b"seed")
+    pending = _evidence(event, seed)
+    # _evidence hashes its input; the coordinator replaces it with assembled bytes.
+    final_path = tmp_path / "final.mp4"
+    ready = coordinator.complete(reservation, pending, final_path)
+
+    assert ready.status == "ready"
+    assert publisher.published[0].sha256 == hashlib.sha256(b"final").hexdigest()
+    assert ring.released == ["reservation-1"]
+    assert not preview_path.exists()
+    assert not final_path.exists()
+
+    failed_reservation = SimpleNamespace(
+        reservation_id="reservation-2",
+        status="ready",
+    )
+    assembler.fail = True
+    with pytest.raises(OSError, match="assembly"):
+        coordinator.complete(failed_reservation, pending, tmp_path / "failed.mp4")
+    assert publisher.failed[-1].evidence_id == pending.evidence_id
+    assert len(publisher.failed) == 1
+    assert ring.released[-1] == "reservation-2"
+    with pytest.raises(ValueError, match="fresh pinned"):
+        coordinator.retry(failed_reservation, pending, tmp_path / "retry.mp4")
+
+
+def test_publisher_does_not_journal_deterministic_repository_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"encoded-browser-evidence")
+    evidence = _evidence(event, clip)
+    journal = SQLiteWALJournal(tmp_path / "deterministic.sqlite3", max_items=10)
+    publisher = EvidencePublisher(
+        store=_s3_store(FakeS3Client()),
+        repository=repository,
+        journal=journal,
+    )
+
+    def conflict(*_: object, **__: object) -> object:
+        raise IdempotencyConflictError("deterministic identity conflict")
+
+    monkeypatch.setattr(repository, "finalize_evidence", conflict)
+    with pytest.raises(IdempotencyConflictError, match="deterministic"):
+        publisher.publish(clip, evidence)
+    assert journal.depth() == 0
+
+
+def test_production_builder_uses_validated_site_storage_policy_and_injected_credentials(
+    tmp_path: Path,
+) -> None:
+    repository = _repository()
+    journal = SQLiteWALJournal(tmp_path / "delivery.sqlite3", max_items=10)
+    ring = EncodedFragmentRing(
+        tmp_path / "spool",
+        ring_seconds=15,
+        max_camera_bytes=1_000,
+        max_spool_bytes=2_000,
+    )
+    site = SimpleNamespace(
+        storage=SimpleNamespace(
+            endpoint="https://objects.example.test/",
+            bucket="evidence",
+            country_code="KZ",
+            evidence_prefix="configured-evidence",
+            max_evidence_object_bytes=123_456,
+            server_side_encryption="AES256",
+            kms_key_id=None,
+        )
+    )
+
+    services = build_s3_evidence_delivery(
+        site=site,  # type: ignore[arg-type]
+        client=FakeS3Client(),
+        repository=repository,
+        journal=journal,
+        ring=ring,
+        max_nvenc_jobs=1,
+        codec_tool=SimpleNamespace(nvenc_available=False),  # type: ignore[arg-type]
+        media_probe=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+    assert services.store.evidence_prefix == "configured-evidence"
+    assert services.store.max_object_bytes == 123_456
+    assert services.coordinator._ring is ring

@@ -44,6 +44,9 @@ storage:
   country_code: KZ
   endpoint: https://object-storage.customer.example
   bucket: kuzet-pilot-evidence
+  evidence_prefix: pilot-evidence
+  max_evidence_object_bytes: 64000000
+  server_side_encryption: AES256
   # The customer NVR is the continuous-video system of record. Kuzet retains only
   # bounded encoded evidence, thumbnails, metadata, and audit records.
   retention:
@@ -52,6 +55,9 @@ storage:
     encoded_ring_buffer_seconds: 15
     encoded_ring_max_camera_bytes: 64000000
     encoded_ring_max_spool_bytes: 1280000000
+    encoded_spool_root: /srv/kuzet/evidence-spool
+    encoded_fragment_seconds: 2
+    encoded_fragment_max_bytes: 8000000
     evidence_retention_days: 30
     metadata_retention_days: 365
 

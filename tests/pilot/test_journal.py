@@ -261,3 +261,40 @@ def test_journal_rejects_unknown_or_mismatched_schema_versions(tmp_path: Path) -
         restarted.replay(processed.append)
     assert processed == []
     assert restarted.depth() == 1
+
+
+@pytest.mark.parametrize(
+    "ordered_statuses",
+    (("ready", "failed"), ("failed", "ready")),
+)
+def test_evidence_finalization_replay_orders_converge_to_ready(
+    tmp_path: Path,
+    ordered_statuses: tuple[str, str],
+) -> None:
+    repository = _repository()
+    event_contract = _event()
+    repository.add_event(event_contract)
+    journal = SQLiteWALJournal(tmp_path / "evidence-order.sqlite3", max_items=4)
+    evidence_id = uuid4()
+    base_payload = {
+        "schema_version": "evidence-work.v1",
+        "evidence_id": str(evidence_id),
+        "event_id": str(event_contract.event_id),
+        "object_key": "events/cam-01/replay-order.mp4",
+        "sha256": "c" * 64,
+        "codec": "h264",
+        "start_at": NOW.isoformat(),
+        "end_at": (NOW + timedelta(seconds=6)).isoformat(),
+        "source_reference": "nvr://camera/01?segment=replay-order",
+    }
+    for status in ordered_statuses:
+        journal.enqueue(
+            kind="evidence",
+            schema_version="evidence-work.v1",
+            idempotency_key=f"evidence-finalize:{evidence_id}:{status}",
+            payload={**base_payload, "status": status},
+        )
+
+    assert journal.replay(repository.persist_journal_item) == 2
+    assert journal.depth() == 0
+    assert repository.get_event(event_contract.event_id).evidence_status == "ready"

@@ -32,6 +32,12 @@ from protector.pilot.gates import (
     ShadowStageReportV1,
     TargetSiteReportV1,
 )
+from protector.pilot.runtime.evidence import (
+    EncodedFragmentRing,
+    SourceTimeMapper,
+    SourceTimeMappingError,
+    SplitMuxEvidenceSinkFactory,
+)
 from protector.pilot.runtime.supervisor import CameraHealth, CameraSupervisor
 
 DEEPSTREAM_IMAGE = (
@@ -566,8 +572,8 @@ class SourceRecoveryCoordinator:
                 and self._last_rebuild_reconnect_count.get(camera_id) != health.reconnect_count
             ):
                 try:
-                    self._rebuild_source(camera_id)
                     self._supervisor.recover(camera_id)
+                    self._rebuild_source(camera_id)
                     self._last_rebuild_reconnect_count[camera_id] = health.reconnect_count
                     self._attempt_started_at[camera_id] = self._monotonic()
                 except Exception:
@@ -647,6 +653,7 @@ class DeepStreamDataPlane:
         self._evidence_attachment_failures = 0
         self._started_monotonic: float | None = None
         self._awaiting_frame_since: dict[str, float] = {}
+        self._source_time_mapper = SourceTimeMapper()
 
     def start(self, site: SiteConfig) -> None:
         if self._pipeline is not None:
@@ -706,6 +713,9 @@ class DeepStreamDataPlane:
     def stop(self) -> None:
         if self._pipeline is not None and self._bindings is not None:
             stop_pipeline(self._pipeline, self._bindings.gst)
+        if self._graph is not None and hasattr(self._evidence_sink_factory, "disable"):
+            for source in self._graph.sources:
+                self._evidence_sink_factory.disable(source.camera_id)  # type: ignore[attr-defined]
         self._pipeline = None
         self._graph = None
         self._bindings = None
@@ -714,6 +724,7 @@ class DeepStreamDataPlane:
         self._metadata_publisher = None
         self._started_monotonic = None
         self._awaiting_frame_since = {}
+        self._source_time_mapper = SourceTimeMapper()
         if self._supervisor is not None:
             self._supervisor.clear_observations()
         self._supervisor = None
@@ -862,11 +873,22 @@ class DeepStreamDataPlane:
         if self._evidence_sink_factory is not None:
             try:
                 evidence_sink = self._evidence_sink_factory(gst, source)
+                if (
+                    evidence_sink is not None
+                    and self._supervisor is not None
+                    and hasattr(self._evidence_sink_factory, "bind_writer")
+                ):
+                    self._evidence_sink_factory.bind_writer(  # type: ignore[attr-defined]
+                        evidence_sink,
+                        stream_epoch=str(
+                            self._supervisor.health_for(source.camera_id).stream_epoch
+                        ),
+                    )
             except Exception:
-                # The source bin is not live yet; retain Task 6's safe discard
-                # branch when the bounded writer cannot be constructed.
                 self._evidence_attachment_failures += 1
-                evidence_sink = None
+                raise RuntimeError(
+                    f"bounded evidence writer unavailable for {source.camera_id}"
+                ) from None
         using_discard = evidence_sink is None
         if using_discard:
             evidence_sink = self._make_element(
@@ -899,16 +921,11 @@ class DeepStreamDataPlane:
             if using_discard:
                 raise RuntimeError(f"failed to attach evidence discard for {source.camera_id}")
             self._evidence_attachment_failures += 1
-            if hasattr(source_bin, "remove"):
-                source_bin.remove(evidence_sink)
-            evidence_sink = self._make_element(
-                gst, "fakesink", f"evidence-discard-{source.source_id}"
+            if hasattr(self._evidence_sink_factory, "disable"):
+                self._evidence_sink_factory.disable(source.camera_id)  # type: ignore[attr-defined]
+            raise RuntimeError(
+                f"failed to attach bounded evidence writer for {source.camera_id}"
             )
-            for name, value in evidence_placeholder_properties().items():
-                evidence_sink.set_property(name, value)
-            source_bin.add(evidence_sink)
-            if not evidence_queue.link(evidence_sink):
-                raise RuntimeError(f"failed to attach safe evidence discard for {source.camera_id}")
         if not tee.link(decode_queue) or not decode_queue.link(decoder):
             raise RuntimeError(f"failed to split evidence/NVDEC branches for {source.camera_id}")
         source_bin.add_pad(gst.GhostPad.new("decoded_src", decoder.get_static_pad("src")))
@@ -996,6 +1013,23 @@ class DeepStreamDataPlane:
             if self._recovery is not None:
                 self._recovery.handle_camera_failure(camera_id, "invalid_frame_heartbeat")
             return
+        running_time_ns = int(getattr(frame_meta, "buf_pts", -1))
+        if ntp_timestamp > 0 and running_time_ns >= 0 and self._supervisor is not None:
+            stream_epoch = str(self._supervisor.health_for(camera_id).stream_epoch)
+            try:
+                self._source_time_mapper.anchor(
+                    camera_id=camera_id,
+                    stream_epoch=stream_epoch,
+                    running_time_ns=running_time_ns,
+                    source_time=source_time,
+                )
+            except SourceTimeMappingError:
+                if self._recovery is not None:
+                    self._recovery.handle_camera_failure(
+                        camera_id,
+                        "evidence_source_time_mapping_failed",
+                    )
+                return
         object_node = frame_meta.obj_meta_list
         object_ordinal = 0
         while object_node is not None:
@@ -1041,6 +1075,13 @@ class DeepStreamDataPlane:
     def _on_bus_message(self, _: Any, message: Any) -> None:
         message_type = str(message.type).lower()
         structure = message.get_structure() if hasattr(message, "get_structure") else None
+        structure_name = None if structure is None else structure.get_name()
+        if structure_name in {
+            "splitmuxsink-fragment-opened",
+            "splitmuxsink-fragment-closed",
+        }:
+            self._handle_evidence_message(message, structure)
+            return
         is_rtsp_timeout = structure is not None and structure.get_name() == "GstRTSPSrcTimeout"
         if "error" in message_type or "eos" in message_type or is_rtsp_timeout:
             camera_id = (
@@ -1054,6 +1095,59 @@ class DeepStreamDataPlane:
                     stop_pipeline(self._pipeline, self._bindings.gst)
                 self._fatal_callback()
 
+    def _handle_evidence_message(self, message: Any, structure: Any) -> None:
+        factory = self._evidence_sink_factory
+        if factory is None or not hasattr(factory, "handle_splitmux_message"):
+            self._evidence_attachment_failures += 1
+            return
+        camera_id = self._camera_for_evidence_element(message.src)
+        if camera_id is None or self._graph is None or self._supervisor is None:
+            self._evidence_attachment_failures += 1
+            return
+        try:
+            factory.handle_writer_message(  # type: ignore[attr-defined]
+                writer=message.src,
+                structure=structure,
+                source_time_mapper=self._source_time_mapper,
+            )
+        except Exception:
+            self._evidence_attachment_failures += 1
+            factory.disable(camera_id)  # type: ignore[attr-defined]
+            if self._bindings is not None and hasattr(message.src, "set_state"):
+                message.src.set_state(self._bindings.gst.State.NULL)
+            if self._recovery is not None:
+                self._recovery.handle_camera_failure(
+                    camera_id,
+                    "evidence_fragment_adoption_failed",
+                    force=True,
+                )
+            else:
+                self._supervisor.disconnect(
+                    camera_id,
+                    "evidence_fragment_adoption_failed",
+                )
+
+    def _camera_for_evidence_element(self, element: Any) -> str | None:
+        if self._recovery is not None:
+            resolved = self._recovery.camera_for_element(element)
+            if resolved is not None:
+                return resolved
+        if self._graph is None:
+            return None
+        try:
+            name = str(element.get_name())
+            source_id = int(name.removeprefix("evidence-writer-"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return next(
+            (
+                source.camera_id
+                for source in self._graph.sources
+                if source.source_id == source_id
+            ),
+            None,
+        )
+
     def _rebuild_source(self, camera_id: str) -> None:
         """Placeholder for a target-only source-bin rebuild after local backoff.
 
@@ -1066,6 +1160,11 @@ class DeepStreamDataPlane:
         source = next(item for item in self._graph.sources if item.camera_id == camera_id)
         source_name = f"source-{source.source_id}"
         old_bin = self._pipeline.get_by_name(source_name)
+        old_writer = (
+            None
+            if old_bin is None or not hasattr(old_bin, "get_by_name")
+            else old_bin.get_by_name(f"evidence-writer-{source.source_id}")
+        )
         old_source_pad = None if old_bin is None else old_bin.get_static_pad("decoded_src")
         mux = self._pipeline.get_by_name("streammux")
         mux_sink_pad = (
@@ -1078,14 +1177,29 @@ class DeepStreamDataPlane:
         replacement = self._build_source_bin(
             self._bindings.gst, source, self._locations[camera_id]
         )
+        replacement_writer = (
+            None
+            if not hasattr(replacement, "get_by_name")
+            else replacement.get_by_name(f"evidence-writer-{source.source_id}")
+        )
         if old_bin is not None and old_source_pad is not None:
             old_bin.set_state(self._bindings.gst.State.NULL)
+            if old_writer is not None and hasattr(
+                self._evidence_sink_factory,
+                "unbind_writer",
+            ):
+                self._evidence_sink_factory.unbind_writer(old_writer)  # type: ignore[attr-defined]
             if old_source_pad.unlink(mux_sink_pad) is False:
                 replacement.set_state(self._bindings.gst.State.NULL)
                 raise RuntimeError(f"failed to unlink old source bin for {camera_id}")
             self._pipeline.remove(old_bin)
         if self._pipeline.add(replacement) is False:
             replacement.set_state(self._bindings.gst.State.NULL)
+            if replacement_writer is not None and hasattr(
+                self._evidence_sink_factory,
+                "unbind_writer",
+            ):
+                self._evidence_sink_factory.unbind_writer(replacement_writer)  # type: ignore[attr-defined]
             raise RuntimeError(f"failed to add rebuilt source bin for {camera_id}")
         replacement_pad = replacement.get_static_pad("decoded_src")
         replacement_linked = False
@@ -1100,6 +1214,11 @@ class DeepStreamDataPlane:
                 replacement_pad.unlink(mux_sink_pad)
             replacement.set_state(self._bindings.gst.State.NULL)
             self._pipeline.remove(replacement)
+            if replacement_writer is not None and hasattr(
+                self._evidence_sink_factory,
+                "unbind_writer",
+            ):
+                self._evidence_sink_factory.unbind_writer(replacement_writer)  # type: ignore[attr-defined]
             raise
 
 
@@ -1124,6 +1243,22 @@ def _target_runtime_info() -> tuple[str, str]:
     return compute_capability[0], tensorrt_version
 
 
+def build_evidence_sink_factory(site: SiteConfig) -> SplitMuxEvidenceSinkFactory:
+    """Build the target writer from validated finite spool settings."""
+    retention = site.storage.retention
+    ring = EncodedFragmentRing(
+        retention.encoded_spool_root,
+        ring_seconds=retention.encoded_ring_buffer_seconds,
+        max_camera_bytes=retention.encoded_ring_max_camera_bytes,
+        max_spool_bytes=retention.encoded_ring_max_spool_bytes,
+    )
+    return SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=retention.encoded_fragment_seconds,
+        max_fragment_bytes=retention.encoded_fragment_max_bytes,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run only with signed target inputs; bare image invocation exits non-zero."""
     parser = argparse.ArgumentParser(description="Run the Kuzet shared DeepStream data plane")
@@ -1140,6 +1275,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime = DeepStreamDataPlane(
             runtime_manifest=runtime_manifest,
             runtime_info=_target_runtime_info,
+            evidence_sink_factory=build_evidence_sink_factory(site),
         )
         runtime.start(site)
     except (GraphContractError, OSError, subprocess.CalledProcessError, ValueError) as exc:

@@ -814,55 +814,79 @@ class PilotRepository:
         ``failed`` to ``ready`` after the object store verifies the same key and
         digest, but a ready identity can never be downgraded or repurposed.
         """
-        with self.session_factory.begin() as session:
-            event = session.get(CandidateEventModel, str(evidence.event_id))
-            if event is None:
-                raise KeyError(f"unknown event: {evidence.event_id}")
-            event_transitions = {
-                "pending": {"ready", "failed"},
-                "failed": {"failed", "ready"},
-                "ready": {"ready"},
-            }
-            if status not in event_transitions.get(event.evidence_status, set()):
-                raise StaleStateError(expected=status, actual=event.evidence_status)
-
-            row = session.scalar(
-                select(EvidenceModel).where(
-                    or_(
-                        EvidenceModel.evidence_id == str(evidence.evidence_id),
-                        EvidenceModel.object_key == evidence.object_key,
-                    )
-                )
-            )
-            if row is None:
-                row = EvidenceModel(
-                    evidence_id=str(evidence.evidence_id),
-                    event_id=str(evidence.event_id),
-                    object_key=evidence.object_key,
-                    sha256=evidence.sha256,
-                    codec=evidence.codec,
-                    start_at=evidence.start_at,
-                    end_at=evidence.end_at,
-                    source_reference=evidence.source_reference,
-                    status=status,
-                )
-                session.add(row)
+        with self.session_factory() as session:
+            if session.get_bind().dialect.name == "sqlite":
+                # SQLite ignores SELECT FOR UPDATE; acquire the writer slot
+                # before reading either state so two workers cannot validate
+                # the same stale pending row.
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             else:
-                if not self._evidence_material_matches(row, evidence):
-                    raise IdempotencyConflictError(
-                        "evidence identity was reused with different data"
+                session.begin()
+            try:
+                event = session.scalar(
+                    select(CandidateEventModel)
+                    .where(CandidateEventModel.event_id == str(evidence.event_id))
+                    .with_for_update()
+                )
+                if event is None:
+                    raise KeyError(f"unknown event: {evidence.event_id}")
+                row = session.scalar(
+                    select(EvidenceModel)
+                    .where(
+                        or_(
+                            EvidenceModel.evidence_id == str(evidence.evidence_id),
+                            EvidenceModel.object_key == evidence.object_key,
+                        )
                     )
-                evidence_transitions = {
+                    .with_for_update()
+                )
+                if event.evidence_status == "ready" and status == "failed":
+                    if row is None or not self._evidence_material_matches(row, evidence):
+                        raise IdempotencyConflictError(
+                            "failed replay conflicts with ready evidence identity"
+                        )
+                    session.commit()
+                    return row
+                event_transitions = {
                     "pending": {"ready", "failed"},
                     "failed": {"failed", "ready"},
                     "ready": {"ready"},
                 }
-                if status not in evidence_transitions.get(row.status, set()):
-                    raise IdempotencyConflictError("ready evidence cannot be downgraded")
-                row.status = status
-            event.evidence_status = status
-            session.flush()
-            return row
+                if status not in event_transitions.get(event.evidence_status, set()):
+                    raise StaleStateError(expected=status, actual=event.evidence_status)
+                if row is None:
+                    row = EvidenceModel(
+                        evidence_id=str(evidence.evidence_id),
+                        event_id=str(evidence.event_id),
+                        object_key=evidence.object_key,
+                        sha256=evidence.sha256,
+                        codec=evidence.codec,
+                        start_at=evidence.start_at,
+                        end_at=evidence.end_at,
+                        source_reference=evidence.source_reference,
+                        status=status,
+                    )
+                    session.add(row)
+                else:
+                    if not self._evidence_material_matches(row, evidence):
+                        raise IdempotencyConflictError(
+                            "evidence identity was reused with different data"
+                        )
+                    evidence_transitions = {
+                        "pending": {"ready", "failed"},
+                        "failed": {"failed", "ready"},
+                        "ready": {"ready"},
+                    }
+                    if status not in evidence_transitions.get(row.status, set()):
+                        raise IdempotencyConflictError("ready evidence cannot be downgraded")
+                    row.status = status
+                event.evidence_status = status
+                session.flush()
+                session.commit()
+                return row
+            except BaseException:
+                session.rollback()
+                raise
 
     @staticmethod
     def _evidence_matches(row: EvidenceModel, evidence: EvidenceInput) -> bool:
@@ -917,6 +941,10 @@ class PilotRepository:
             self.store_event_idempotent(CandidateEventV1.model_validate(item.payload))
             return
         if item.kind == "evidence":
-            self.add_evidence(EvidenceInput.from_payload(item.payload))
+            evidence = EvidenceInput.from_payload(item.payload)
+            if evidence.status in ("ready", "failed"):
+                self.finalize_evidence(evidence, status=evidence.status)
+            else:
+                self.add_evidence(evidence)
             return
         raise ValueError(f"unsupported journal item kind: {item.kind}")

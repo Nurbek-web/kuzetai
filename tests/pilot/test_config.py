@@ -36,10 +36,16 @@ def _site_payload() -> dict[str, object]:
             "country_code": "KZ",
             "endpoint": "https://object-storage.customer.example",
             "bucket": "kuzet-pilot-evidence",
+            "evidence_prefix": "pilot-evidence",
+            "max_evidence_object_bytes": 64_000_000,
+            "server_side_encryption": "AES256",
             "retention": {
                 "continuous_video_owner": "customer_nvr",
                 "continuous_video_storage_enabled": False,
                 "encoded_ring_buffer_seconds": 15,
+                "encoded_spool_root": "/srv/kuzet/evidence-spool",
+                "encoded_fragment_seconds": 2,
+                "encoded_fragment_max_bytes": 8_000_000,
                 "evidence_retention_days": 30,
                 "metadata_retention_days": 365,
             },
@@ -121,6 +127,8 @@ def test_site_requires_kazakhstan_https_storage_and_explicit_bounded_queues():
     site = SiteConfig.model_validate(payload)
     assert site.storage.country_code == "KZ"
     assert str(site.storage.endpoint) == "https://object-storage.customer.example/"
+    assert site.storage.evidence_prefix == "pilot-evidence"
+    assert site.storage.server_side_encryption == "AES256"
 
     wrong_country = _site_payload()
     wrong_country["storage"]["country_code"] = "US"
@@ -131,6 +139,32 @@ def test_site_requires_kazakhstan_https_storage_and_explicit_bounded_queues():
     insecure_endpoint["storage"]["endpoint"] = "http://object-storage.customer.example"
     with pytest.raises(ValidationError):
         SiteConfig.model_validate(insecure_endpoint)
+
+    for endpoint in (
+        "https://access:secret@object-storage.customer.example",
+        "https://object-storage.customer.example?credential=secret",
+        "https://object-storage.customer.example/#fragment",
+        "https://object-storage.customer.example/tenant/path",
+    ):
+        ambiguous = _site_payload()
+        ambiguous["storage"]["endpoint"] = endpoint
+        with pytest.raises(ValidationError):
+            SiteConfig.model_validate(ambiguous)
+
+    unsafe_prefix = _site_payload()
+    unsafe_prefix["storage"]["evidence_prefix"] = "../other-customer"
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(unsafe_prefix)
+
+    missing_kms_key = _site_payload()
+    missing_kms_key["storage"]["server_side_encryption"] = "aws:kms"
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(missing_kms_key)
+
+    aes_with_kms_key = _site_payload()
+    aes_with_kms_key["storage"]["kms_key_id"] = "unexpected-key"
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(aes_with_kms_key)
 
     missing_queue = _site_payload()
     del missing_queue["queues"]["verifier"]
@@ -151,6 +185,8 @@ def test_storage_keeps_continuous_video_in_customer_nvr_and_bounds_retention():
     assert retention.encoded_ring_buffer_seconds == 15
     assert retention.encoded_ring_max_camera_bytes > 0
     assert retention.encoded_ring_max_spool_bytes >= retention.encoded_ring_max_camera_bytes
+    assert retention.encoded_spool_root == Path("/srv/kuzet/evidence-spool")
+    assert retention.encoded_fragment_seconds == 2
 
     wrong_owner = _site_payload()
     wrong_owner["storage"]["retention"]["continuous_video_owner"] = "kuzet"
@@ -182,6 +218,16 @@ def test_storage_keeps_continuous_video_in_customer_nvr_and_bounds_retention():
     inverted_disk_bound["storage"]["retention"]["encoded_ring_max_spool_bytes"] = 1_000
     with pytest.raises(ValidationError):
         SiteConfig.model_validate(inverted_disk_bound)
+
+    relative_spool = _site_payload()
+    relative_spool["storage"]["retention"]["encoded_spool_root"] = "relative/spool"
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(relative_spool)
+
+    oversized_fragment = _site_payload()
+    oversized_fragment["storage"]["retention"]["encoded_fragment_max_bytes"] = 64_000_001
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(oversized_fragment)
 
 
 @pytest.mark.parametrize(

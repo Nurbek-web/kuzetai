@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import shutil
+import stat
 import subprocess
 import threading
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ from uuid import uuid4
 Codec = Literal["h264", "h265"]
 ReservationStatus = Literal["pending", "ready"]
 _FRAGMENT_SCHEMA = "encoded-fragment.v1"
+_SPOOL_MARKER = ".kuzet-encoded-evidence-spool.v1"
 
 
 class SpoolCapacityError(RuntimeError):
@@ -65,7 +67,9 @@ def _fsync_directory(path: Path) -> None:
 
 def _atomic_write(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.part")
+    incomplete = path.parent / ".incomplete"
+    incomplete.mkdir(mode=0o700, exist_ok=True)
+    temporary = incomplete / f"{path.name}.{uuid4().hex}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -88,6 +92,7 @@ class EncodedFragment:
 
     fragment_id: str
     camera_id: str
+    stream_epoch: str
     path: Path
     start_at: datetime
     end_at: datetime
@@ -159,10 +164,25 @@ class EncodedFragmentRing:
         if pin_ttl <= timedelta(0):
             raise ValueError("pin_ttl must be positive")
         self.root = Path(spool_root).absolute()
+        if self.root == Path(self.root.anchor):
+            raise ValueError("spool root must be a dedicated namespaced directory")
         if self.root.exists() and self.root.is_symlink():
             raise ValueError("spool root must not be a symlink")
         self.root.mkdir(parents=True, exist_ok=True)
         self.root = self.root.resolve(strict=True)
+        root_stat = self.root.stat()
+        if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o022:
+            raise ValueError("spool root ownership or permissions are unsafe")
+        marker = self.root / _SPOOL_MARKER
+        if marker.exists():
+            if marker.is_symlink() or not marker.is_file():
+                raise ValueError("spool ownership marker is unsafe")
+            if marker.read_text(encoding="utf-8") != _SPOOL_MARKER:
+                raise ValueError("spool ownership marker is invalid")
+        else:
+            if any(self.root.iterdir()):
+                raise ValueError("spool root is nonempty and not owned by Kuzet evidence")
+            _atomic_write(marker, _SPOOL_MARKER.encode())
         self.ring_seconds = ring_seconds
         self.max_camera_bytes = max_camera_bytes
         self.max_spool_bytes = max_spool_bytes
@@ -170,12 +190,53 @@ class EncodedFragmentRing:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._records: dict[str, _FragmentRecord] = {}
+        self._staging_reservations: dict[str, int] = {}
         self._scan()
 
     @property
     def used_bytes(self) -> int:
         with self._lock:
-            return sum(record.fragment.size_bytes for record in self._records.values())
+            adopted = sum(record.fragment.size_bytes for record in self._records.values())
+            incoming_by_camera = self._incoming_bytes_by_camera()
+            staged = sum(
+                max(reserved, incoming_by_camera.pop(camera_id, 0))
+                for camera_id, reserved in self._staging_reservations.items()
+            )
+            return adopted + staged + sum(incoming_by_camera.values())
+
+    def reserve_staging(self, camera_id: str, max_fragment_bytes: int) -> None:
+        """Reserve one open splitmux fragment before a camera writer is attached."""
+        if not camera_id or max_fragment_bytes <= 0:
+            raise ValueError("camera staging reservation must be finite and positive")
+        if max_fragment_bytes > self.max_camera_bytes:
+            raise SpoolCapacityError("camera staging reservation exceeds its spool bound")
+        with self._lock:
+            existing = self._staging_reservations.get(camera_id)
+            if existing is not None:
+                if existing != max_fragment_bytes:
+                    raise SpoolCapacityError("camera staging reservation changed during rebuild")
+                self.assert_staging_within_bounds(camera_id)
+                return
+            self._staging_reservations[camera_id] = max_fragment_bytes
+            try:
+                self._enforce_bounds(protected_fragment_id=None)
+                self.assert_staging_within_bounds(camera_id)
+            except BaseException:
+                self._staging_reservations.pop(camera_id, None)
+                raise
+
+    def release_staging(self, camera_id: str) -> None:
+        with self._lock:
+            self._staging_reservations.pop(camera_id, None)
+
+    def assert_staging_within_bounds(self, camera_id: str) -> None:
+        """Fail as soon as closed/open incoming files exceed either physical budget."""
+        with self._lock:
+            if (
+                self._camera_bytes(camera_id) > self.max_camera_bytes
+                or self.used_bytes > self.max_spool_bytes
+            ):
+                raise SpoolCapacityError("incoming evidence staging exceeded spool capacity")
 
     def fragments(self, camera_id: str) -> tuple[EncodedFragment, ...]:
         with self._lock:
@@ -199,10 +260,13 @@ class EncodedFragmentRing:
         end_at: datetime,
         codec: Codec,
         starts_with_keyframe: bool,
+        stream_epoch: str = "default",
     ) -> EncodedFragment:
         """Atomically publish one already-encoded 1–2 second fragment."""
         if not camera_id or len(camera_id) > 128:
             raise ValueError("camera_id must be non-empty and at most 128 characters")
+        if not stream_epoch or len(stream_epoch) > 128:
+            raise ValueError("stream_epoch must be non-empty and at most 128 characters")
         start_at = _require_utc(start_at, field="start_at")
         end_at = _require_utc(end_at, field="end_at")
         duration = (end_at - start_at).total_seconds()
@@ -216,16 +280,21 @@ class EncodedFragmentRing:
             raise SpoolCapacityError("fragment exceeds configured spool byte bounds")
 
         digest = hashlib.sha256(payload).hexdigest()
-        identity_material = (
-            f"{camera_id}\0{start_at.isoformat()}\0{end_at.isoformat()}\0{codec}\0"
-            f"{int(starts_with_keyframe)}\0{digest}"
-        ).encode()
-        fragment_id = hashlib.sha256(identity_material).hexdigest()
+        fragment_id = self._fragment_identity(
+            camera_id=camera_id,
+            stream_epoch=stream_epoch,
+            start_at=start_at,
+            end_at=end_at,
+            codec=codec,
+            starts_with_keyframe=starts_with_keyframe,
+            digest=digest,
+        )
         directory = self._camera_directory(camera_id)
         path = directory / f"{fragment_id}.mp4"
         fragment = EncodedFragment(
             fragment_id=fragment_id,
             camera_id=camera_id,
+            stream_epoch=stream_epoch,
             path=path,
             start_at=start_at,
             end_at=end_at,
@@ -241,6 +310,14 @@ class EncodedFragmentRing:
                 if existing.fragment != fragment:
                     raise ValueError("fragment identity was reused with different metadata")
                 return existing.fragment
+            same_stream = [
+                record.fragment
+                for record in self._records.values()
+                if record.fragment.camera_id == camera_id
+                and record.fragment.stream_epoch == stream_epoch
+            ]
+            if same_stream and start_at < max(item.end_at for item in same_stream):
+                raise ValueError("fragment interval would overlap or regress within stream epoch")
             _atomic_write(path, payload)
             record = _FragmentRecord(fragment=fragment, pins={})
             self._records[fragment_id] = record
@@ -286,15 +363,21 @@ class EncodedFragmentRing:
             )
             if keyframe_index is None:
                 raise ValueError("no camera-local keyframe can decode the requested pre-roll")
+            selected_epoch = available[keyframe_index].stream_epoch
+            available = [
+                fragment
+                for fragment in available[keyframe_index:]
+                if fragment.stream_epoch == selected_epoch
+            ]
             selected: list[EncodedFragment] = []
             previous_end: datetime | None = None
-            for fragment in available[keyframe_index:]:
+            for fragment in available:
                 if fragment.start_at >= target_end:
                     break
-                if previous_end is not None and fragment.start_at > previous_end:
+                if previous_end is not None and fragment.start_at != previous_end:
                     break
                 selected.append(fragment)
-                previous_end = max(previous_end or fragment.end_at, fragment.end_at)
+                previous_end = fragment.end_at
             if not selected:
                 raise ValueError("no encoded fragments overlap the evidence window")
             codecs = {fragment.codec for fragment in selected}
@@ -331,29 +414,67 @@ class EncodedFragmentRing:
         end_at: datetime,
         codec: Codec,
         starts_with_keyframe: bool,
+        stream_epoch: str = "default",
     ) -> EncodedFragment:
         """Adopt one splitmux-closed encoded file through the normal atomic path."""
         part_path = Path(part_path).absolute()
         incoming_root = self.root / ".incoming"
-        if (
-            part_path.is_symlink()
-            or not part_path.is_file()
-            or not part_path.resolve(strict=True).is_relative_to(incoming_root)
-        ):
+        if not part_path.is_relative_to(incoming_root):
             raise ValueError("closed splitmux fragment must be a regular file under .incoming")
-        if part_path.stat().st_size > self.max_camera_bytes:
-            raise SpoolCapacityError("closed splitmux fragment exceeds configured byte bound")
-        fragment = self.append(
-            camera_id=camera_id,
-            payload=part_path.read_bytes(),
-            start_at=start_at,
-            end_at=end_at,
-            codec=codec,
-            starts_with_keyframe=starts_with_keyframe,
+        relative = part_path.relative_to(incoming_root)
+        directory_descriptor = os.open(
+            incoming_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
-        part_path.unlink()
-        _fsync_directory(part_path.parent)
-        return fragment
+        try:
+            for part in relative.parts[:-1]:
+                child = os.open(
+                    part,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_descriptor,
+                )
+                os.close(directory_descriptor)
+                directory_descriptor = child
+            descriptor = os.open(
+                relative.parts[-1],
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+            try:
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise ValueError("closed splitmux fragment must be a regular file")
+                if file_stat.st_size > self.max_camera_bytes:
+                    raise SpoolCapacityError(
+                        "closed splitmux fragment exceeds configured byte bound"
+                    )
+                payload = bytearray()
+                while block := os.read(descriptor, 1024 * 1024):
+                    payload.extend(block)
+                    if len(payload) > self.max_camera_bytes:
+                        raise SpoolCapacityError(
+                            "closed splitmux fragment exceeds configured byte bound"
+                        )
+            finally:
+                os.close(descriptor)
+            fragment = self.append(
+                camera_id=camera_id,
+                payload=bytes(payload),
+                start_at=start_at,
+                end_at=end_at,
+                codec=codec,
+                starts_with_keyframe=starts_with_keyframe,
+                stream_epoch=stream_epoch,
+            )
+            os.unlink(relative.parts[-1], dir_fd=directory_descriptor)
+            os.fsync(directory_descriptor)
+            return fragment
+        except OSError as exc:
+            raise ValueError("closed splitmux fragment could not be adopted safely") from exc
+        finally:
+            os.close(directory_descriptor)
 
     def release(self, reservation_id: str) -> int:
         with self._lock:
@@ -395,6 +516,7 @@ class EncodedFragmentRing:
             "schema_version": _FRAGMENT_SCHEMA,
             "fragment_id": fragment.fragment_id,
             "camera_id": fragment.camera_id,
+            "stream_epoch": fragment.stream_epoch,
             "path": fragment.path.name,
             "start_at": fragment.start_at.isoformat(),
             "end_at": fragment.end_at.isoformat(),
@@ -413,13 +535,11 @@ class EncodedFragmentRing:
         )
 
     def _scan(self) -> None:
-        for incomplete in self.root.rglob("*"):
+        for incomplete in self.root.rglob(".incomplete"):
             if incomplete.is_symlink():
-                if ".part" in incomplete.name:
-                    incomplete.unlink(missing_ok=True)
-                continue
-            if incomplete.is_file() and ".part" in incomplete.name:
                 incomplete.unlink(missing_ok=True)
+            elif incomplete.is_dir():
+                shutil.rmtree(incomplete)
 
         valid_data: set[Path] = set()
         for metadata_path in sorted(self.root.rglob("*.json")):
@@ -434,6 +554,7 @@ class EncodedFragmentRing:
                     raise ValueError("unknown fragment schema")
                 fragment_id = str(raw["fragment_id"])
                 camera_id = str(raw["camera_id"])
+                stream_epoch = str(raw["stream_epoch"])
                 if raw["path"] != f"{fragment_id}.mp4":
                     raise ValueError("fragment path is not canonical")
                 if metadata_path.parent != self._camera_directory(camera_id):
@@ -449,18 +570,33 @@ class EncodedFragmentRing:
                 codec = raw["codec"]
                 if codec not in ("h264", "h265"):
                     raise ValueError("unsupported codec")
+                starts_with_keyframe = raw["starts_with_keyframe"]
+                if type(starts_with_keyframe) is not bool:
+                    raise ValueError("starts_with_keyframe must be a boolean")
                 size = path.stat().st_size
                 digest = _sha256_file(path)
                 if size != raw["size_bytes"] or digest != raw["sha256"]:
                     raise ValueError("fragment integrity mismatch")
+                expected_identity = self._fragment_identity(
+                    camera_id=camera_id,
+                    stream_epoch=stream_epoch,
+                    start_at=start_at,
+                    end_at=end_at,
+                    codec=codec,
+                    starts_with_keyframe=starts_with_keyframe,
+                    digest=digest,
+                )
+                if fragment_id != expected_identity:
+                    raise ValueError("fragment identity does not match metadata")
                 fragment = EncodedFragment(
                     fragment_id=fragment_id,
                     camera_id=camera_id,
+                    stream_epoch=stream_epoch,
                     path=resolved_path,
                     start_at=start_at,
                     end_at=end_at,
                     codec=codec,
-                    starts_with_keyframe=bool(raw["starts_with_keyframe"]),
+                    starts_with_keyframe=starts_with_keyframe,
                     sha256=digest,
                     size_bytes=size,
                 )
@@ -475,6 +611,8 @@ class EncodedFragmentRing:
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
                 self._remove_unsafe_pair(metadata_path)
 
+        self._discard_overlapping_restart_records()
+        valid_data = {record.fragment.path for record in self._records.values()}
         for path in self.root.rglob("*.mp4"):
             if path.is_symlink():
                 path.unlink(missing_ok=True)
@@ -530,16 +668,84 @@ class EncodedFragmentRing:
             self._delete_files(victim)
 
     def _camera_duration(self, camera_id: str) -> float:
-        return sum(fragment.duration_seconds for fragment in self.fragments(camera_id))
+        fragments = self.fragments(camera_id)
+        if not fragments:
+            return 0.0
+        return (fragments[-1].end_at - fragments[0].start_at).total_seconds()
 
     def _camera_bytes(self, camera_id: str) -> int:
-        return sum(fragment.size_bytes for fragment in self.fragments(camera_id))
+        adopted = sum(fragment.size_bytes for fragment in self.fragments(camera_id))
+        incoming = self._incoming_bytes_by_camera().get(camera_id, 0)
+        reserved = self._staging_reservations.get(camera_id, 0)
+        return adopted + max(incoming, reserved)
+
+    def _incoming_bytes_by_camera(self) -> dict[str, int]:
+        incoming_root = self.root / ".incoming"
+        if not incoming_root.exists() or incoming_root.is_symlink():
+            return {}
+        camera_keys = {
+            hashlib.sha256(camera_id.encode()).hexdigest(): camera_id
+            for camera_id in self._staging_reservations
+        }
+        totals: dict[str, int] = {}
+        for directory in incoming_root.iterdir():
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            camera_id = camera_keys.get(directory.name, f"unreserved:{directory.name}")
+            total = 0
+            for path in directory.rglob("*"):
+                try:
+                    path_stat = path.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(path_stat.st_mode):
+                    total += path_stat.st_size
+            totals[camera_id] = total
+        return totals
 
     def _delete_files(self, fragment: EncodedFragment) -> None:
         self._metadata_path(fragment).unlink(missing_ok=True)
         fragment.path.unlink(missing_ok=True)
         if fragment.path.parent.exists():
             _fsync_directory(fragment.path.parent)
+
+    @staticmethod
+    def _fragment_identity(
+        *,
+        camera_id: str,
+        stream_epoch: str,
+        start_at: datetime,
+        end_at: datetime,
+        codec: Codec,
+        starts_with_keyframe: bool,
+        digest: str,
+    ) -> str:
+        material = (
+            f"{camera_id}\0{stream_epoch}\0{start_at.isoformat()}\0{end_at.isoformat()}\0"
+            f"{codec}\0{int(starts_with_keyframe)}\0{digest}"
+        ).encode()
+        return hashlib.sha256(material).hexdigest()
+
+    def _discard_overlapping_restart_records(self) -> None:
+        previous_end: dict[tuple[str, str], datetime] = {}
+        ordered = sorted(
+            self._records.values(),
+            key=lambda record: (
+                record.fragment.camera_id,
+                record.fragment.stream_epoch,
+                record.fragment.start_at,
+                record.fragment.end_at,
+                record.fragment.fragment_id,
+            ),
+        )
+        for record in ordered:
+            fragment = record.fragment
+            key = (fragment.camera_id, fragment.stream_epoch)
+            if key in previous_end and fragment.start_at < previous_end[key]:
+                self._records.pop(fragment.fragment_id, None)
+                self._delete_files(fragment)
+                continue
+            previous_end[key] = fragment.end_at
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,16 +765,31 @@ def gstreamer_splitmux_sink_spec(
     codec: Codec,
     fragment_seconds: int,
     max_fragment_bytes: int,
+    ring_seconds: int,
+    max_camera_bytes: int,
+    writer_generation: str = "standalone",
 ) -> GStreamerSplitMuxSinkSpec:
     """Return the exact bounded target sink contract without importing GStreamer."""
     if fragment_seconds not in (1, 2):
         raise ValueError("splitmux fragments must be 1-2 seconds")
     if max_fragment_bytes <= 0:
         raise ValueError("splitmux max_fragment_bytes must be finite and positive")
+    if ring_seconds <= 0 or max_camera_bytes < max_fragment_bytes:
+        raise ValueError("splitmux staging bounds must cover one finite fragment")
     if codec not in ("h264", "h265"):
         raise ValueError("splitmux codec must be h264 or h265")
     camera_key = hashlib.sha256(camera_id.encode()).hexdigest()
-    incoming = Path(spool_root).absolute() / ".incoming" / camera_key
+    if not writer_generation or "/" in writer_generation or "\\" in writer_generation:
+        raise ValueError("writer generation must be one safe path component")
+    incoming = (
+        Path(spool_root).absolute()
+        / ".incoming"
+        / camera_key
+        / writer_generation
+    )
+    duration_files = (ring_seconds + fragment_seconds - 1) // fragment_seconds
+    byte_files = max_camera_bytes // max_fragment_bytes
+    staging_max_files = max(1, min(duration_files, byte_files))
     return GStreamerSplitMuxSinkSpec(
         factory="splitmuxsink",
         codec=codec,
@@ -576,11 +797,100 @@ def gstreamer_splitmux_sink_spec(
             "location": incoming / "%05d.part.mp4",
             "muxer-factory": "mp4mux",
             "max-size-time": fragment_seconds * 1_000_000_000,
-            "max-size-bytes": max_fragment_bytes,
+            # GStreamer documents keyframe requests as effective only when
+            # byte-based splitting is disabled. Byte bounds are enforced by
+            # the ring's separate staging reservation.
+            "max-size-bytes": 0,
             "send-keyframe-requests": True,
-            "async-finalize": True,
+            "async-finalize": False,
+            # These files are unadopted staging only, never ring-owned or
+            # pinned evidence. Synchronous close adoption removes them first;
+            # the finite fallback prevents an unhealthy bus from accumulating
+            # unbounded closed fragments.
+            "max-files": staging_max_files,
         },
     )
+
+
+class SourceTimeMappingError(RuntimeError):
+    """A splitmux running timestamp cannot be bound to trusted source UTC."""
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceTimeAnchor:
+    stream_epoch: str
+    running_time_ns: int
+    source_time: datetime
+
+
+class SourceTimeMapper:
+    """Map GStreamer running time to source UTC inside one camera stream epoch."""
+
+    def __init__(self, *, max_delta_seconds: float = 60.0) -> None:
+        if max_delta_seconds <= 0:
+            raise ValueError("source-time mapping delta must be finite and positive")
+        self.max_delta_seconds = max_delta_seconds
+        self._anchors: dict[str, _SourceTimeAnchor] = {}
+        self._lock = threading.RLock()
+
+    def anchor(
+        self,
+        *,
+        camera_id: str,
+        stream_epoch: str,
+        running_time_ns: int,
+        source_time: datetime,
+    ) -> None:
+        if not camera_id or not stream_epoch or running_time_ns < 0:
+            raise SourceTimeMappingError("invalid source-time anchor")
+        source_time = _require_utc(source_time, field="source_time")
+        with self._lock:
+            current = self._anchors.get(camera_id)
+            if (
+                current is not None
+                and current.stream_epoch == stream_epoch
+                and running_time_ns < current.running_time_ns
+            ):
+                raise SourceTimeMappingError("running time regressed within a stream epoch")
+            self._anchors[camera_id] = _SourceTimeAnchor(
+                stream_epoch=stream_epoch,
+                running_time_ns=running_time_ns,
+                source_time=source_time,
+            )
+
+    def map(
+        self,
+        *,
+        camera_id: str,
+        stream_epoch: str,
+        running_time_ns: int,
+    ) -> datetime:
+        if running_time_ns < 0:
+            raise SourceTimeMappingError("running time must be non-negative")
+        with self._lock:
+            anchor = self._anchors.get(camera_id)
+        if anchor is None or anchor.stream_epoch != stream_epoch:
+            raise SourceTimeMappingError("source-time mapping is not anchored for this epoch")
+        delta_seconds = (running_time_ns - anchor.running_time_ns) / 1_000_000_000
+        if abs(delta_seconds) > self.max_delta_seconds:
+            raise SourceTimeMappingError("splitmux timestamp is outside the mapping horizon")
+        return anchor.source_time + timedelta(seconds=delta_seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenedSplitMuxFragment:
+    camera_id: str
+    location: Path
+    running_time_ns: int
+    starts_with_keyframe: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _WriterBinding:
+    camera_id: str
+    codec: Codec
+    incoming_directory: Path
+    stream_epoch: str | None = None
 
 
 class SplitMuxEvidenceSinkFactory:
@@ -600,30 +910,204 @@ class SplitMuxEvidenceSinkFactory:
         self.ring = ring
         self.fragment_seconds = fragment_seconds
         self.max_fragment_bytes = max_fragment_bytes
+        self._opened: dict[tuple[str, Path], _OpenedSplitMuxFragment] = {}
+        self._writers: dict[int, _WriterBinding] = {}
+        self._lock = threading.RLock()
 
     def __call__(self, gst: object, source: object) -> object:
         camera_id = str(getattr(source, "camera_id"))
         source_id = int(getattr(source, "source_id"))
         codec = getattr(source, "codec")
+        self.ring.reserve_staging(camera_id, self.max_fragment_bytes)
+        writer_generation = uuid4().hex
         spec = gstreamer_splitmux_sink_spec(
             spool_root=self.ring.root,
             camera_id=camera_id,
             codec=codec,
             fragment_seconds=self.fragment_seconds,
             max_fragment_bytes=self.max_fragment_bytes,
+            ring_seconds=self.ring.ring_seconds,
+            max_camera_bytes=self.ring.max_camera_bytes,
+            writer_generation=writer_generation,
         )
-        location = Path(spec.properties["location"])
-        location.parent.mkdir(parents=True, exist_ok=True)
-        sink = gst.ElementFactory.make(spec.factory, f"evidence-writer-{source_id}")  # type: ignore[attr-defined]
-        if sink is None:
-            raise RuntimeError("required GStreamer splitmuxsink is unavailable")
-        for name, value in spec.properties.items():
-            sink.set_property(name, str(value) if name == "location" else value)
-        sink.set_property(
-            "max-files",
-            math.ceil(self.ring.ring_seconds / self.fragment_seconds) + 2,
+        try:
+            location = Path(spec.properties["location"])
+            location.parent.mkdir(parents=True, exist_ok=True)
+            sink = gst.ElementFactory.make(spec.factory, f"evidence-writer-{source_id}")  # type: ignore[attr-defined]
+            if sink is None:
+                raise RuntimeError("required GStreamer splitmuxsink is unavailable")
+            for name, value in spec.properties.items():
+                sink.set_property(name, str(value) if name == "location" else value)
+            with self._lock:
+                self._writers[id(sink)] = _WriterBinding(
+                    camera_id=camera_id,
+                    codec=codec,
+                    incoming_directory=location.parent,
+                )
+            return sink
+        except BaseException:
+            self.ring.release_staging(camera_id)
+            raise
+
+    def disable(self, camera_id: str) -> None:
+        """Release the open-fragment reservation after the writer is stopped."""
+        self.reset_camera(camera_id)
+        with self._lock:
+            writer_ids = [
+                writer_id
+                for writer_id, binding in self._writers.items()
+                if binding.camera_id == camera_id
+            ]
+        for writer_id in writer_ids:
+            self._unbind_writer_id(writer_id)
+        self.ring.release_staging(camera_id)
+
+    def reset_camera(self, camera_id: str) -> None:
+        """Discard stale open callbacks before a camera-local source rebuild."""
+        with self._lock:
+            self._opened = {
+                key: opened
+                for key, opened in self._opened.items()
+                if opened.camera_id != camera_id
+            }
+
+    def bind_writer(self, writer: object, *, stream_epoch: str) -> None:
+        if not stream_epoch:
+            raise ValueError("writer stream epoch must be non-empty")
+        with self._lock:
+            binding = self._writers.get(id(writer))
+            if binding is None:
+                raise ValueError("evidence writer was not created by this factory")
+            self._writers[id(writer)] = _WriterBinding(
+                camera_id=binding.camera_id,
+                codec=binding.codec,
+                incoming_directory=binding.incoming_directory,
+                stream_epoch=stream_epoch,
+            )
+
+    def unbind_writer(self, writer: object) -> None:
+        self._unbind_writer_id(id(writer))
+
+    def _unbind_writer_id(self, writer_id: int) -> None:
+        with self._lock:
+            binding = self._writers.pop(writer_id, None)
+            if binding is None:
+                return
+            self._opened = {
+                key: opened
+                for key, opened in self._opened.items()
+                if not opened.location.is_relative_to(binding.incoming_directory)
+            }
+            has_replacement = any(
+                item.camera_id == binding.camera_id for item in self._writers.values()
+            )
+        if binding.incoming_directory.exists():
+            shutil.rmtree(binding.incoming_directory)
+            _fsync_directory(binding.incoming_directory.parent)
+        if not has_replacement:
+            self.ring.release_staging(binding.camera_id)
+
+    def handle_writer_message(
+        self,
+        *,
+        writer: object,
+        structure: object,
+        source_time_mapper: SourceTimeMapper,
+    ) -> EncodedFragment | None:
+        with self._lock:
+            binding = self._writers.get(id(writer))
+        if binding is None:
+            # Delayed messages from a stopped/rebuilt writer are stale by
+            # construction and must never inherit a replacement's epoch.
+            return None
+        if binding.stream_epoch is None:
+            raise SourceTimeMappingError("evidence writer has no bound stream epoch")
+        return self.handle_splitmux_message(
+            camera_id=binding.camera_id,
+            codec=binding.codec,
+            stream_epoch=binding.stream_epoch,
+            structure=structure,
+            source_time_mapper=source_time_mapper,
         )
-        return sink
+
+    def handle_splitmux_message(
+        self,
+        *,
+        camera_id: str,
+        codec: Codec,
+        stream_epoch: str,
+        structure: object,
+        source_time_mapper: SourceTimeMapper,
+    ) -> EncodedFragment | None:
+        """Consume standard splitmux opened/closed element messages."""
+        name = str(structure.get_name())  # type: ignore[attr-defined]
+        if name not in {"splitmuxsink-fragment-opened", "splitmuxsink-fragment-closed"}:
+            return None
+        location_value = self._structure_value(structure, "location")
+        running_value = self._structure_value(structure, "running-time")
+        if not isinstance(location_value, str) or not isinstance(running_value, int):
+            raise ValueError("splitmux message omitted location or running-time")
+        location = Path(location_value).absolute()
+        key = (camera_id, location)
+        if name == "splitmuxsink-fragment-opened":
+            keyframe_value = self._structure_value(
+                structure,
+                "starts-with-keyframe",
+                default=True,
+            )
+            if type(keyframe_value) is not bool:
+                raise ValueError("splitmux keyframe state must be boolean")
+            opened = _OpenedSplitMuxFragment(
+                camera_id=camera_id,
+                location=location,
+                running_time_ns=running_value,
+                # splitmux opens on the keyframe requested by this factory's
+                # send-keyframe-requests contract. A supplied adapter flag can
+                # only tighten that guarantee.
+                starts_with_keyframe=keyframe_value,
+            )
+            with self._lock:
+                if key in self._opened:
+                    raise ValueError("splitmux fragment was opened twice")
+                self._opened[key] = opened
+            self.ring.assert_staging_within_bounds(camera_id)
+            return None
+        with self._lock:
+            opened = self._opened.pop(key, None)
+        if opened is None or running_value <= opened.running_time_ns:
+            raise ValueError("splitmux close did not match a valid open fragment")
+        start_at = source_time_mapper.map(
+            camera_id=camera_id,
+            stream_epoch=stream_epoch,
+            running_time_ns=opened.running_time_ns,
+        )
+        end_at = source_time_mapper.map(
+            camera_id=camera_id,
+            stream_epoch=stream_epoch,
+            running_time_ns=running_value,
+        )
+        return self.commit_closed_fragment(
+            camera_id=camera_id,
+            part_path=location,
+            start_at=start_at,
+            end_at=end_at,
+            codec=codec,
+            starts_with_keyframe=opened.starts_with_keyframe,
+            stream_epoch=stream_epoch,
+        )
+
+    @staticmethod
+    def _structure_value(
+        structure: object,
+        name: str,
+        *,
+        default: object | None = None,
+    ) -> object:
+        try:
+            value = structure.get_value(name)  # type: ignore[attr-defined]
+        except (AttributeError, KeyError, TypeError):
+            return default
+        return default if value is None else value
 
     def commit_closed_fragment(
         self,
@@ -634,8 +1118,17 @@ class SplitMuxEvidenceSinkFactory:
         end_at: datetime,
         codec: Codec,
         starts_with_keyframe: bool,
+        stream_epoch: str = "default",
     ) -> EncodedFragment:
         """Finalise a target splitmux fragment after its close message supplies source time."""
+        part = Path(part_path)
+        try:
+            size = part.stat(follow_symlinks=False).st_size
+        except OSError as exc:
+            raise ValueError("closed splitmux fragment is unavailable") from exc
+        if size > self.max_fragment_bytes:
+            raise SpoolCapacityError("closed splitmux fragment exceeds staging byte bound")
+        self.ring.assert_staging_within_bounds(camera_id)
         return self.ring.commit_closed_fragment(
             camera_id=camera_id,
             part_path=part_path,
@@ -643,15 +1136,102 @@ class SplitMuxEvidenceSinkFactory:
             end_at=end_at,
             codec=codec,
             starts_with_keyframe=starts_with_keyframe,
+            stream_epoch=stream_epoch,
         )
 
 
 class CodecTool(Protocol):
     nvenc_available: bool
 
-    def remux_h264(self, inputs: tuple[Path, ...], output: Path) -> None: ...
+    def remux_h264(
+        self,
+        inputs: tuple[Path, ...],
+        output: Path,
+        *,
+        pass_fds: tuple[int, ...],
+    ) -> None: ...
 
-    def transcode_h265_nvenc(self, inputs: tuple[Path, ...], output: Path) -> None: ...
+    def transcode_h265_nvenc(
+        self,
+        inputs: tuple[Path, ...],
+        output: Path,
+        *,
+        pass_fds: tuple[int, ...],
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class MediaInfo:
+    """Probed browser-relevant media facts, never inferred from extension alone."""
+
+    duration_seconds: float
+    codec: str
+    profile: str
+    pixel_format: str
+    browser_compatible: bool
+
+
+class MediaProbe(Protocol):
+    def probe(self, path: Path, *, pass_fds: tuple[int, ...] = ()) -> MediaInfo: ...
+
+
+class FfprobeMediaProbe:
+    """Bounded ffprobe adapter used to model actual browser compatibility."""
+
+    def __init__(self, executable: str | None = None) -> None:
+        self.executable = executable or shutil.which("ffprobe") or "ffprobe"
+
+    def probe(self, path: Path, *, pass_fds: tuple[int, ...] = ()) -> MediaInfo:
+        try:
+            result = subprocess.run(
+                (
+                    self.executable,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "format=duration:stream=codec_name,profile,pix_fmt",
+                    "-of",
+                    "json",
+                    str(path),
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                pass_fds=pass_fds,
+            )
+            payload = json.loads(result.stdout)
+            stream = payload["streams"][0]
+            duration = float(payload["format"]["duration"])
+            codec = str(stream["codec_name"]).lower()
+            profile = str(stream.get("profile", ""))
+            pixel_format = str(stream.get("pix_fmt", "")).lower()
+        except (
+            IndexError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            raise ClipAssemblyError("media compatibility probe failed") from exc
+        compatible_profiles = {"baseline", "constrained baseline", "main", "high"}
+        browser_compatible = (
+            codec == "h264"
+            and profile.strip().lower() in compatible_profiles
+            and pixel_format == "yuv420p"
+        )
+        return MediaInfo(
+            duration_seconds=duration,
+            codec=codec,
+            profile=profile,
+            pixel_format=pixel_format,
+            browser_compatible=browser_compatible,
+        )
 
 
 class FfmpegCodecTool:
@@ -704,6 +1284,10 @@ class FfmpegCodecTool:
             "h264_nvenc",
             "-preset",
             "p4",
+            "-profile:v",
+            "high",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-movflags",
@@ -711,13 +1295,25 @@ class FfmpegCodecTool:
             str(output),
         )
 
-    def remux_h264(self, inputs: tuple[Path, ...], output: Path) -> None:
-        self._run(inputs, output, nvenc=False)
+    def remux_h264(
+        self,
+        inputs: tuple[Path, ...],
+        output: Path,
+        *,
+        pass_fds: tuple[int, ...],
+    ) -> None:
+        self._run(inputs, output, nvenc=False, pass_fds=pass_fds)
 
-    def transcode_h265_nvenc(self, inputs: tuple[Path, ...], output: Path) -> None:
+    def transcode_h265_nvenc(
+        self,
+        inputs: tuple[Path, ...],
+        output: Path,
+        *,
+        pass_fds: tuple[int, ...],
+    ) -> None:
         if not self.nvenc_available:
             raise ClipAssemblyError("NVENC H.264 encoder is unavailable")
-        self._run(inputs, output, nvenc=True)
+        self._run(inputs, output, nvenc=True, pass_fds=pass_fds)
 
     def _detect_nvenc(self) -> bool:
         try:
@@ -732,7 +1328,14 @@ class FfmpegCodecTool:
             return False
         return "h264_nvenc" in result.stdout
 
-    def _run(self, inputs: tuple[Path, ...], output: Path, *, nvenc: bool) -> None:
+    def _run(
+        self,
+        inputs: tuple[Path, ...],
+        output: Path,
+        *,
+        nvenc: bool,
+        pass_fds: tuple[int, ...],
+    ) -> None:
         concat_file = output.with_name(f".{output.name}.{uuid4().hex}.concat")
         try:
             lines = []
@@ -746,7 +1349,13 @@ class FfmpegCodecTool:
                 else self.remux_command(concat_file, output)
             )
             command = (self.executable, *command[1:])
-            subprocess.run(command, check=True, capture_output=True, timeout=120)
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                timeout=120,
+                pass_fds=pass_fds,
+            )
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise ClipAssemblyError("ffmpeg evidence assembly failed") from exc
         finally:
@@ -766,19 +1375,48 @@ class AssembledEvidence:
 class ClipAssembler:
     """Atomic H.264 remux or bounded target-only H.265→H.264 NVENC assembly."""
 
-    def __init__(self, codec_tool: CodecTool, *, max_nvenc_jobs: int) -> None:
+    def __init__(
+        self,
+        codec_tool: CodecTool,
+        media_probe: MediaProbe,
+        *,
+        max_nvenc_jobs: int,
+    ) -> None:
         if max_nvenc_jobs <= 0:
             raise ValueError("max_nvenc_jobs must be a finite positive bound")
         self._codec_tool = codec_tool
+        self._media_probe = media_probe
         self._nvenc_slots = threading.BoundedSemaphore(max_nvenc_jobs)
 
     def assemble(self, reservation: EvidenceReservation, output: str | Path) -> AssembledEvidence:
+        """Build the final, duration-attested evidence clip."""
         if reservation.status != "ready":
             raise ClipAssemblyError("post-roll is still pending")
-        if not 4.0 <= reservation.duration_seconds <= 10.0:
+        return self._assemble(reservation, output, final=True)
+
+    def assemble_preview(
+        self,
+        reservation: EvidenceReservation,
+        output: str | Path,
+    ) -> AssembledEvidence:
+        """Build a browser-playable pending preview without releasing its pins."""
+        return self._assemble(reservation, output, final=False)
+
+    def _assemble(
+        self,
+        reservation: EvidenceReservation,
+        output: str | Path,
+        *,
+        final: bool,
+    ) -> AssembledEvidence:
+        expected_duration = reservation.duration_seconds
+        if not reservation.fragments:
+            raise ClipAssemblyError("evidence reservation has no encoded fragments")
+        if final and not 4.0 <= expected_duration <= 10.0:
             raise ClipAssemblyError("evidence clip must be 4-10 seconds")
-        if not reservation.fragments[0].starts_with_keyframe:
-            raise ClipAssemblyError("evidence must begin at a keyframe")
+        if not final and not 0.0 < expected_duration <= 10.0:
+            raise ClipAssemblyError("evidence preview must be no longer than 10 seconds")
+        self._validate_fragment_chain(reservation)
         codecs = {fragment.codec for fragment in reservation.fragments}
         if len(codecs) != 1:
             raise ClipAssemblyError("evidence fragments use mixed codecs")
@@ -786,20 +1424,49 @@ class ClipAssembler:
         output_path = Path(output).absolute()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = output_path.with_name(f".{output_path.stem}.{uuid4().hex}.part.mp4")
-        inputs = tuple(fragment.path for fragment in reservation.fragments)
         acquired = False
         try:
-            if source_codec == "h264":
-                self._codec_tool.remux_h264(inputs, temporary)
-            else:
-                if not self._codec_tool.nvenc_available:
-                    raise ClipAssemblyError("NVENC H.264 encoder is unavailable")
-                acquired = self._nvenc_slots.acquire(blocking=False)
-                if not acquired:
-                    raise NvencCapacityError("NVENC evidence transcode capacity is full")
-                self._codec_tool.transcode_h265_nvenc(inputs, temporary)
+            with self._attested_inputs(reservation) as (inputs, pass_fds):
+                media_items: list[MediaInfo] = []
+                for path in inputs:
+                    self._rewind_descriptors(pass_fds)
+                    media_items.append(
+                        self._media_probe.probe(path, pass_fds=pass_fds)
+                    )
+                media = tuple(media_items)
+                self._rewind_descriptors(pass_fds)
+                source_is_browser_compatible = (
+                    source_codec == "h264"
+                    and all(item.browser_compatible for item in media)
+                )
+                if source_is_browser_compatible:
+                    self._codec_tool.remux_h264(
+                        inputs,
+                        temporary,
+                        pass_fds=pass_fds,
+                    )
+                else:
+                    if not self._codec_tool.nvenc_available:
+                        raise ClipAssemblyError("NVENC H.264 encoder is unavailable")
+                    acquired = self._nvenc_slots.acquire(blocking=False)
+                    if not acquired:
+                        raise NvencCapacityError("NVENC evidence transcode capacity is full")
+                    self._codec_tool.transcode_h265_nvenc(
+                        inputs,
+                        temporary,
+                        pass_fds=pass_fds,
+                    )
             if not temporary.is_file() or temporary.stat().st_size <= 0:
                 raise ClipAssemblyError("codec tool did not produce a playable clip")
+            output_media = self._media_probe.probe(temporary)
+            if not output_media.browser_compatible or output_media.codec != "h264":
+                raise ClipAssemblyError("assembled evidence is not browser-compatible H.264")
+            if abs(output_media.duration_seconds - expected_duration) > 0.25:
+                raise ClipAssemblyError("assembled evidence duration does not match source time")
+            if final and not 4.0 <= output_media.duration_seconds <= 10.0:
+                raise ClipAssemblyError("assembled evidence duration is outside 4-10 seconds")
+            if not final and not 0.0 < output_media.duration_seconds <= 10.0:
+                raise ClipAssemblyError("assembled preview duration is outside its finite bound")
             os.replace(temporary, output_path)
             _fsync_directory(output_path.parent)
         finally:
@@ -816,3 +1483,87 @@ class ClipAssembler:
             end_at=reservation.end_at,
             source_codec=source_codec,
         )
+
+    @staticmethod
+    def _rewind_descriptors(descriptors: tuple[int, ...]) -> None:
+        for descriptor in descriptors:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+
+    @staticmethod
+    def _validate_fragment_chain(reservation: EvidenceReservation) -> None:
+        fragments = reservation.fragments
+        if not fragments[0].starts_with_keyframe:
+            raise ClipAssemblyError("evidence must begin at a keyframe")
+        epoch = fragments[0].stream_epoch
+        previous_end: datetime | None = None
+        for fragment in fragments:
+            if fragment.camera_id != reservation.camera_id or fragment.stream_epoch != epoch:
+                raise ClipAssemblyError("evidence fragments cross a camera or stream epoch")
+            if previous_end is not None and fragment.start_at != previous_end:
+                raise ClipAssemblyError("evidence fragments are not a contiguous source-time chain")
+            previous_end = fragment.end_at
+
+    @contextmanager
+    def _attested_inputs(
+        self,
+        reservation: EvidenceReservation,
+    ):
+        descriptors: list[int] = []
+        inputs: list[Path] = []
+        try:
+            for fragment in reservation.fragments:
+                metadata = self._read_metadata_safely(fragment)
+                pins = metadata.get("pins")
+                if (
+                    metadata.get("fragment_id") != fragment.fragment_id
+                    or metadata.get("sha256") != fragment.sha256
+                    or not isinstance(pins, dict)
+                    or reservation.reservation_id not in pins
+                ):
+                    raise ClipAssemblyError("pinned fragment metadata integrity check failed")
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(fragment.path, flags)
+                descriptors.append(descriptor)
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size != fragment.size_bytes:
+                    raise ClipAssemblyError("pinned fragment integrity check failed")
+                digest = hashlib.sha256()
+                while block := os.read(descriptor, 1024 * 1024):
+                    digest.update(block)
+                if digest.hexdigest() != fragment.sha256:
+                    raise ClipAssemblyError("pinned fragment integrity check failed")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                inputs.append(Path(f"/dev/fd/{descriptor}"))
+            yield tuple(inputs), tuple(descriptors)
+        except OSError as exc:
+            raise ClipAssemblyError("pinned fragment integrity check failed") from exc
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+    @staticmethod
+    def _read_metadata_safely(fragment: EncodedFragment) -> dict[str, object]:
+        metadata_path = fragment.path.with_suffix(".json")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(metadata_path, flags)
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ClipAssemblyError("pinned fragment metadata integrity check failed")
+            payload = bytearray()
+            while block := os.read(descriptor, 64 * 1024):
+                payload.extend(block)
+                if len(payload) > 1024 * 1024:
+                    raise ClipAssemblyError("pinned fragment metadata is unbounded")
+            decoded = json.loads(payload)
+            if not isinstance(decoded, dict):
+                raise ClipAssemblyError("pinned fragment metadata is invalid")
+            return decoded
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ClipAssemblyError("pinned fragment metadata integrity check failed") from exc
+        finally:
+            os.close(descriptor)

@@ -34,6 +34,7 @@ from protector.pilot.runtime.deepstream import (
     NvidiaBindingsUnavailable,
     RuntimeModelManifestV1,
     SourceRecoveryCoordinator,
+    build_evidence_sink_factory,
     configure_nvtracker,
     evidence_placeholder_properties,
     main,
@@ -43,6 +44,11 @@ from protector.pilot.runtime.deepstream import (
     rtsp_caps_fields,
     should_link_rtsp_video_pad,
     stop_pipeline,
+)
+from protector.pilot.runtime.evidence import (
+    EncodedFragmentRing,
+    SourceTimeMapper,
+    SplitMuxEvidenceSinkFactory,
 )
 from protector.pilot.runtime.supervisor import CameraSupervisor
 
@@ -393,9 +399,17 @@ def test_encoded_writer_replaces_discard_only_after_factory_succeeds() -> None:
         runtime_info=lambda: ("8.9", "10.16.0.72"),
         evidence_sink_factory=failed_factory,
     )
-    fallback = fallback_runtime._build_source_bin(Gst, source, "rtsp://redacted")
-    assert fallback.elements["evidence-0"].links == [fallback.elements["evidence-discard-0"]]
+    with pytest.raises(RuntimeError, match="bounded evidence writer"):
+        fallback_runtime._build_source_bin(Gst, source, "rtsp://redacted")
     assert fallback_runtime.evidence_attachment_failures == 1
+
+    development_runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        evidence_sink_factory=None,
+    )
+    discard = development_runtime._build_source_bin(Gst, source, "rtsp://redacted")
+    assert discard.elements["evidence-0"].links == [discard.elements["evidence-discard-0"]]
 
 
 def test_rtsp_dynamic_pad_accepts_only_matching_video_rtp_caps() -> None:
@@ -512,11 +526,16 @@ def test_inner_rtsp_error_routes_to_its_camera_and_rebuilds_only_after_backoff()
         monotonic_clock=clocks.monotonic,
         wall_clock=clocks.wall,
     )
-    rebuilt: list[str] = []
+    rebuilt: list[tuple[str, object]] = []
+
+    def rebuild(camera_id: str) -> None:
+        rebuilt.append((camera_id, supervisor.health_for(camera_id).stream_epoch))
+
+    initial_epoch = supervisor.health_for("camera-01").stream_epoch
     recovery = SourceRecoveryCoordinator(
         supervisor=supervisor,
         source_ids={"camera-01": 0, "camera-02": 1},
-        rebuild_source=rebuilt.append,
+        rebuild_source=rebuild,
     )
 
     recovery.handle_element_error("depay-0")
@@ -525,7 +544,8 @@ def test_inner_rtsp_error_routes_to_its_camera_and_rebuilds_only_after_backoff()
     clocks.advance(1.0)
     recovery.advance()
 
-    assert rebuilt == ["camera-01"]
+    assert rebuilt == [("camera-01", supervisor.health_for("camera-01").stream_epoch)]
+    assert rebuilt[0][1] != initial_epoch
     assert supervisor.health_for("camera-01").state == "reconnecting"
     supervisor.accept_sample(camera_id="camera-01", source_time=clocks.wall(), monotonic_seq=0)
     assert supervisor.health_for("camera-01").state == "online"
@@ -638,6 +658,265 @@ def test_internal_rtsp_child_resolves_camera_from_source_bin_ancestry() -> None:
     assert supervisor.health_for("camera-01").state == "offline"
     assert runtime.failed_reason is None
     assert fatal_calls == []
+
+
+def test_splitmux_bus_close_maps_source_time_and_adopts_through_live_runtime(
+    tmp_path: Path,
+) -> None:
+    class Element:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.properties: dict[str, object] = {}
+            self.states: list[object] = []
+
+        def get_name(self) -> str:
+            return self.name
+
+        def get_parent(self) -> None:
+            return None
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+        def set_state(self, state: object) -> None:
+            self.states.append(state)
+
+    class Gst:
+        class State:
+            NULL = "null"
+
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, name: str) -> Element:
+                return Element(name)
+
+    class Structure:
+        def __init__(self, name: str, **values: object) -> None:
+            self.name = name
+            self.values = values
+
+        def get_name(self) -> str:
+            return self.name
+
+        def get_value(self, name: str) -> object:
+            return self.values[name]
+
+    class Message:
+        type = "element"
+
+        def __init__(self, src: Element, structure: Structure) -> None:
+            self.src = src
+            self.structure = structure
+
+        def get_structure(self) -> Structure:
+            return self.structure
+
+    ring = EncodedFragmentRing(
+        tmp_path / "spool",
+        ring_seconds=15,
+        max_camera_bytes=1_000,
+        max_spool_bytes=2_000,
+    )
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    graph = DeepStreamGraphSpec.from_site(_site())
+    source = graph.sources[0]
+    sink = factory(Gst, source)
+    part = Path(str(sink.properties["location"]).replace("%05d", "00001"))
+    part.write_bytes(b"runtime-closed-fragment")
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        evidence_sink_factory=factory,
+    )
+    supervisor = CameraSupervisor(
+        camera_ids=tuple(item.camera_id for item in graph.sources),
+        observation_queue_size=4,
+        monotonic_clock=lambda: 0.0,
+        wall_clock=lambda: datetime(2026, 7, 28, 9, 0, tzinfo=UTC),
+    )
+    runtime._graph = graph
+    runtime._supervisor = supervisor
+    runtime._bindings = type("Bindings", (), {"gst": Gst})()
+    epoch = str(supervisor.health_for(source.camera_id).stream_epoch)
+    factory.bind_writer(sink, stream_epoch=epoch)
+    runtime._source_time_mapper.anchor(
+        camera_id=source.camera_id,
+        stream_epoch=epoch,
+        running_time_ns=10_000_000_000,
+        source_time=datetime(2026, 7, 28, 9, 0, tzinfo=UTC),
+    )
+
+    runtime._on_bus_message(
+        None,
+        Message(
+            sink,
+            Structure(
+                "splitmuxsink-fragment-opened",
+                location=str(part),
+                **{"running-time": 9_000_000_000},
+            ),
+        ),
+    )
+    runtime._on_bus_message(
+        None,
+        Message(
+            sink,
+            Structure(
+                "splitmuxsink-fragment-closed",
+                location=str(part),
+                **{"running-time": 11_000_000_000},
+            ),
+        ),
+    )
+
+    fragments = ring.fragments(source.camera_id)
+    assert len(fragments) == 1
+    assert fragments[0].stream_epoch == epoch
+    assert fragments[0].start_at == datetime(2026, 7, 28, 8, 59, 59, tzinfo=UTC)
+    assert not part.exists()
+
+    oversized = part.with_name("00002.part.mp4")
+    oversized.write_bytes(b"x" * 101)
+    runtime._on_bus_message(
+        None,
+        Message(
+            sink,
+            Structure(
+                "splitmuxsink-fragment-opened",
+                location=str(oversized),
+                **{"running-time": 12_000_000_000},
+            ),
+        ),
+    )
+    runtime._on_bus_message(
+        None,
+        Message(
+            sink,
+            Structure(
+                "splitmuxsink-fragment-closed",
+                location=str(oversized),
+                **{"running-time": 14_000_000_000},
+            ),
+        ),
+    )
+    assert runtime.evidence_attachment_failures == 1
+    assert sink.states == ["null"]
+    assert supervisor.health_for(source.camera_id).state == "offline"
+
+
+def test_target_config_builds_the_bounded_writer_instead_of_discarding_encoded_branch(
+    tmp_path: Path,
+) -> None:
+    site = _site()
+    retention = site.storage.retention.model_copy(
+        update={
+            "encoded_spool_root": tmp_path / "owned-spool",
+            "encoded_ring_max_camera_bytes": 1_000,
+            "encoded_ring_max_spool_bytes": 20_000,
+            "encoded_fragment_max_bytes": 100,
+        }
+    )
+    configured = site.model_copy(
+        update={
+            "storage": site.storage.model_copy(
+                update={"retention": retention},
+            )
+        }
+    )
+
+    factory = build_evidence_sink_factory(configured)
+
+    assert factory.ring.root == (tmp_path / "owned-spool").resolve()
+    assert factory.fragment_seconds == 2
+    assert factory.max_fragment_bytes == 100
+
+
+def test_runtime_stop_clears_writer_generation_and_allows_clean_restart(
+    tmp_path: Path,
+) -> None:
+    class Element:
+        def __init__(self) -> None:
+            self.properties: dict[str, object] = {}
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+    class Gst:
+        class State:
+            NULL = "null"
+
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                return Element()
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.states: list[object] = []
+
+        def set_state(self, state: object) -> None:
+            self.states.append(state)
+
+    class Structure:
+        def get_name(self) -> str:
+            return "splitmuxsink-fragment-closed"
+
+        def get_value(self, name: str) -> object:
+            return {
+                "location": "/already/removed/old.part.mp4",
+                "running-time": 2_000_000_000,
+            }[name]
+
+    ring = EncodedFragmentRing(
+        tmp_path / "spool",
+        ring_seconds=15,
+        max_camera_bytes=1_000,
+        max_spool_bytes=2_000,
+    )
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    graph = DeepStreamGraphSpec.from_site(_site())
+    source = graph.sources[0]
+    old_writer = factory(Gst, source)
+    epoch = "epoch-before-stop"
+    factory.bind_writer(old_writer, stream_epoch=epoch)
+    open_part = Path(
+        str(old_writer.properties["location"]).replace("%05d", "00001")
+    )
+    open_part.write_bytes(b"unadopted")
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        evidence_sink_factory=factory,
+    )
+    pipeline = Pipeline()
+    runtime._graph = graph
+    runtime._pipeline = pipeline
+    runtime._bindings = type("Bindings", (), {"gst": Gst})()
+
+    runtime.stop()
+
+    assert pipeline.states == ["null"]
+    assert not open_part.exists()
+    assert ring.used_bytes == 0
+    assert (
+        factory.handle_writer_message(
+            writer=old_writer,
+            structure=Structure(),
+            source_time_mapper=SourceTimeMapper(),
+        )
+        is None
+    )
+    restarted_writer = factory(Gst, source)
+    factory.bind_writer(restarted_writer, stream_epoch="epoch-after-stop")
+    assert ring.used_bytes == 100
 
 
 def test_failed_camera_local_rebuild_returns_only_that_camera_to_backoff() -> None:
@@ -935,6 +1214,52 @@ def test_metadata_publisher_emits_versioned_observations_without_cpu_surface_acc
     assert published.class_name == "person"
     assert published.model_artifact_id == "person-primary-v1"
     assert published.sample_kind == "fresh"
+
+
+def test_frame_metadata_anchors_splitmux_running_time_to_camera_rtcp_utc() -> None:
+    clocks = Clocks()
+    graph = DeepStreamGraphSpec.from_site(_site())
+    supervisor = CameraSupervisor(
+        camera_ids=tuple(source.camera_id for source in graph.sources),
+        observation_queue_size=4,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+    )
+    runtime._graph = graph
+    runtime._supervisor = supervisor
+    runtime._metadata_publisher = MetadataPublisher(
+        supervisor=supervisor,
+        model_artifact_id="person-primary-v1",
+    )
+    ntp_timestamp = int(clocks.wall().timestamp() * 1_000_000_000)
+    frame = type(
+        "Frame",
+        (),
+        {
+            "source_id": 0,
+            "ntp_timestamp": ntp_timestamp,
+            "buf_pts": 7_000_000_000,
+            "source_frame_width": 1920,
+            "source_frame_height": 1080,
+            "frame_num": 1,
+            "obj_meta_list": None,
+        },
+    )()
+    pyds = type("Pyds", (), {})()
+
+    runtime._publish_frame_metadata(frame, pyds)
+
+    camera_id = graph.sources[0].camera_id
+    epoch = str(supervisor.health_for(camera_id).stream_epoch)
+    assert runtime._source_time_mapper.map(
+        camera_id=camera_id,
+        stream_epoch=epoch,
+        running_time_ns=8_000_000_000,
+    ) == clocks.wall() + timedelta(seconds=1)
 
 
 def test_objects_from_one_frame_publish_distinct_deterministic_observation_sequences() -> None:

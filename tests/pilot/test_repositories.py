@@ -857,6 +857,60 @@ def test_concurrent_idempotent_retries_return_single_rows(tmp_path: Path) -> Non
     assert len({row.outbox_id for row in outbox_rows}) == 1
 
 
+def test_concurrent_ready_and_failed_evidence_can_never_downgrade_ready(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'evidence-race.sqlite3'}")
+    Base.metadata.create_all(engine)
+    repository = PilotRepository(create_session_factory(engine))
+    repository.add_site(site_id="site-1", name="Pilot School")
+    repository.add_camera(
+        camera_id="cam-01",
+        site_id="site-1",
+        name="Entrance",
+        source_reference="nvr://camera/01",
+        codec="h264",
+    )
+    repository.add_model_artifact(_artifact())
+    event_contract = _event()
+    repository.add_event(event_contract)
+    evidence = EvidenceInput(
+        evidence_id=uuid4(),
+        event_id=event_contract.event_id,
+        object_key="events/concurrent-finalize.mp4",
+        sha256="e" * 64,
+        codec="h264",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=5),
+        source_reference="nvr://camera/01?segment=finalize",
+        status="pending",
+    )
+    barrier = Barrier(2)
+    outcomes: list[object] = []
+
+    def finalize(status: str) -> None:
+        barrier.wait(timeout=5)
+        try:
+            outcomes.append(repository.finalize_evidence(evidence, status=status))  # type: ignore[arg-type]
+        except BaseException as exc:  # pragma: no cover - asserted below
+            outcomes.append(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(finalize, "ready"),
+            executor.submit(finalize, "failed"),
+        ]
+        for future in futures:
+            future.result(timeout=5)
+
+    assert repository.get_event(event_contract.event_id).evidence_status == "ready"
+    with repository.session_factory() as session:
+        row = session.scalar(select(EvidenceModel))
+        assert row is not None
+        assert row.status == "ready"
+    assert len(outcomes) == 2
+
+
 @pytest.mark.skipif(
     os.getenv("PILOT_TEST_DATABASE_URL") is None,
     reason="requires disposable PostgreSQL *_test database",
@@ -886,6 +940,56 @@ def test_postgresql_concurrent_retry_contract(repository: PilotRepository) -> No
         )
         == 1
     )
+    ready_event = _event()
+    repository.add_event(ready_event)
+    ready_evidence = EvidenceInput(
+        evidence_id=uuid4(),
+        event_id=ready_event.event_id,
+        object_key="events/postgresql-ready-retry.mp4",
+        sha256="2" * 64,
+        codec="h264",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=5),
+        source_reference="nvr://camera/01?segment=postgresql-ready-retry",
+        status="pending",
+    )
+    ready_rows = _run_concurrently(
+        lambda: repository.finalize_evidence(ready_evidence, status="ready")
+    )
+    assert {row.evidence_id for row in ready_rows} == {
+        str(ready_evidence.evidence_id)
+    }
+    assert repository.get_event(ready_event.event_id).evidence_status == "ready"
+    finalized_event = _event()
+    repository.add_event(finalized_event)
+    finalized = EvidenceInput(
+        evidence_id=uuid4(),
+        event_id=finalized_event.event_id,
+        object_key="events/postgresql-finalize.mp4",
+        sha256="1" * 64,
+        codec="h264",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=5),
+        source_reference="nvr://camera/01?segment=postgresql-finalize",
+        status="pending",
+    )
+    barrier = Barrier(2)
+
+    def finalize(status: str) -> object:
+        barrier.wait(timeout=5)
+        return repository.finalize_evidence(finalized, status=status)  # type: ignore[arg-type]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(finalize, "ready"),
+            executor.submit(finalize, "failed"),
+        ]
+        for future in futures:
+            try:
+                future.result(timeout=5)
+            except ValueError:
+                pass
+    assert repository.get_event(finalized_event.event_id).evidence_status == "ready"
     repository.add_user(
         user_id="operator-1",
         username="operator",
