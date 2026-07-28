@@ -110,7 +110,7 @@ def test_stale_source_regression_still_resets_only_its_camera_epoch() -> None:
     assert supervisor.health_for("camera-b").tracker_generation == 0
 
 
-def test_duplicate_sequence_is_rejected_inside_an_epoch_without_affecting_other_camera() -> None:
+def test_duplicate_sequence_is_dropped_without_poisoning_later_samples_or_another_camera() -> None:
     clocks = Clocks()
     supervisor = _supervisor(clocks)
     source_time = clocks.wall()
@@ -122,11 +122,19 @@ def test_duplicate_sequence_is_rejected_inside_an_epoch_without_affecting_other_
         source_time=source_time + timedelta(milliseconds=1),
         monotonic_seq=2,
     )
+    later = supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=source_time + timedelta(milliseconds=2),
+        monotonic_seq=3,
+    )
 
     assert accepted is not None
     assert other is not None
     assert duplicate is None
-    assert supervisor.health_for("camera-a").degraded_reason == "non_increasing_sequence"
+    assert later is not None
+    assert supervisor.health_for("camera-a").state == "online"
+    assert supervisor.health_for("camera-a").degraded_reason is None
+    assert supervisor.health_for("camera-a").last_monotonic_seq == 3
     assert supervisor.health_for("camera-b").state == "online"
     assert supervisor.health_for("camera-b").stream_epoch == other.stream_epoch
     assert supervisor.health_for("camera-b").last_monotonic_seq == 7
@@ -152,6 +160,28 @@ def test_explicit_source_recovery_starts_a_new_epoch_before_sequence_restarts() 
     assert recovered is not None
     assert recovered.stream_epoch != original.stream_epoch
     assert supervisor.health_for("camera-a").tracker_generation == 1
+
+
+def test_successful_reconnect_resets_backoff_for_a_later_disconnect() -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks)
+    source_time = clocks.wall()
+
+    supervisor.accept_sample(camera_id="camera-a", source_time=source_time, monotonic_seq=1)
+    supervisor.disconnect("camera-a")
+    clocks.advance(1.0)
+    supervisor.advance()
+    supervisor.recover("camera-a")
+    supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=source_time + timedelta(seconds=1),
+        monotonic_seq=0,
+    )
+    supervisor.disconnect("camera-a")
+
+    health = supervisor.health_for("camera-a")
+    assert health.reconnect_backoff_seconds == 1.0
+    assert health.next_reconnect_in_seconds == 1.0
 
 
 def test_health_snapshot_reports_age_skew_queue_and_visible_drop_counts() -> None:

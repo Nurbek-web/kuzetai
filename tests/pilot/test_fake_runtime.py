@@ -182,3 +182,4 @@ def test_fake_runtime_rejects_stale_and_cached_display_samples_and_preserves_fin
         **{f"camera-{number:02d}": None for number in range(3, 21)},
     }
     assert [item.state for item in final_health[:2]] == ["degraded", "degraded"]
+    assert final_health[0].source_time_skew_seconds == 10.0

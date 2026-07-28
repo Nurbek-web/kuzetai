@@ -205,6 +205,7 @@ class CameraSupervisor:
             self._degrade(state, "malformed_source_time")
             return None
         source_time = source_time.astimezone(now.tzinfo)
+        state.last_source_time_skew_seconds = abs((now - source_time).total_seconds())
         if sample_kind != "fresh":
             state.dropped_samples += 1
             self._degrade(state, "cached_display_sample")
@@ -223,8 +224,9 @@ class CameraSupervisor:
             return None
         if state.last_monotonic_seq is not None and monotonic_seq <= state.last_monotonic_seq:
             state.dropped_samples += 1
-            self._degrade(state, "non_increasing_sequence")
+            state.degraded_reason = "non_increasing_sequence"
             return None
+        reconnected = state.state == "reconnecting"
         if state.state == "starting":
             self._transition(state, "online")
         elif state.state == "reconnecting":
@@ -239,7 +241,9 @@ class CameraSupervisor:
         state.last_frame_at = now
         state.last_received_monotonic = self._monotonic()
         state.last_monotonic_seq = monotonic_seq
-        state.last_source_time_skew_seconds = abs((now - source_time).total_seconds())
+        if reconnected:
+            state.reconnect_backoff_seconds = 0.0
+            state.reconnect_at_monotonic = None
         state.degraded_reason = None
         observation = ObservationV1(
             schema_version="observation.v1",
