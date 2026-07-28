@@ -16,6 +16,8 @@ artifact:
 artifact_path: null
 engine_sha256: null
 engine_path: null
+nvinfer_config_path: null
+nvinfer_config_sha256: null
 precision: fp16
 target_compute_capability: "8.9" # NVIDIA L4 / Ada; verify on the target host.
 tensorrt_version: "10.16.0.72" # DeepStream 9.1 x86 compatibility.

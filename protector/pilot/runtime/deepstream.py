@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import math
 import subprocess
 import sys
 import time
@@ -133,6 +134,8 @@ class DeepStreamGraphSpec(FrozenModel):
                     "batch-size": len(feeds),
                     "live-source": 1,
                     "nvbuf-memory-type": GPU_MEMORY_TYPE,
+                    "batched-push-timeout": 40_000,
+                    "attach-sys-ts": False,
                 },
             ),
             ElementSpec(
@@ -290,6 +293,8 @@ class RuntimeModelManifestV1(FrozenModel):
     artifact_path: Path | None = None
     engine_sha256: str | None
     engine_path: Path | None = None
+    nvinfer_config_path: Path | None = None
+    nvinfer_config_sha256: str | None = None
     precision: str
     target_compute_capability: str
     tensorrt_version: str
@@ -302,6 +307,13 @@ class RuntimeModelManifestV1(FrozenModel):
     def engine_hash_is_digest_when_present(cls, value: str | None) -> str | None:
         if value is not None and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value.lower())):
             raise ValueError("engine_sha256 must be a 64-character hexadecimal digest")
+        return value
+
+    @field_validator("nvinfer_config_sha256")
+    @classmethod
+    def config_hash_is_digest_when_present(cls, value: str | None) -> str | None:
+        if value is not None and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value.lower())):
+            raise ValueError("nvinfer_config_sha256 must be a 64-character hexadecimal digest")
         return value
 
     def validate_for_host(
@@ -339,6 +351,9 @@ class RuntimeModelManifestV1(FrozenModel):
         if require_files:
             self._validate_artifact_file(self.artifact_path, self.artifact.sha256, "model")
             self._validate_artifact_file(self.engine_path, self.engine_sha256, "engine")
+            self._validate_artifact_file(
+                self.nvinfer_config_path, self.nvinfer_config_sha256, "nvinfer config"
+            )
 
     @staticmethod
     def _validate_artifact_file(path: Path | None, expected_sha256: str, label: str) -> None:
@@ -402,8 +417,15 @@ def resolve_rtsp_locations(site: SiteConfig) -> dict[str, str]:
 
 def person_config_paths_match(manifest: RuntimeModelManifestV1, config_path: Path) -> None:
     """Refuse a config that would load files other than the hash-verified pair."""
-    if manifest.artifact_path is None or manifest.engine_path is None:
+    if (
+        manifest.artifact_path is None
+        or manifest.engine_path is None
+        or manifest.nvinfer_config_path is None
+        or manifest.nvinfer_config_sha256 is None
+    ):
         raise GraphContractError("model and engine paths are required for nvinfer startup")
+    if config_path != manifest.nvinfer_config_path:
+        raise GraphContractError("nvinfer configuration path does not match runtime manifest")
     try:
         properties = dict(
             line.split("=", 1)
@@ -412,11 +434,37 @@ def person_config_paths_match(manifest: RuntimeModelManifestV1, config_path: Pat
         )
     except OSError as exc:
         raise GraphContractError("person nvinfer configuration is unavailable") from exc
+    if hashlib.sha256(config_path.read_bytes()).hexdigest() != manifest.nvinfer_config_sha256:
+        raise GraphContractError("nvinfer configuration sha256 does not match runtime manifest")
+    if any("REPLACE_" in value for value in properties.values()):
+        raise GraphContractError("nvinfer configuration contains an unresolved placeholder")
+    required_person_properties = {
+        "network-mode": "2",
+        "batch-size": "20",
+        "infer-dims": "3;640;640",
+        "model-color-format": "0",
+        "net-scale-factor": "0.003921568627",
+        "maintain-aspect-ratio": "1",
+    }
+    if manifest.artifact.preprocessing != "letterbox-rgb-640x640" or any(
+        properties.get(key) != value for key, value in required_person_properties.items()
+    ):
+        raise GraphContractError("nvinfer configuration does not match approved person preprocessing")
     if (
         properties.get("onnx-file") != str(manifest.artifact_path)
         or properties.get("model-engine-file") != str(manifest.engine_path)
     ):
         raise GraphContractError("person nvinfer configuration does not load manifest-verified paths")
+
+
+def should_link_rtsp_video_pad(caps: Mapping[str, str], codec: Literal["h264", "h265"]) -> bool:
+    """Keep audio/control RTP pads out of a camera's video decoder branch."""
+    expected_encoding = "H264" if codec == "h264" else "H265"
+    return (
+        caps.get("name") == "application/x-rtp"
+        and caps.get("media", "").lower() == "video"
+        and caps.get("encoding-name", "").upper() == expected_encoding
+    )
 
 
 def metadata_observation_sequence(frame_number: int, object_ordinal: int) -> int:
@@ -470,8 +518,8 @@ class SourceRecoveryCoordinator:
         if camera_id is not None:
             self.handle_camera_failure(camera_id, "rtsp_pipeline_error")
 
-    def handle_camera_failure(self, camera_id: str, reason: str) -> None:
-        if self._supervisor.health_for(camera_id).state not in {
+    def handle_camera_failure(self, camera_id: str, reason: str, *, force: bool = False) -> None:
+        if force or self._supervisor.health_for(camera_id).state not in {
             "offline",
             "reconnecting",
         }:
@@ -542,11 +590,13 @@ class DeepStreamDataPlane:
         runtime_info: RuntimeInfo,
         binding_loader: BindingLoader = _load_nvidia_bindings,
         person_config_path: Path = PERSON_PRIMARY_CONFIG_PATH,
+        fatal_callback: Callable[[], None] | None = None,
     ) -> None:
         self._manifest = runtime_manifest
         self._runtime_info = runtime_info
         self._binding_loader = binding_loader
         self._person_config_path = person_config_path
+        self._fatal_callback = fatal_callback or (lambda: None)
         self._graph: DeepStreamGraphSpec | None = None
         self._pipeline: Any | None = None
         self._supervisor: CameraSupervisor | None = None
@@ -554,6 +604,10 @@ class DeepStreamDataPlane:
         self._recovery: SourceRecoveryCoordinator | None = None
         self._locations: dict[str, str] = {}
         self._metadata_publisher: MetadataPublisher | None = None
+        self._failed_reason: str | None = None
+        self._invalid_metadata_count = 0
+        self._started_monotonic: float | None = None
+        self._awaiting_frame_since: dict[str, float] = {}
 
     def start(self, site: SiteConfig) -> None:
         if self._pipeline is not None:
@@ -565,7 +619,8 @@ class DeepStreamDataPlane:
             tensorrt_version=tensorrt_version,
             require_files=True,
         )
-        person_config_paths_match(self._manifest, self._person_config_path)
+        assert self._manifest.nvinfer_config_path is not None
+        person_config_paths_match(self._manifest, self._manifest.nvinfer_config_path)
         try:
             bindings = self._binding_loader()
         except (ImportError, ModuleNotFoundError, NvidiaBindingsUnavailable) as exc:
@@ -576,6 +631,8 @@ class DeepStreamDataPlane:
             raise NvidiaBindingsUnavailable("binding loader returned an invalid NVIDIA adapter")
         locations = resolve_rtsp_locations(site)
         self._graph = graph
+        self._failed_reason = None
+        self._started_monotonic = time.monotonic()
         self._bindings = bindings
         self._locations = dict(locations)
         self._supervisor = CameraSupervisor(
@@ -599,7 +656,9 @@ class DeepStreamDataPlane:
             bus.add_signal_watch()
             bus.connect("message", self._on_bus_message)
             bindings.glib.timeout_add(250, self._advance_recovery)
-            self._pipeline.set_state(bindings.gst.State.PLAYING)
+            state_result = self._pipeline.set_state(bindings.gst.State.PLAYING)
+            if state_result == bindings.gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("DeepStream pipeline failed to enter PLAYING")
         except Exception:
             self.stop()
             raise
@@ -613,6 +672,7 @@ class DeepStreamDataPlane:
         self._recovery = None
         self._locations = {}
         self._metadata_publisher = None
+        self._started_monotonic = None
         if self._supervisor is not None:
             self._supervisor.clear_observations()
         self._supervisor = None
@@ -620,14 +680,45 @@ class DeepStreamDataPlane:
     def health(self) -> list[CameraHealth]:
         return [] if self._supervisor is None else self._supervisor.health()
 
+    @property
+    def failed_reason(self) -> str | None:
+        """Redacted global failure reason for core graph faults."""
+        return self._failed_reason
+
+    @property
+    def invalid_metadata_count(self) -> int:
+        """Count malformed frame/object metadata dropped without touching GPU surfaces."""
+        return self._invalid_metadata_count
+
     def drain_observations(self) -> list[Any]:
         """Deliver bounded metadata observations; decoded GPU surfaces never leave the graph."""
         return [] if self._supervisor is None else self._supervisor.drain_observations()
 
     def _advance_recovery(self) -> bool:
         if self._recovery is not None:
+            now = time.monotonic()
+            for health in self.health():
+                if health.state == "online":
+                    if health.last_frame_age_seconds is not None and health.last_frame_age_seconds > 5.0:
+                        self._recovery.handle_camera_failure(
+                            health.camera_id, "source_frame_timeout", force=True
+                        )
+                        self._awaiting_frame_since[health.camera_id] = now
+                    else:
+                        self._awaiting_frame_since.pop(health.camera_id, None)
+                    continue
+                if health.state not in {"starting", "reconnecting"}:
+                    continue
+                if health.state == "starting" and health.last_frame_age_seconds is not None:
+                    self._awaiting_frame_since.pop(health.camera_id, None)
+                began = self._awaiting_frame_since.setdefault(
+                    health.camera_id, self._started_monotonic or now
+                )
+                if now - began > 5.0:
+                    self._recovery.handle_camera_failure(health.camera_id, "source_frame_timeout", force=True)
+                    self._awaiting_frame_since[health.camera_id] = now
             self._recovery.advance()
-        return self._pipeline is not None
+        return self._pipeline is not None and self._failed_reason is None
 
     def _build_pipeline(
         self, bindings: _NvidiaBindings, graph: DeepStreamGraphSpec, locations: Mapping[str, str]
@@ -640,6 +731,8 @@ class DeepStreamDataPlane:
         mux.set_property("batch-size", 20)
         mux.set_property("live-source", 1)
         mux.set_property("nvbuf-memory-type", 2)  # NVBUF_MEM_CUDA_DEVICE on dGPU.
+        mux.set_property("batched-push-timeout", 40_000)
+        mux.set_property("attach-sys-ts", False)
         pipeline.add(mux)
         for source in graph.sources:
             source_bin = self._build_source_bin(gst, source, locations[source.camera_id])
@@ -651,7 +744,8 @@ class DeepStreamDataPlane:
 
         primary_queue = self._make_queue(gst, graph.element("primary-queue"))
         person = self._make_element(gst, "nvinfer", "person-primary")
-        person.set_property("config-file-path", str(self._person_config_path))
+        assert self._manifest.nvinfer_config_path is not None
+        person.set_property("config-file-path", str(self._manifest.nvinfer_config_path))
         core_tee = self._make_element(gst, "tee", "conditional-analytics-tee")
         core_queue = self._make_queue(
             gst,
@@ -680,6 +774,7 @@ class DeepStreamDataPlane:
             valve.set_property("drop", True)
             sink = self._make_element(gst, "fakesink", f"{branch.module}-disabled-sink")
             sink.set_property("sync", False)
+            sink.set_property("async", False)
             for element in (branch_queue, valve, sink):
                 pipeline.add(element)
             if not core_tee.link(branch_queue) or not gst.Element.link_many(branch_queue, valve, sink):
@@ -714,7 +809,7 @@ class DeepStreamDataPlane:
         decoder = self._make_element(gst, "nvv4l2decoder", f"nvdec-{source.source_id}")
         for element in (rtspsrc, depay, parser, tee, evidence_queue, decode_queue, decoder):
             source_bin.add(element)
-        rtspsrc.connect("pad-added", self._link_dynamic_rtsp_pad, depay)
+        rtspsrc.connect("pad-added", self._link_dynamic_rtsp_pad, depay, source.codec)
         if not gst.Element.link_many(depay, parser, tee):
             raise RuntimeError(f"failed to build encoded branch for {source.camera_id}")
         if not tee.link(evidence_queue) or not tee.link(decode_queue) or not decode_queue.link(decoder):
@@ -740,18 +835,33 @@ class DeepStreamDataPlane:
         return queue
 
     @staticmethod
-    def _link_dynamic_rtsp_pad(_: Any, pad: Any, depay: Any) -> None:
+    def _link_dynamic_rtsp_pad(
+        _: Any, pad: Any, depay: Any, codec: Literal["h264", "h265"]
+    ) -> None:
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        structure = caps.get_structure(0)
+        fields = {
+            "name": structure.get_name(),
+            "media": structure.get_string("media") or "",
+            "encoding-name": structure.get_string("encoding-name") or "",
+        }
+        if not should_link_rtsp_video_pad(fields, codec):
+            return
         sink = depay.get_static_pad("sink")
         if not sink.is_linked():
-            pad.link(sink)
+            if int(pad.link(sink)) != 0:
+                raise RuntimeError("failed to link validated RTSP video pad")
 
     def _metadata_probe(self, _: Any, info: Any, bindings: _NvidiaBindings) -> Any:
         """Publish scalar metadata only; surfaces are neither mapped nor copied to CPU memory."""
-        buffer = info.get_buffer()
-        if buffer is not None:
-            batch_meta = bindings.pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
-            if batch_meta is not None:
-                self._publish_batch_metadata(batch_meta, bindings.pyds)
+        try:
+            buffer = info.get_buffer()
+            if buffer is not None:
+                batch_meta = bindings.pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
+                if batch_meta is not None:
+                    self._publish_batch_metadata(batch_meta, bindings.pyds)
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            self._invalid_metadata_count += 1
         return bindings.gst.PadProbeReturn.OK
 
     def _publish_batch_metadata(self, batch_meta: Any, pyds: Any) -> None:
@@ -774,8 +884,10 @@ class DeepStreamDataPlane:
                 else datetime.now(UTC)
             )
             timestamp_quality = "camera_rtcp" if ntp_timestamp > 0 else "host_ntp_fallback"
-            frame_width = max(1, int(getattr(frame_meta, "source_frame_width", 1)))
-            frame_height = max(1, int(getattr(frame_meta, "source_frame_height", 1)))
+            frame_width = int(getattr(frame_meta, "source_frame_width", 0))
+            frame_height = int(getattr(frame_meta, "source_frame_height", 0))
+            if frame_width <= 0 or frame_height <= 0:
+                raise ValueError("invalid frame dimensions")
             camera_id = self._graph.sources[source_id].camera_id
             if not self._metadata_publisher.record_frame(
                 camera_id=camera_id,
@@ -793,12 +905,20 @@ class DeepStreamDataPlane:
                     object_meta = pyds.NvDsObjectMeta.cast(object_node.data)
                 except StopIteration:
                     break
-                rect = object_meta.rect_params
-                left = max(0.0, min(1.0, float(rect.left) / frame_width))
-                top = max(0.0, min(1.0, float(rect.top) / frame_height))
-                right = max(0.0, min(1.0, float(rect.left + rect.width) / frame_width))
-                bottom = max(0.0, min(1.0, float(rect.top + rect.height) / frame_height))
-                if left < right and top < bottom:
+                try:
+                    rect = object_meta.rect_params
+                    raw = (float(rect.left), float(rect.top), float(rect.width), float(rect.height))
+                    confidence = float(object_meta.confidence)
+                    if not all(math.isfinite(value) for value in (*raw, confidence)):
+                        raise ValueError("non-finite metadata")
+                    if not 0.0 <= confidence <= 1.0 or raw[2] <= 0.0 or raw[3] <= 0.0:
+                        raise ValueError("invalid detection metadata")
+                    left = max(0.0, min(1.0, raw[0] / frame_width))
+                    top = max(0.0, min(1.0, raw[1] / frame_height))
+                    right = max(0.0, min(1.0, (raw[0] + raw[2]) / frame_width))
+                    bottom = max(0.0, min(1.0, (raw[1] + raw[3]) / frame_height))
+                    if not (left < right and top < bottom):
+                        raise ValueError("invalid normalised bbox")
                     self._metadata_publisher.publish(
                         FrameMetadataV1(
                             camera_id=camera_id,
@@ -807,12 +927,14 @@ class DeepStreamDataPlane:
                             monotonic_seq=metadata_observation_sequence(
                                 int(frame_meta.frame_num), object_ordinal
                             ),
-                            class_name=str(getattr(object_meta, "obj_label", "person")),
-                            confidence=float(object_meta.confidence),
+                            class_name="person",
+                            confidence=confidence,
                             bbox=(left, top, right, bottom),
                             track_id=str(object_meta.object_id),
                         )
                     )
+                except (TypeError, ValueError, OverflowError):
+                    self._invalid_metadata_count += 1
                 object_ordinal += 1
                 object_node = self._next_metadata_node(object_node)
             frame_node = self._next_metadata_node(frame_node)
@@ -825,12 +947,18 @@ class DeepStreamDataPlane:
             return None
 
     def _on_bus_message(self, _: Any, message: Any) -> None:
-        if self._recovery is None:
-            return
         source_name = message.src.get_name() if message.src is not None else ""
         message_type = str(message.type).lower()
-        if "error" in message_type or "eos" in message_type:
-            self._recovery.handle_element_error(source_name)
+        structure = message.get_structure() if hasattr(message, "get_structure") else None
+        is_rtsp_timeout = structure is not None and structure.get_name() == "GstRTSPSrcTimeout"
+        if "error" in message_type or "eos" in message_type or is_rtsp_timeout:
+            if self._recovery is not None and self._recovery._camera_for_element(source_name) is not None:
+                self._recovery.handle_element_error(source_name)
+            else:
+                self._failed_reason = "core_pipeline_error"
+                if self._pipeline is not None and self._bindings is not None:
+                    stop_pipeline(self._pipeline, self._bindings.gst)
+                self._fatal_callback()
 
     def _rebuild_source(self, camera_id: str) -> None:
         """Placeholder for a target-only source-bin rebuild after local backoff.
@@ -860,7 +988,8 @@ class DeepStreamDataPlane:
         if replacement_pad.link(mux_sink_pad) != self._bindings.gst.PadLinkReturn.OK:
             self._pipeline.remove(replacement)
             raise RuntimeError(f"failed to relink rebuilt source bin for {camera_id}")
-        replacement.sync_state_with_parent()
+        if not replacement.sync_state_with_parent():
+            raise RuntimeError(f"failed to sync rebuilt source bin for {camera_id}")
 
 
 def _target_runtime_info() -> tuple[str, str]:
@@ -906,10 +1035,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     try:
         assert runtime._bindings is not None
-        runtime._bindings.glib.MainLoop().run()
+        loop = runtime._bindings.glib.MainLoop()
+        runtime._fatal_callback = loop.quit
+        if runtime.failed_reason is None:
+            loop.run()
     finally:
         runtime.stop()
-    return 0
+    return 1 if runtime.failed_reason is not None else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - target process entrypoint.

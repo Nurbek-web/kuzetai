@@ -39,6 +39,7 @@ from protector.pilot.runtime.deepstream import (
     metadata_observation_sequence,
     person_config_paths_match,
     resolve_rtsp_locations,
+    should_link_rtsp_video_pad,
     stop_pipeline,
 )
 from protector.pilot.runtime.supervisor import CameraSupervisor
@@ -133,6 +134,15 @@ def _manifest_with_files(tmp_path: Path) -> RuntimeModelManifestV1:
     engine = tmp_path / "person.engine"
     model.write_bytes(b"approved-model")
     engine.write_bytes(b"approved-engine")
+    config = tmp_path / "person_primary.txt"
+    config.write_text(
+        (
+            f"[property]\nonnx-file={model}\nmodel-engine-file={engine}\nnetwork-mode=2\n"
+            "batch-size=20\ninfer-dims=3;640;640\nmodel-color-format=0\n"
+            "net-scale-factor=0.003921568627\nmaintain-aspect-ratio=1\n"
+        ),
+        encoding="utf-8",
+    )
     manifest = _manifest()
     return manifest.model_copy(
         update={
@@ -142,6 +152,8 @@ def _manifest_with_files(tmp_path: Path) -> RuntimeModelManifestV1:
                 update={"sha256": hashlib.sha256(model.read_bytes()).hexdigest()}
             ),
             "engine_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
+            "nvinfer_config_path": config,
+            "nvinfer_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         }
     )
 
@@ -155,6 +167,8 @@ def test_shared_graph_uses_twenty_unique_source_bins_and_one_gpu_batch() -> None
         "batch-size": 20,
         "live-source": 1,
         "nvbuf-memory-type": "nvbuf-mem-cuda-device",
+        "batched-push-timeout": 40_000,
+        "attach-sys-ts": False,
     }
     assert graph.primary_inference_count == 1
     assert graph.tracker_count == 1
@@ -229,6 +243,18 @@ def test_optional_analytics_are_disabled_and_isolated_by_valves_and_leaky_queues
         assert branch.queue.properties["max-size-time"] == 0
 
 
+def test_rtsp_dynamic_pad_accepts_only_matching_video_rtp_caps() -> None:
+    assert should_link_rtsp_video_pad(
+        {"name": "application/x-rtp", "media": "video", "encoding-name": "H264"}, "h264"
+    )
+    assert not should_link_rtsp_video_pad(
+        {"name": "application/x-rtp", "media": "audio", "encoding-name": "H264"}, "h264"
+    )
+    assert not should_link_rtsp_video_pad(
+        {"name": "application/x-rtp", "media": "video", "encoding-name": "H265"}, "h264"
+    )
+
+
 def test_runtime_manifest_fails_closed_for_missing_rights_hashes_or_target_mismatch() -> None:
     manifest = _manifest()
     assert manifest.validate_for_host(compute_capability="8.9", tensorrt_version="10.16.0.72") is None
@@ -262,22 +288,11 @@ def test_nvidia_bindings_are_loaded_only_when_the_target_adapter_starts(tmp_path
     manifest = _manifest_with_files(tmp_path)
     assert manifest.artifact_path is not None
     assert manifest.engine_path is not None
-    config = tmp_path / "person_primary.txt"
-    config.write_text(
-        "\n".join(
-            (
-                "[property]",
-                f"onnx-file={manifest.artifact_path}",
-                f"model-engine-file={manifest.engine_path}",
-            )
-        ),
-        encoding="utf-8",
-    )
     runtime = DeepStreamDataPlane(
         runtime_manifest=manifest,
         runtime_info=lambda: ("8.9", "10.16.0.72"),
         binding_loader=missing_bindings,
-        person_config_path=config,
+        person_config_path=manifest.nvinfer_config_path,
     )
 
     with pytest.raises(NvidiaBindingsUnavailable, match="NVIDIA DeepStream bindings"):
@@ -426,17 +441,29 @@ def test_person_nvinfer_config_must_load_the_exact_hash_verified_paths(tmp_path:
                 "[property]",
                 f"onnx-file={manifest.artifact_path}",
                 f"model-engine-file={manifest.engine_path}",
+                "network-mode=2",
+                "batch-size=20",
+                "infer-dims=3;640;640",
+                "model-color-format=0",
+                "net-scale-factor=0.003921568627",
+                "maintain-aspect-ratio=1",
             )
         ),
         encoding="utf-8",
     )
 
+    manifest = manifest.model_copy(
+        update={
+            "nvinfer_config_path": config,
+            "nvinfer_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+        }
+    )
     assert person_config_paths_match(manifest, config) is None
     config.write_text(
         "[property]\nonnx-file=/wrong/model.onnx\nmodel-engine-file=/wrong/model.engine\n",
         encoding="utf-8",
     )
-    with pytest.raises(GraphContractError, match="does not load manifest-verified"):
+    with pytest.raises(GraphContractError, match="configuration sha256"):
         person_config_paths_match(manifest, config)
 
 
