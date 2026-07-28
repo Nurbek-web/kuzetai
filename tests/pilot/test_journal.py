@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -127,6 +129,7 @@ def test_journal_is_bounded_idempotent_and_reports_wal_depth(tmp_path: Path) -> 
         schema_version="evidence-work.v1",
         idempotency_key="evidence-1",
         payload={
+            "schema_version": "evidence-work.v1",
             "evidence_id": str(uuid4()),
             "event_id": str(uuid4()),
             "object_key": "events/cam-01/clip.mp4",
@@ -172,6 +175,7 @@ def test_evidence_journal_rejects_raw_or_oversized_payloads(tmp_path: Path) -> N
         max_payload_bytes=600,
     )
     metadata = {
+        "schema_version": "evidence-work.v1",
         "evidence_id": str(uuid4()),
         "event_id": str(uuid4()),
         "object_key": "events/cam-01/clip.mp4",
@@ -198,3 +202,62 @@ def test_evidence_journal_rejects_raw_or_oversized_payloads(tmp_path: Path) -> N
             payload={"schema_version": "candidate-event.v1", "reason": "x" * 700},
         )
     assert journal.depth() == 0
+
+
+def test_journal_rejects_unknown_or_mismatched_schema_versions(tmp_path: Path) -> None:
+    path = tmp_path / "versions.sqlite3"
+    journal = SQLiteWALJournal(path, max_items=4)
+    event_payload = _event().model_dump(mode="json")
+
+    with pytest.raises(ValueError, match="unsupported journal schema version"):
+        journal.enqueue(
+            kind="candidate_event",
+            schema_version="candidate-event.v2",
+            idempotency_key="unknown-event-version",
+            payload={**event_payload, "schema_version": "candidate-event.v2"},
+        )
+    with pytest.raises(ValueError, match="does not match payload"):
+        journal.enqueue(
+            kind="candidate_event",
+            schema_version="candidate-event.v1",
+            idempotency_key="mismatched-event-version",
+            payload={**event_payload, "schema_version": "candidate-event.v2"},
+        )
+    with pytest.raises(ValueError, match="unsupported journal schema version"):
+        journal.enqueue(
+            kind="evidence",
+            schema_version="evidence-work.v2",
+            idempotency_key="unknown-evidence-version",
+            payload={
+                "schema_version": "evidence-work.v2",
+                "evidence_id": str(uuid4()),
+            },
+        )
+    journal.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO journal_items
+                (kind, schema_version, idempotency_key, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "evidence",
+                "evidence-work.v2",
+                "tampered-version",
+                json.dumps(
+                    {
+                        "schema_version": "evidence-work.v2",
+                        "evidence_id": str(uuid4()),
+                    }
+                ),
+                NOW.isoformat(),
+            ),
+        )
+    restarted = SQLiteWALJournal(path, max_items=4)
+    processed: list[object] = []
+    with pytest.raises(ValueError, match="unsupported journal schema version"):
+        restarted.replay(processed.append)
+    assert processed == []
+    assert restarted.depth() == 1

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
+from threading import Barrier
 from uuid import UUID, uuid4
 
 import pytest
@@ -144,6 +148,18 @@ def _event(
     )
 
 
+def _run_concurrently(operation: Callable[[], object]) -> list[object]:
+    barrier = Barrier(2)
+
+    def synchronized() -> object:
+        barrier.wait(timeout=5)
+        return operation()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(synchronized) for _ in range(2)]
+        return [future.result() for future in futures]
+
+
 def test_observation_id_and_dedupe_key_are_independently_unique(
     repository: PilotRepository,
 ) -> None:
@@ -279,6 +295,62 @@ def test_review_transition_is_atomic_legal_and_idempotent(
         assert len(session.scalars(select(AuditEntryModel)).all()) == 1
 
 
+def test_review_idempotency_compares_review_timestamp(repository: PilotRepository) -> None:
+    event = _event()
+    repository.add_event(event)
+    repository.add_user(
+        user_id="operator-1",
+        username="operator",
+        password_hash="argon2id-placeholder",
+        role="operator",
+    )
+    repository.review_event(
+        event_id=event.event_id,
+        reviewer_id="operator-1",
+        target_status="confirmed",
+        idempotency_key="review-material-fields",
+        notes="same note",
+        reviewed_at=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(IdempotencyConflictError, match="different data"):
+        repository.review_event(
+            event_id=event.event_id,
+            reviewer_id="operator-1",
+            target_status="confirmed",
+            idempotency_key="review-material-fields",
+            notes="same note",
+            reviewed_at=NOW + timedelta(minutes=2),
+        )
+
+
+def test_database_rejects_illegal_review_pairs(repository: PilotRepository) -> None:
+    event = _event()
+    repository.add_event(event)
+    repository.add_user(
+        user_id="operator-1",
+        username="operator",
+        password_hash="argon2id-placeholder",
+        role="operator",
+    )
+
+    with repository.session_factory.begin() as session:
+        session.add(
+            ReviewModel(
+                review_id=str(uuid4()),
+                event_id=str(event.event_id),
+                reviewer_id="operator-1",
+                from_status="candidate",
+                to_status="escalated",
+                notes=None,
+                idempotency_key="illegal-pair",
+                reviewed_at=NOW,
+            )
+        )
+        with pytest.raises(IntegrityError, match="legal_transition"):
+            session.flush()
+
+
 def test_review_rejects_corrupt_lifecycle_provenance_without_partial_writes(
     repository: PilotRepository,
 ) -> None:
@@ -290,21 +362,14 @@ def test_review_rejects_corrupt_lifecycle_provenance_without_partial_writes(
         password_hash="argon2id-placeholder",
         role="operator",
     )
-    with repository.session_factory.begin() as session:
-        stored = session.get(CandidateEventModel, str(event.event_id))
-        assert stored is not None
-        stored.transition_history = ["candidate"]
+    with pytest.raises(IntegrityError, match="lifecycle"):
+        with repository.session_factory.begin() as session:
+            stored = session.get(CandidateEventModel, str(event.event_id))
+            assert stored is not None
+            stored.transition_history = "candidate"
+            session.flush()
 
-    with pytest.raises(ValueError, match="transition_history must start"):
-        repository.review_event(
-            event_id=event.event_id,
-            reviewer_id="operator-1",
-            target_status="confirmed",
-            idempotency_key="review-corrupt-event",
-            notes=None,
-            reviewed_at=NOW + timedelta(minutes=1),
-        )
-
+    assert repository.get_event(event.event_id).review_status == "candidate"
     with repository.session_factory() as session:
         assert len(session.scalars(select(ReviewModel)).all()) == 0
         assert len(session.scalars(select(AuditEntryModel)).all()) == 0
@@ -368,6 +433,37 @@ def test_outbox_accepts_one_confirmed_operator_event_only(
         )
 
 
+def test_outbox_idempotency_compares_payload(repository: PilotRepository) -> None:
+    event = _event()
+    repository.add_event(event)
+    repository.add_user(
+        user_id="operator-1",
+        username="operator",
+        password_hash="argon2id-placeholder",
+        role="operator",
+    )
+    repository.review_event(
+        event_id=event.event_id,
+        reviewer_id="operator-1",
+        target_status="confirmed",
+        idempotency_key="review-for-payload",
+        notes=None,
+        reviewed_at=NOW,
+    )
+    repository.enqueue_notification(
+        event_id=event.event_id,
+        idempotency_key="notify-material-fields",
+        payload={"connector": "telegram"},
+    )
+
+    with pytest.raises(IdempotencyConflictError, match="different data"):
+        repository.enqueue_notification(
+            event_id=event.event_id,
+            idempotency_key="notify-material-fields",
+            payload={"connector": "email"},
+        )
+
+
 def test_database_rejects_outbox_insert_for_unconfirmed_event(
     repository: PilotRepository,
 ) -> None:
@@ -386,6 +482,56 @@ def test_database_rejects_outbox_insert_for_unconfirmed_event(
             )
         )
         with pytest.raises(IntegrityError, match="confirmed operator"):
+            session.flush()
+
+
+def test_database_rejects_confirmed_outbox_without_review_provenance(
+    repository: PilotRepository,
+) -> None:
+    event = _event(
+        review_status="confirmed",
+        transition_history=("observation", "candidate", "confirmed"),
+    )
+    repository.add_event(event)
+
+    with repository.session_factory.begin() as session:
+        session.add(
+            NotificationOutboxModel(
+                outbox_id=str(uuid4()),
+                event_id=str(event.event_id),
+                idempotency_key="confirmed-without-review",
+                status="pending",
+                payload={},
+                available_at=NOW,
+            )
+        )
+        with pytest.raises(IntegrityError, match="review provenance"):
+            session.flush()
+
+
+def test_database_rejects_corrupt_confirmed_transition_history(
+    repository: PilotRepository,
+) -> None:
+    with repository.session_factory.begin() as session:
+        session.add(
+            CandidateEventModel(
+                event_id=str(uuid4()),
+                schema_version="candidate-event.v1",
+                dedupe_key="corrupt-confirmed-history",
+                camera_id="cam-01",
+                module="person",
+                opened_at=NOW,
+                last_seen_at=NOW,
+                peak_confidence=0.8,
+                reason="test",
+                model_artifact_id="person-v1",
+                gate_mode="operator",
+                evidence_status="pending",
+                review_status="confirmed",
+                transition_history="observation>confirmed",
+            )
+        )
+        with pytest.raises(IntegrityError, match="lifecycle"):
             session.flush()
 
 
@@ -413,6 +559,75 @@ def test_evidence_persists_only_bounded_metadata(repository: PilotRepository) ->
     )
 
 
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("codec", "h265"),
+        ("start_at", NOW - timedelta(seconds=1)),
+        ("end_at", NOW + timedelta(seconds=7)),
+        ("source_reference", "nvr://camera/01?segment=99"),
+        ("status", "failed"),
+    ],
+)
+def test_evidence_idempotency_compares_all_material_fields(
+    repository: PilotRepository,
+    changed_field: str,
+    changed_value: object,
+) -> None:
+    event = _event()
+    repository.add_event(event)
+    evidence = EvidenceInput(
+        evidence_id=uuid4(),
+        event_id=event.event_id,
+        object_key="events/cam-01/material.mp4",
+        sha256="b" * 64,
+        codec="h264",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=5),
+        source_reference="nvr://camera/01?segment=42",
+        status="ready",
+    )
+    repository.add_evidence(evidence)
+
+    with pytest.raises(IdempotencyConflictError, match="different data"):
+        repository.add_evidence(
+            EvidenceInput(
+                **{
+                    **evidence.__dict__,
+                    changed_field: changed_value,
+                }
+            )
+        )
+
+
+def test_database_bounds_evidence_time_range(repository: PilotRepository) -> None:
+    event = _event()
+    repository.add_event(event)
+    cases = (
+        ("zero", NOW, NOW, "pending"),
+        ("continuous", NOW, NOW + timedelta(seconds=11), "pending"),
+        ("short-ready", NOW, NOW + timedelta(seconds=3), "ready"),
+    )
+
+    for label, start_at, end_at, status in cases:
+        with repository.session_factory.begin() as session:
+            session.add(
+                EvidenceModel(
+                    evidence_id=str(uuid4()),
+                    event_id=str(event.event_id),
+                    object_key=f"events/{label}.mp4",
+                    sha256="c" * 64,
+                    codec="h264",
+                    start_at=start_at,
+                    end_at=end_at,
+                    source_reference="nvr://camera/01",
+                    status=status,
+                )
+            )
+            with pytest.raises(IntegrityError, match="evidence duration"):
+                session.flush()
+
+
 def test_database_checks_reject_invalid_persisted_state(repository: PilotRepository) -> None:
     with repository.session_factory.begin() as session:
         session.add(
@@ -430,7 +645,7 @@ def test_database_checks_reject_invalid_persisted_state(repository: PilotReposit
                 gate_mode="automatic",
                 evidence_status="pending",
                 review_status="candidate",
-                transition_history=["observation", "candidate"],
+                transition_history="observation>candidate",
             )
         )
         with pytest.raises(IntegrityError):
@@ -510,7 +725,7 @@ def test_alembic_upgrade_is_repeat_safe_and_matches_core_metadata(tmp_path: Path
                 "gate_mode": "operator",
                 "evidence_status": "pending",
                 "review_status": "candidate",
-                "transition_history": ["observation", "candidate"],
+                "transition_history": "observation>candidate",
                 "created_at": NOW,
             },
         )
@@ -550,3 +765,163 @@ def test_alembic_upgrade_is_repeat_safe_and_matches_core_metadata(tmp_path: Path
                     "created_at": NOW,
                 },
             )
+    with engine.begin() as connection:
+        with pytest.raises(IntegrityError, match="evidence duration"):
+            connection.execute(
+                Base.metadata.tables["evidence"].insert(),
+                {
+                    "evidence_id": str(uuid4()),
+                    "event_id": event_id,
+                    "object_key": "events/migration-continuous.mp4",
+                    "sha256": "e" * 64,
+                    "codec": "h264",
+                    "start_at": NOW,
+                    "end_at": NOW + timedelta(seconds=11),
+                    "source_reference": "nvr://camera/migration",
+                    "status": "pending",
+                    "created_at": NOW,
+                },
+            )
+
+
+def test_postgresql_offline_migration_uses_integrity_sqlstates() -> None:
+    output = StringIO()
+    config = Config("alembic.ini", output_buffer=output)
+    config.set_main_option(
+        "sqlalchemy.url",
+        "postgresql+psycopg://localhost/kuzet_pilot_test",
+    )
+
+    command.upgrade(config, "head", sql=True)
+
+    assert output.getvalue().count("ERRCODE = '23514'") >= 3
+
+
+def test_concurrent_idempotent_retries_return_single_rows(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'concurrent.sqlite3'}")
+    Base.metadata.create_all(engine)
+    repository = PilotRepository(create_session_factory(engine))
+    repository.add_site(site_id="site-1", name="Pilot School")
+    repository.add_camera(
+        camera_id="cam-01",
+        site_id="site-1",
+        name="Entrance",
+        source_reference="nvr://camera/01",
+        codec="h264",
+    )
+    repository.add_model_artifact(_artifact())
+    event_contract = _event()
+
+    event_rows = _run_concurrently(lambda: repository.store_event_idempotent(event_contract))
+    assert {row.event_id for row in event_rows} == {str(event_contract.event_id)}
+
+    evidence = EvidenceInput(
+        evidence_id=uuid4(),
+        event_id=event_contract.event_id,
+        object_key="events/concurrent.mp4",
+        sha256="d" * 64,
+        codec="h264",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=5),
+        source_reference="nvr://camera/01?segment=5",
+        status="ready",
+    )
+    evidence_rows = _run_concurrently(lambda: repository.add_evidence(evidence))
+    assert {row.evidence_id for row in evidence_rows} == {str(evidence.evidence_id)}
+
+    repository.add_user(
+        user_id="operator-1",
+        username="operator",
+        password_hash="argon2id-placeholder",
+        role="operator",
+    )
+    reviews = _run_concurrently(
+        lambda: repository.review_event(
+            event_id=event_contract.event_id,
+            reviewer_id="operator-1",
+            target_status="confirmed",
+            idempotency_key="concurrent-review",
+            notes="same review",
+            reviewed_at=NOW,
+        )
+    )
+    assert len({review.review_id for review in reviews}) == 1
+
+    outbox_rows = _run_concurrently(
+        lambda: repository.enqueue_notification(
+            event_id=event_contract.event_id,
+            idempotency_key="concurrent-outbox",
+            payload={"connector": "telegram"},
+        )
+    )
+    assert len({row.outbox_id for row in outbox_rows}) == 1
+
+
+@pytest.mark.skipif(
+    os.getenv("PILOT_TEST_DATABASE_URL") is None,
+    reason="requires disposable PostgreSQL *_test database",
+)
+def test_postgresql_concurrent_retry_contract(repository: PilotRepository) -> None:
+    event_contract = _event()
+    event_rows = _run_concurrently(lambda: repository.store_event_idempotent(event_contract))
+    assert len({row.event_id for row in event_rows}) == 1
+
+    evidence = EvidenceInput(
+        evidence_id=uuid4(),
+        event_id=event_contract.event_id,
+        object_key="events/postgresql-concurrent.mp4",
+        sha256="f" * 64,
+        codec="h264",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=5),
+        source_reference="nvr://camera/01?segment=postgresql",
+        status="ready",
+    )
+    assert (
+        len(
+            {
+                row.evidence_id
+                for row in _run_concurrently(lambda: repository.add_evidence(evidence))
+            }
+        )
+        == 1
+    )
+    repository.add_user(
+        user_id="operator-1",
+        username="operator",
+        password_hash="argon2id-placeholder",
+        role="operator",
+    )
+    assert (
+        len(
+            {
+                row.review_id
+                for row in _run_concurrently(
+                    lambda: repository.review_event(
+                        event_id=event_contract.event_id,
+                        reviewer_id="operator-1",
+                        target_status="confirmed",
+                        idempotency_key="postgresql-concurrent-review",
+                        notes="same review",
+                        reviewed_at=NOW,
+                    )
+                )
+            }
+        )
+        == 1
+    )
+    assert (
+        len(
+            {
+                row.outbox_id
+                for row in _run_concurrently(
+                    lambda: repository.enqueue_notification(
+                        event_id=event_contract.event_id,
+                        idempotency_key="postgresql-concurrent-outbox",
+                        payload={"connector": "telegram"},
+                    )
+                )
+            }
+        )
+        == 1
+    )

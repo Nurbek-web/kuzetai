@@ -172,7 +172,7 @@ def upgrade() -> None:
         sa.Column("gate_mode", sa.String(length=16), nullable=False),
         sa.Column("evidence_status", sa.String(length=16), nullable=False),
         sa.Column("review_status", sa.String(length=16), nullable=False),
-        sa.Column("transition_history", sa.JSON(), nullable=False),
+        sa.Column("transition_history", sa.String(length=128), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(
             "evidence_status IN ('pending', 'ready', 'failed', 'unavailable')",
@@ -189,6 +189,20 @@ def upgrade() -> None:
             "schema_version = 'candidate-event.v1'", name="ck_candidate_events_schema"
         ),
         sa.CheckConstraint("last_seen_at >= opened_at", name="ck_candidate_events_time_range"),
+        sa.CheckConstraint(
+            "(review_status = 'observation' AND transition_history = 'observation') OR "
+            "(review_status = 'candidate' AND "
+            "transition_history = 'observation>candidate') OR "
+            "(review_status = 'confirmed' AND "
+            "transition_history = 'observation>candidate>confirmed') OR "
+            "(review_status = 'rejected' AND "
+            "transition_history = 'observation>candidate>rejected') OR "
+            "(review_status = 'expired' AND "
+            "transition_history = 'observation>candidate>expired') OR "
+            "(review_status = 'escalated' AND "
+            "transition_history = 'observation>candidate>confirmed>escalated')",
+            name="ck_candidate_events_lifecycle",
+        ),
         sa.CheckConstraint(
             "peak_confidence >= 0 AND peak_confidence <= 1",
             name="ck_candidate_events_peak_confidence",
@@ -315,6 +329,12 @@ def upgrade() -> None:
             "to_status IN ('confirmed', 'rejected', 'expired', 'escalated')",
             name="ck_reviews_to_status",
         ),
+        sa.CheckConstraint(
+            "(from_status = 'candidate' AND "
+            "to_status IN ('confirmed', 'rejected', 'expired')) OR "
+            "(from_status = 'confirmed' AND to_status = 'escalated')",
+            name="ck_reviews_legal_transition",
+        ),
         sa.ForeignKeyConstraint(["event_id"], ["candidate_events.event_id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["reviewer_id"], ["users.user_id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("review_id"),
@@ -364,28 +384,72 @@ def upgrade() -> None:
             CREATE TRIGGER trg_notification_outbox_confirmed_operator
             BEFORE INSERT ON notification_outbox
             FOR EACH ROW
-            WHEN NOT EXISTS (
-                SELECT 1
-                FROM candidate_events
-                WHERE event_id = NEW.event_id
-                  AND gate_mode = 'operator'
-                  AND review_status = 'confirmed'
-            )
             BEGIN
-                SELECT RAISE(
-                    ABORT,
-                    'notification outbox requires a confirmed operator event'
-                );
+                SELECT CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1
+                        FROM candidate_events
+                        WHERE event_id = NEW.event_id
+                          AND gate_mode = 'operator'
+                          AND review_status = 'confirmed'
+                    )
+                    THEN RAISE(
+                        ABORT,
+                        'notification outbox requires a confirmed operator event'
+                    )
+                END;
+                SELECT CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1
+                        FROM candidate_events AS event
+                        JOIN reviews AS review
+                          ON review.event_id = event.event_id
+                         AND review.from_status = 'candidate'
+                         AND review.to_status = 'confirmed'
+                        WHERE event.event_id = NEW.event_id
+                          AND event.transition_history = 'observation>candidate>confirmed'
+                    )
+                    THEN RAISE(
+                        ABORT,
+                        'notification outbox requires valid review provenance'
+                    )
+                END;
             END
             """
         )
+        for evidence_operation in ("INSERT", "UPDATE"):
+            op.execute(
+                f"""
+                CREATE TRIGGER trg_evidence_duration_{evidence_operation.lower()}
+                BEFORE {evidence_operation} ON evidence
+                FOR EACH ROW
+                WHEN NEW.end_at <= NEW.start_at
+                  OR (
+                      julianday(NEW.end_at) - julianday(NEW.start_at)
+                  ) * 86400.0 > 10.0001
+                  OR (
+                      NEW.status = 'ready'
+                      AND (
+                          julianday(NEW.end_at) - julianday(NEW.start_at)
+                      ) * 86400.0 < 3.9999
+                  )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'evidence duration violates the bounded clip policy'
+                    );
+                END
+                """
+            )
     elif dialect == "postgresql":
         op.execute(
             """
             CREATE OR REPLACE FUNCTION pilot_reject_audit_mutation()
             RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN
-                RAISE EXCEPTION 'audit entries are append-only';
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'audit entries are append-only';
             END;
             $$
             """
@@ -401,20 +465,63 @@ def upgrade() -> None:
             """
             CREATE OR REPLACE FUNCTION pilot_validate_notification_outbox()
             RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE
+                event_gate_mode text;
+                event_review_status text;
+                event_transition_history text;
             BEGIN
-                IF NOT EXISTS (
-                    SELECT 1
-                    FROM candidate_events
-                    WHERE event_id = NEW.event_id
-                      AND gate_mode = 'operator'
-                      AND review_status = 'confirmed'
-                ) THEN
-                    RAISE EXCEPTION
-                        'notification outbox requires a confirmed operator event';
+                SELECT gate_mode, review_status, transition_history
+                INTO event_gate_mode, event_review_status, event_transition_history
+                FROM candidate_events
+                WHERE event_id = NEW.event_id;
+                IF event_gate_mode IS DISTINCT FROM 'operator'
+                   OR event_review_status IS DISTINCT FROM 'confirmed' THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '23514',
+                        MESSAGE = 'notification outbox requires a confirmed operator event';
+                END IF;
+                IF event_transition_history <> 'observation>candidate>confirmed'
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM reviews
+                       WHERE event_id = NEW.event_id
+                         AND from_status = 'candidate'
+                         AND to_status = 'confirmed'
+                   ) THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '23514',
+                        MESSAGE = 'notification outbox requires valid review provenance';
                 END IF;
                 RETURN NEW;
             END;
             $$
+            """
+        )
+        op.execute(
+            """
+            CREATE OR REPLACE FUNCTION pilot_validate_evidence_duration()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE
+                duration_seconds double precision;
+            BEGIN
+                duration_seconds := EXTRACT(EPOCH FROM (NEW.end_at - NEW.start_at));
+                IF duration_seconds <= 0
+                   OR duration_seconds > 10
+                   OR (NEW.status = 'ready' AND duration_seconds < 4) THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '23514',
+                        MESSAGE = 'evidence duration violates the bounded clip policy';
+                END IF;
+                RETURN NEW;
+            END;
+            $$
+            """
+        )
+        op.execute(
+            """
+            CREATE TRIGGER trg_evidence_duration
+            BEFORE INSERT OR UPDATE ON evidence
+            FOR EACH ROW EXECUTE FUNCTION pilot_validate_evidence_duration()
             """
         )
         op.execute(
@@ -462,4 +569,5 @@ def downgrade() -> None:
     if op.get_bind().dialect.name == "postgresql":
         op.execute("DROP FUNCTION IF EXISTS pilot_reject_audit_mutation()")
         op.execute("DROP FUNCTION IF EXISTS pilot_validate_notification_outbox()")
+        op.execute("DROP FUNCTION IF EXISTS pilot_validate_evidence_duration()")
     # ### end Alembic commands ###

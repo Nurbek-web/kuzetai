@@ -8,6 +8,7 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from sqlalchemy import Select, and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from protector.pilot.domain import (
     CandidateEventV1,
@@ -17,6 +18,7 @@ from protector.pilot.domain import (
 )
 from protector.pilot.gates import ModelArtifactV1
 from protector.pilot.storage.db import SessionFactory
+from protector.pilot.storage.journal import validate_journal_work
 from protector.pilot.storage.models import (
     AuditEntryModel,
     CameraModel,
@@ -93,7 +95,7 @@ def _event_from_row(row: CandidateEventModel) -> CandidateEventV1:
         gate_mode=row.gate_mode,
         evidence_status=row.evidence_status,
         review_status=row.review_status,
-        transition_history=tuple(row.transition_history),
+        transition_history=tuple(row.transition_history.split(">")),
     )
 
 
@@ -209,7 +211,7 @@ class PilotRepository:
             return row
 
     def store_event_idempotent(self, event: CandidateEventV1) -> CandidateEventModel:
-        with self.session_factory.begin() as session:
+        with self.session_factory() as session:
             existing = session.scalar(
                 select(CandidateEventModel).where(
                     or_(
@@ -227,8 +229,29 @@ class PilotRepository:
                 return existing
             row = self._new_event_row(event)
             session.add(row)
-            session.flush()
-            return row
+            try:
+                session.commit()
+                return row
+            except IntegrityError as insert_error:
+                session.rollback()
+                existing = session.scalar(
+                    select(CandidateEventModel).where(
+                        or_(
+                            CandidateEventModel.event_id == str(event.event_id),
+                            CandidateEventModel.dedupe_key == event.dedupe_key,
+                        )
+                    )
+                )
+                if existing is None:
+                    raise insert_error
+                persisted = _event_from_row(existing)
+                if persisted.model_dump(mode="json", exclude={"dedupe_key"}) != event.model_dump(
+                    mode="json", exclude={"dedupe_key"}
+                ):
+                    raise IdempotencyConflictError(
+                        "event identity was reused with different data"
+                    ) from insert_error
+                return existing
 
     @staticmethod
     def _new_event_row(event: CandidateEventV1) -> CandidateEventModel:
@@ -246,7 +269,7 @@ class PilotRepository:
             gate_mode=event.gate_mode,
             evidence_status=event.evidence_status,
             review_status=event.review_status,
-            transition_history=list(event.transition_history),
+            transition_history=">".join(event.transition_history),
         )
 
     def get_event(self, event_id: UUID) -> CandidateEventV1:
@@ -361,7 +384,17 @@ class PilotRepository:
         notes: str | None,
         reviewed_at: datetime,
     ) -> ReviewModel:
-        with self.session_factory.begin() as session:
+        with self.session_factory() as session:
+            if session.get_bind().dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            row = session.scalar(
+                select(CandidateEventModel)
+                .where(CandidateEventModel.event_id == str(event_id))
+                .with_for_update()
+            )
+            if row is None:
+                session.rollback()
+                raise KeyError(f"unknown event: {event_id}")
             existing = session.scalar(
                 select(ReviewModel).where(
                     ReviewModel.event_id == str(event_id),
@@ -373,19 +406,15 @@ class PilotRepository:
                     existing.reviewer_id,
                     existing.to_status,
                     existing.notes,
-                ) != (reviewer_id, target_status, notes):
+                    _as_utc(existing.reviewed_at),
+                ) != (reviewer_id, target_status, notes, _as_utc(reviewed_at)):
+                    session.rollback()
                     raise IdempotencyConflictError(
                         "review idempotency key was reused with different data"
                     )
+                session.commit()
                 return existing
 
-            row = session.scalar(
-                select(CandidateEventModel)
-                .where(CandidateEventModel.event_id == str(event_id))
-                .with_for_update()
-            )
-            if row is None:
-                raise KeyError(f"unknown event: {event_id}")
             current = _event_from_row(row)
             transitioned = current.transition_to(target_status)
             result = session.execute(
@@ -396,10 +425,11 @@ class PilotRepository:
                 )
                 .values(
                     review_status=transitioned.review_status,
-                    transition_history=list(transitioned.transition_history),
+                    transition_history=">".join(transitioned.transition_history),
                 )
             )
             if result.rowcount != 1:
+                session.rollback()
                 raise RuntimeError("event was reviewed concurrently")
 
             review = ReviewModel(
@@ -430,6 +460,7 @@ class PilotRepository:
                 )
             )
             session.flush()
+            session.commit()
             return review
 
     def enqueue_notification(
@@ -439,7 +470,8 @@ class PilotRepository:
         idempotency_key: str,
         payload: dict[str, Any] | None = None,
     ) -> NotificationOutboxModel:
-        with self.session_factory.begin() as session:
+        requested_payload = dict(payload or {})
+        with self.session_factory() as session:
             existing = session.scalar(
                 select(NotificationOutboxModel).where(
                     or_(
@@ -452,6 +484,7 @@ class PilotRepository:
                 if (
                     existing.event_id != str(event_id)
                     or existing.idempotency_key != idempotency_key
+                    or existing.payload != requested_payload
                 ):
                     raise IdempotencyConflictError(
                         "notification identity was reused with different data"
@@ -469,26 +502,47 @@ class PilotRepository:
                 event_id=str(event_id),
                 idempotency_key=idempotency_key,
                 status="pending",
-                payload=dict(payload or {}),
+                payload=requested_payload,
                 available_at=datetime.now(timezone.utc),
             )
             session.add(row)
-            session.flush()
-            return row
+            try:
+                session.commit()
+                return row
+            except IntegrityError as insert_error:
+                session.rollback()
+                existing = session.scalar(
+                    select(NotificationOutboxModel).where(
+                        or_(
+                            NotificationOutboxModel.event_id == str(event_id),
+                            NotificationOutboxModel.idempotency_key == idempotency_key,
+                        )
+                    )
+                )
+                if existing is None:
+                    raise insert_error
+                if (
+                    existing.event_id != str(event_id)
+                    or existing.idempotency_key != idempotency_key
+                    or existing.payload != requested_payload
+                ):
+                    raise IdempotencyConflictError(
+                        "notification identity was reused with different data"
+                    ) from insert_error
+                return existing
 
     def add_evidence(self, evidence: EvidenceInput) -> EvidenceModel:
-        with self.session_factory.begin() as session:
-            existing = session.get(EvidenceModel, str(evidence.evidence_id))
+        with self.session_factory() as session:
+            existing = session.scalar(
+                select(EvidenceModel).where(
+                    or_(
+                        EvidenceModel.evidence_id == str(evidence.evidence_id),
+                        EvidenceModel.object_key == evidence.object_key,
+                    )
+                )
+            )
             if existing is not None:
-                if (
-                    existing.event_id,
-                    existing.object_key,
-                    existing.sha256,
-                ) != (
-                    str(evidence.event_id),
-                    evidence.object_key,
-                    evidence.sha256,
-                ):
+                if not self._evidence_matches(existing, evidence):
                     raise IdempotencyConflictError(
                         "evidence identity was reused with different data"
                     )
@@ -505,11 +559,54 @@ class PilotRepository:
                 status=evidence.status,
             )
             session.add(row)
-            session.flush()
-            return row
+            try:
+                session.commit()
+                return row
+            except IntegrityError as insert_error:
+                session.rollback()
+                existing = session.scalar(
+                    select(EvidenceModel).where(
+                        or_(
+                            EvidenceModel.evidence_id == str(evidence.evidence_id),
+                            EvidenceModel.object_key == evidence.object_key,
+                        )
+                    )
+                )
+                if existing is None:
+                    raise insert_error
+                if not self._evidence_matches(existing, evidence):
+                    raise IdempotencyConflictError(
+                        "evidence identity was reused with different data"
+                    ) from insert_error
+                return existing
+
+    @staticmethod
+    def _evidence_matches(row: EvidenceModel, evidence: EvidenceInput) -> bool:
+        return (
+            row.evidence_id,
+            row.event_id,
+            row.object_key,
+            row.sha256,
+            row.codec,
+            _as_utc(row.start_at),
+            _as_utc(row.end_at),
+            row.source_reference,
+            row.status,
+        ) == (
+            str(evidence.evidence_id),
+            str(evidence.event_id),
+            evidence.object_key,
+            evidence.sha256,
+            evidence.codec,
+            _as_utc(evidence.start_at),
+            _as_utc(evidence.end_at),
+            evidence.source_reference,
+            evidence.status,
+        )
 
     def persist_journal_item(self, item: Any) -> None:
         """Commit one journal item before returning so the journal may acknowledge it."""
+        validate_journal_work(item.kind, item.schema_version, item.payload)
         if item.kind == "candidate_event":
             self.store_event_idempotent(CandidateEventV1.model_validate(item.payload))
             return

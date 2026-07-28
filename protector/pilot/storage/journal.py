@@ -14,8 +14,13 @@ from typing import Any, Literal
 from protector.pilot.domain import CandidateEventV1
 
 JournalKind = Literal["candidate_event", "evidence"]
+SUPPORTED_JOURNAL_SCHEMA_VERSIONS: dict[JournalKind, str] = {
+    "candidate_event": "candidate-event.v1",
+    "evidence": "evidence-work.v1",
+}
 _EVIDENCE_METADATA_FIELDS = frozenset(
     {
+        "schema_version",
         "evidence_id",
         "event_id",
         "object_key",
@@ -27,6 +32,18 @@ _EVIDENCE_METADATA_FIELDS = frozenset(
         "status",
     }
 )
+
+
+def validate_journal_work(
+    kind: JournalKind,
+    schema_version: str,
+    payload: dict[str, Any],
+) -> None:
+    expected_version = SUPPORTED_JOURNAL_SCHEMA_VERSIONS[kind]
+    if schema_version != expected_version:
+        raise ValueError(f"unsupported journal schema version for {kind}: {schema_version}")
+    if payload.get("schema_version") != schema_version:
+        raise ValueError("journal schema version does not match payload")
 
 
 class JournalFullError(RuntimeError):
@@ -114,6 +131,7 @@ class SQLiteWALJournal:
     ) -> JournalItem:
         if not schema_version or not idempotency_key:
             raise ValueError("schema_version and idempotency_key must be non-empty")
+        validate_journal_work(kind, schema_version, payload)
         if kind == "evidence" and not set(payload) <= _EVIDENCE_METADATA_FIELDS:
             raise ValueError("evidence journal payload must contain metadata only")
         payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -192,6 +210,7 @@ class SQLiteWALJournal:
         acknowledged = 0
         for row in rows:
             item = self._row_to_item(row)
+            validate_journal_work(item.kind, item.schema_version, item.payload)
             processor(item)
             with self._lock:
                 self._connection.execute(
