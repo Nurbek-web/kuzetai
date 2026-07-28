@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import (
     DDL,
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -367,6 +368,7 @@ class UserModel(Base):
     username: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(String(1024), nullable=False)
     totp_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    totp_last_accepted_counter: Mapped[int | None] = mapped_column(BigInteger)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(

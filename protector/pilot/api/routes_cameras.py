@@ -8,7 +8,12 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 
 from protector.pilot.api.auth import ServerSession
-from protector.pilot.api.dependencies import ApiContext, get_context, get_current_session
+from protector.pilot.api.dependencies import (
+    ApiContext,
+    get_context,
+    get_current_session,
+    redact_secrets,
+)
 from protector.pilot.storage.models import CameraModel
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
@@ -18,7 +23,7 @@ router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 def list_cameras(
     current: Annotated[ServerSession, Depends(get_current_session)],
     context: Annotated[ApiContext, Depends(get_context)],
-    site_id: str | None = None,
+    site_id: Annotated[str | None, Query(max_length=128)] = None,
     state: Literal["starting", "online", "degraded", "offline", "reconnecting"] | None = None,
     enabled: bool | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
@@ -45,15 +50,17 @@ def list_cameras(
         total = int(session.scalar(count_statement) or 0)
     return {
         "items": [
-            {
-                "camera_id": row.camera_id,
-                "site_id": row.site_id,
-                "name": row.name,
-                "codec": row.codec,
-                "state": row.state,
-                "enabled": row.enabled,
-                "created_at": row.created_at,
-            }
+            redact_secrets(
+                {
+                    "camera_id": row.camera_id,
+                    "site_id": row.site_id,
+                    "name": row.name,
+                    "codec": row.codec,
+                    "state": row.state,
+                    "enabled": row.enabled,
+                    "created_at": row.created_at,
+                }
+            )
             for row in rows
         ],
         "limit": limit,

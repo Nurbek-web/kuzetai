@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,13 +11,14 @@ from fastapi.testclient import TestClient
 from protector.pilot.api.app import create_app
 from protector.pilot.api.auth import LoginThrottle, PasswordService, TotpService
 from protector.pilot.storage.db import create_engine, create_session_factory
-from protector.pilot.storage.models import Base
+from protector.pilot.storage.models import Base, UserModel
 from protector.pilot.storage.repositories import PilotRepository
 
 UTC = timezone.utc
 NOW = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
 SESSION_SECRET = "test-session-signing-key-that-is-never-returned"
 MACHINE_TOKEN = "test-machine-token-that-is-never-returned"
+TOTP_KEY = base64.urlsafe_b64encode(b"t" * 32).decode()
 
 
 @pytest.fixture
@@ -25,7 +27,7 @@ def auth_context(tmp_path: Path) -> tuple[TestClient, PilotRepository, dict[str,
     Base.metadata.create_all(engine)
     repository = PilotRepository(create_session_factory(engine))
     password_service = PasswordService()
-    totp_service = TotpService()
+    totp_service = TotpService(encryption_key=TOTP_KEY)
     secrets: dict[str, str] = {}
     for username, role in (
         ("viewer", "viewer"),
@@ -39,13 +41,19 @@ def auth_context(tmp_path: Path) -> tuple[TestClient, PilotRepository, dict[str,
             username=username,
             password_hash=password_service.hash("Correct horse battery staple"),
             role=role,
-            totp_secret_encrypted=totp_secret,
+            totp_secret_encrypted=totp_service.encrypt_secret(totp_secret),
         )
     app = create_app(
         repository=repository,
         session_secret=SESSION_SECRET,
+        totp_encryption_key=TOTP_KEY,
         machine_token=MACHINE_TOKEN,
-        throttle=LoginThrottle(max_attempts=3, window_seconds=60, max_entries=8),
+        throttle=LoginThrottle(
+            max_attempts=3,
+            client_max_attempts=20,
+            window_seconds=60,
+            max_entries=8,
+        ),
     )
     return TestClient(app, base_url="https://testserver"), repository, secrets
 
@@ -70,7 +78,7 @@ def _login(
 def test_password_hashing_uses_argon2_and_totp_enrolment_verifies() -> None:
     passwords = PasswordService()
     encoded = passwords.hash("secret password")
-    totp = TotpService()
+    totp = TotpService(encryption_key=TOTP_KEY)
     enrolment = totp.enrol("operator")
 
     assert encoded.startswith("$argon2id$")
@@ -78,7 +86,14 @@ def test_password_hashing_uses_argon2_and_totp_enrolment_verifies() -> None:
     assert passwords.verify(encoded, "secret password")
     assert not passwords.verify(encoded, "wrong password")
     assert "operator" in enrolment.provisioning_uri
-    assert totp.verify(enrolment.secret, pyotp.TOTP(enrolment.secret).now())
+    encrypted = totp.encrypt_secret(enrolment.secret)
+    assert (
+        totp.match_current_counter(
+            encrypted,
+            pyotp.TOTP(enrolment.secret).now(),
+        )
+        is not None
+    )
     assert enrolment.secret not in repr(enrolment)
 
 
@@ -117,6 +132,34 @@ def test_login_requires_password_and_totp_and_sets_a_hardened_opaque_cookie(
     assert "operator-1" not in set_cookie
     assert secrets["operator"].lower() not in set_cookie
     assert MACHINE_TOKEN not in repr(client.app.state.pilot_context)
+    with client.app.state.pilot_context.repository.session_factory() as session:
+        stored = session.get(UserModel, "operator-1")
+        assert stored is not None
+        assert secrets["operator"] not in stored.totp_secret_encrypted
+
+
+def test_totp_code_replay_fails_after_new_session_manager_and_repository_instance(
+    auth_context: tuple[TestClient, PilotRepository, dict[str, str]],
+) -> None:
+    client, repository, secrets = auth_context
+    code = pyotp.TOTP(secrets["operator"]).now()
+    payload = {
+        "username": "operator",
+        "password": "Correct horse battery staple",
+        "totp_code": code,
+    }
+
+    assert client.post("/api/auth/login", json=payload).status_code == 200
+    assert client.post("/api/auth/login", json=payload).status_code == 401
+
+    restarted = create_app(
+        repository=PilotRepository(repository.session_factory),
+        session_secret=SESSION_SECRET,
+        totp_encryption_key=TOTP_KEY,
+        machine_token=MACHINE_TOKEN,
+    )
+    restarted_client = TestClient(restarted, base_url="https://testserver")
+    assert restarted_client.post("/api/auth/login", json=payload).status_code == 401
 
 
 def test_successful_login_rotates_session_and_logout_requires_csrf(
@@ -127,15 +170,18 @@ def test_successful_login_rotates_session_and_logout_requires_csrf(
     first_cookie = client.cookies.get("pilot_session")
     csrf = first.json()["csrf_token"]
 
-    second = _login(client, secrets, "operator")
+    second = _login(client, secrets, "admin")
     second_cookie = client.cookies.get("pilot_session")
 
     assert first_cookie != second_cookie
     assert client.post("/api/auth/logout").status_code == 403
-    assert client.post(
-        "/api/auth/logout",
-        headers={"X-CSRF-Token": second.json()["csrf_token"]},
-    ).status_code == 204
+    assert (
+        client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": second.json()["csrf_token"]},
+        ).status_code
+        == 204
+    )
     assert client.get("/api/cameras").status_code == 401
 
     client.cookies.set("pilot_session", first_cookie)
@@ -162,11 +208,15 @@ def test_login_throttle_is_bounded_and_does_not_trust_forwarded_headers(
 
     assert client.post("/api/auth/login", json=payload).status_code == 429
 
-    throttle = LoginThrottle(max_attempts=1, window_seconds=60, max_entries=2)
-    for index in range(10):
-        throttle.record_failure(f"user-{index}", "client")
+    throttle = LoginThrottle(
+        max_attempts=1,
+        client_max_attempts=20,
+        window_seconds=60,
+        max_entries=2,
+    )
+    assert throttle.admit_attempt("user-0", "client")
     assert throttle.entry_count == 2
-    assert throttle.is_limited("new-user-during-capacity-pressure", "client")
+    assert not throttle.admit_attempt("new-user-during-capacity-pressure", "other-client")
 
 
 def test_login_validation_errors_do_not_echo_passwords(

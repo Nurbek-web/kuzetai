@@ -98,9 +98,12 @@ def test_camera_analytics_requires_person_and_bounds_every_frequency():
         "person": 10.0,
         "weapon": 0.0,
     }
-    assert SiteConfig.model_validate(disabled_optional_module).ready_to_start.feeds[0].analytics_hz[
-        "weapon"
-    ] == 0.0
+    assert (
+        SiteConfig.model_validate(disabled_optional_module)
+        .ready_to_start.feeds[0]
+        .analytics_hz["weapon"]
+        == 0.0
+    )
 
     missing_person = deepcopy(disabled_optional_module)
     missing_person["ready_to_start"]["feeds"][0]["analytics_hz"] = {"weapon": 1.0}
@@ -221,6 +224,7 @@ def test_secrets_load_only_from_environment_or_docker_secret_files(monkeypatch, 
 
     environment = PilotSecrets.from_environment()
     assert environment.database_url.get_secret_value() == "env-database_url"
+    assert environment.totp_encryption_key.get_secret_value() == "env-totp_encryption_key"
 
     for name in PilotSecrets.required_names():
         monkeypatch.delenv(f"PILOT_{name.upper()}")

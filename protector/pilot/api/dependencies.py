@@ -42,7 +42,9 @@ def get_current_session(
     token = request.cookies.get(context.sessions.cookie_name)
     current = context.sessions.resolve(token)
     if current is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
     with context.repository.session_factory() as database_session:
         user = database_session.get(UserModel, current.user.user_id)
         if (
@@ -107,39 +109,53 @@ def require_machine_auth(
         or not credential
         or not machine_token_matches(credential, context.machine_token)
     ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="machine authentication required")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="machine authentication required"
+        )
 
 
-_REDACTED_KEYS = frozenset(
+_CREDENTIAL_KEY_MARKERS = frozenset(
     {
-        "rtsp_url",
-        "source_reference",
-        "object_store_access_key",
-        "object_store_secret_key",
-        "totp_secret",
-        "totp_secret_encrypted",
+        "authorization",
+        "credential",
         "password",
-        "password_hash",
-        "machine_token",
-        "session_secret",
+        "secret",
+        "token",
+        "accesskey",
+        "apikey",
+        "rtsp",
+        "objectstore",
+        "objectkey",
+        "sourcereference",
+        "url",
+        "uri",
+        "header",
+        "cookie",
     }
 )
-_CREDENTIAL_URL = re.compile(r"\b([a-z][a-z0-9+.-]*://)([^/\s@]+)@", re.IGNORECASE)
+_URI = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+_BEARER = re.compile(r"\bbearer\s+\S+", re.IGNORECASE)
 _INLINE_SECRET = re.compile(
-    r"\b(access[_-]?key|secret[_-]?key|password|token)=([^&\s]+)",
+    r"\b(access[_-]?key|secret[_-]?key|password|token|authorization)=\S+",
     re.IGNORECASE,
 )
+
+
+def _credential_like_key(key: object) -> bool:
+    collapsed = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+    return any(marker in collapsed for marker in _CREDENTIAL_KEY_MARKERS)
 
 
 def redact_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: ("[REDACTED]" if key.casefold() in _REDACTED_KEYS else redact_secrets(item))
+            key: ("[REDACTED]" if _credential_like_key(key) else redact_secrets(item))
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
         return [redact_secrets(item) for item in value]
     if isinstance(value, str):
-        without_url_credentials = _CREDENTIAL_URL.sub(r"\1[REDACTED]@", value)
-        return _INLINE_SECRET.sub(r"\1=[REDACTED]", without_url_credentials)
+        if _URI.search(value) or _BEARER.search(value) or _INLINE_SECRET.search(value):
+            return "[REDACTED]"
+        return value
     return value

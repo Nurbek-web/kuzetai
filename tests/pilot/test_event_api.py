@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -26,6 +27,7 @@ from protector.pilot.storage.repositories import PilotRepository
 UTC = timezone.utc
 NOW = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
 MACHINE_TOKEN = "internal-runtime-token"
+TOTP_KEY = base64.urlsafe_b64encode(b"e" * 32).decode()
 
 
 @pytest.fixture
@@ -67,17 +69,19 @@ def api_context(tmp_path: Path) -> tuple[TestClient, PilotRepository, str]:
             analytic="person",
         )
     )
-    totp_secret = TotpService().enrol("operator").secret
+    totp_service = TotpService(encryption_key=TOTP_KEY)
+    totp_secret = totp_service.enrol("operator").secret
     repository.add_user(
         user_id="operator-1",
         username="operator",
         password_hash=PasswordService().hash("operator-password"),
         role="operator",
-        totp_secret_encrypted=totp_secret,
+        totp_secret_encrypted=totp_service.encrypt_secret(totp_secret),
     )
     app = create_app(
         repository=repository,
         session_secret="session-secret-at-least-32-characters",
+        totp_encryption_key=TOTP_KEY,
         machine_token=MACHINE_TOKEN,
     )
     client = TestClient(app, base_url="https://testserver")
@@ -165,12 +169,11 @@ def test_camera_and_event_lists_are_redacted_filtered_and_deterministically_pagi
     assert "source_reference" not in cameras.text
     assert "camera-password" not in cameras.text
     assert [event["event_id"] for event in events.json()["items"]] == [str(first.event_id)]
-    assert [event["event_id"] for event in second_page.json()["items"]] == [
-        str(second.event_id)
-    ]
+    assert [event["event_id"] for event in second_page.json()["items"]] == [str(second.event_id)]
     assert detail.json()["event_id"] == str(first.event_id)
     assert client.get("/api/events", params={"limit": 101}).status_code == 422
     assert client.get("/api/events", params={"offset": 10001}).status_code == 422
+    assert client.get("/api/events", params={"module": "x" * 1_024}).status_code == 422
 
 
 def test_review_requires_csrf_and_idempotency_and_returns_stable_replay(
@@ -186,16 +189,22 @@ def test_review_requires_csrf_and_idempotency_and_returns_stable_replay(
         "reviewed_at": (NOW + timedelta(minutes=1)).isoformat(),
     }
 
-    assert client.post(
-        f"/api/events/{event.event_id}/review",
-        headers={"Idempotency-Key": "review-1"},
-        json=payload,
-    ).status_code == 403
-    assert client.post(
-        f"/api/events/{event.event_id}/review",
-        headers={"X-CSRF-Token": csrf},
-        json=payload,
-    ).status_code == 400
+    assert (
+        client.post(
+            f"/api/events/{event.event_id}/review",
+            headers={"Idempotency-Key": "review-1"},
+            json=payload,
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            f"/api/events/{event.event_id}/review",
+            headers={"X-CSRF-Token": csrf},
+            json=payload,
+        ).status_code
+        == 400
+    )
 
     first = _review(client, event, csrf, idempotency_key="review-1")
     replay = _review(client, event, csrf, idempotency_key="review-1")

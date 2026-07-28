@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -35,6 +36,15 @@ from protector.pilot.storage.models import (
 
 class IdempotencyConflictError(ValueError):
     """An idempotency key was reused for different work."""
+
+
+class StaleStateError(ValueError):
+    """The caller's expected event state no longer matches persisted state."""
+
+    def __init__(self, *, expected: str, actual: str) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"expected {expected}, found {actual}")
 
 
 @dataclass(frozen=True)
@@ -75,10 +85,21 @@ class EvidenceInput:
         )
 
 
+@dataclass(frozen=True)
+class ReviewNotificationResult:
+    review: ReviewModel
+    outbox: NotificationOutboxModel | None
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _review_audit_key(event_id: UUID, review_idempotency_key: str) -> str:
+    material = f"{event_id}:{review_idempotency_key}".encode()
+    return f"review-audit:{hashlib.sha256(material).hexdigest()}"
 
 
 def _event_from_row(row: CandidateEventModel) -> CandidateEventV1:
@@ -336,6 +357,37 @@ class PilotRepository:
             session.flush()
             return row
 
+    def accept_totp_counter(
+        self,
+        *,
+        user_id: str,
+        counter: int,
+        expected_password_hash: str,
+        expected_encrypted_secret: str,
+    ) -> bool:
+        """Atomically advance one user's accepted TOTP counter."""
+        if counter < 0:
+            raise ValueError("TOTP counter must be non-negative")
+        with self.session_factory() as session:
+            if session.get_bind().dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            result = session.execute(
+                update(UserModel)
+                .where(
+                    UserModel.user_id == user_id,
+                    UserModel.is_active.is_(True),
+                    UserModel.password_hash == expected_password_hash,
+                    UserModel.totp_secret_encrypted == expected_encrypted_secret,
+                    or_(
+                        UserModel.totp_last_accepted_counter.is_(None),
+                        UserModel.totp_last_accepted_counter < counter,
+                    ),
+                )
+                .values(totp_last_accepted_counter=counter)
+            )
+            session.commit()
+            return result.rowcount == 1
+
     def append_audit(self, entry: AuditEntryInput) -> AuditEntryModel:
         with self.session_factory.begin() as session:
             if entry.idempotency_key is not None:
@@ -456,12 +508,160 @@ class PilotRepository:
                         "to_status": target_status,
                         "notes": notes,
                     },
-                    idempotency_key=f"review:{event_id}:{idempotency_key}",
+                    idempotency_key=_review_audit_key(event_id, idempotency_key),
                 )
             )
             session.flush()
             session.commit()
             return review
+
+    def review_event_and_enqueue_notification(
+        self,
+        *,
+        event_id: UUID,
+        reviewer_id: str,
+        target_status: ReviewStatus,
+        expected_status: ReviewStatus,
+        review_idempotency_key: str,
+        notification_idempotency_key: str,
+        notes: str | None,
+        reviewed_at: datetime,
+    ) -> ReviewNotificationResult:
+        """Commit review, audit, and any confirmed-operator outbox row together."""
+        with self.session_factory() as session:
+            if session.get_bind().dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            event_row = session.scalar(
+                select(CandidateEventModel)
+                .where(CandidateEventModel.event_id == str(event_id))
+                .with_for_update()
+            )
+            if event_row is None:
+                session.rollback()
+                raise KeyError(f"unknown event: {event_id}")
+            conflicting_outbox = session.scalar(
+                select(NotificationOutboxModel).where(
+                    NotificationOutboxModel.idempotency_key == notification_idempotency_key,
+                    NotificationOutboxModel.event_id != str(event_id),
+                )
+            )
+            if conflicting_outbox is not None:
+                session.rollback()
+                raise IdempotencyConflictError(
+                    "notification identity was reused with different data"
+                )
+
+            existing_review = session.scalar(
+                select(ReviewModel).where(
+                    ReviewModel.event_id == str(event_id),
+                    ReviewModel.idempotency_key == review_idempotency_key,
+                )
+            )
+            if existing_review is not None:
+                if (
+                    existing_review.reviewer_id,
+                    existing_review.from_status,
+                    existing_review.to_status,
+                    existing_review.notes,
+                    _as_utc(existing_review.reviewed_at),
+                ) != (
+                    reviewer_id,
+                    expected_status,
+                    target_status,
+                    notes,
+                    _as_utc(reviewed_at),
+                ):
+                    session.rollback()
+                    raise IdempotencyConflictError(
+                        "review idempotency key was reused with different data"
+                    )
+                outbox = session.scalar(
+                    select(NotificationOutboxModel).where(
+                        NotificationOutboxModel.event_id == str(event_id)
+                    )
+                )
+                if outbox is not None and outbox.idempotency_key != notification_idempotency_key:
+                    session.rollback()
+                    raise IdempotencyConflictError(
+                        "notification identity was reused with different data"
+                    )
+                persisted_event = _event_from_row(event_row)
+                if (
+                    outbox is None
+                    and persisted_event.gate_mode == "operator"
+                    and existing_review.to_status == "confirmed"
+                ):
+                    NotificationOutboxRecordV1.from_confirmed_event(
+                        persisted_event,
+                        idempotency_key=notification_idempotency_key,
+                    )
+                    outbox = NotificationOutboxModel(
+                        outbox_id=str(uuid4()),
+                        event_id=str(event_id),
+                        idempotency_key=notification_idempotency_key,
+                        status="pending",
+                        payload={},
+                        available_at=datetime.now(timezone.utc),
+                    )
+                    session.add(outbox)
+                    session.flush()
+                session.commit()
+                return ReviewNotificationResult(review=existing_review, outbox=outbox)
+
+            current = _event_from_row(event_row)
+            if current.review_status != expected_status:
+                session.rollback()
+                raise StaleStateError(expected=expected_status, actual=current.review_status)
+            transitioned = current.transition_to(target_status)
+            event_row.review_status = transitioned.review_status
+            event_row.transition_history = ">".join(transitioned.transition_history)
+            review = ReviewModel(
+                review_id=str(uuid4()),
+                event_id=str(event_id),
+                reviewer_id=reviewer_id,
+                from_status=current.review_status,
+                to_status=target_status,
+                notes=notes,
+                idempotency_key=review_idempotency_key,
+                reviewed_at=reviewed_at,
+            )
+            session.add(review)
+            session.add(
+                AuditEntryModel(
+                    audit_id=str(uuid4()),
+                    occurred_at=reviewed_at,
+                    actor_user_id=reviewer_id,
+                    action=f"event.{target_status}",
+                    entity_type="candidate_event",
+                    entity_id=str(event_id),
+                    payload={
+                        "from_status": current.review_status,
+                        "to_status": target_status,
+                        "notes": notes,
+                    },
+                    idempotency_key=_review_audit_key(event_id, review_idempotency_key),
+                )
+            )
+            session.flush()
+
+            outbox: NotificationOutboxModel | None = None
+            if transitioned.gate_mode == "operator" and target_status == "confirmed":
+                NotificationOutboxRecordV1.from_confirmed_event(
+                    transitioned,
+                    idempotency_key=notification_idempotency_key,
+                )
+                outbox = NotificationOutboxModel(
+                    outbox_id=str(uuid4()),
+                    event_id=str(event_id),
+                    idempotency_key=notification_idempotency_key,
+                    status="pending",
+                    payload={},
+                    available_at=datetime.now(timezone.utc),
+                )
+                session.add(outbox)
+                session.flush()
+            session.commit()
+            return ReviewNotificationResult(review=review, outbox=outbox)
 
     def enqueue_notification(
         self,

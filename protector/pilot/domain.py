@@ -1,4 +1,5 @@
 """Versioned, immutable messages shared by the pilot runtime and control plane."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -6,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import Field, computed_field, field_validator, model_validator
+from pydantic import Field, StringConstraints, computed_field, field_validator, model_validator
 
 from protector.pilot.config import FrozenModel, NonEmptyString
 
@@ -23,6 +24,12 @@ GateMode = Literal["disabled", "shadow", "operator"]
 EvidenceStatus = Literal["pending", "ready", "failed", "unavailable"]
 ReviewStatus = Literal["observation", "candidate", "confirmed", "rejected", "expired", "escalated"]
 NormalisedBoundingBox = tuple[float, float, float, float]
+Identifier128 = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)
+]
+Identifier255 = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)
+]
 
 _EVENT_TRANSITIONS: dict[ReviewStatus, frozenset[ReviewStatus]] = {
     "observation": frozenset({"candidate"}),
@@ -45,17 +52,17 @@ class ObservationV1(FrozenModel):
 
     schema_version: Literal["observation.v1"]
     observation_id: UUID
-    camera_id: NonEmptyString
+    camera_id: Identifier128
     stream_epoch: UUID
     source_time: datetime
     timestamp_quality: TimestampQuality
     monotonic_seq: Annotated[int, Field(ge=0)]
-    module: NonEmptyString
-    class_name: NonEmptyString
+    module: Identifier128
+    class_name: Identifier128
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
     bbox: NormalisedBoundingBox
-    track_id: NonEmptyString | None = None
-    model_artifact_id: NonEmptyString
+    track_id: Identifier255 | None = None
+    model_artifact_id: Identifier255
     sample_kind: SampleKind
     runtime_state: RuntimeState
     received_at: datetime
@@ -150,8 +157,7 @@ class CandidateEventV1(FrozenModel):
     @property
     def dedupe_key(self) -> str:
         return (
-            f"{self.camera_id}:{self.module}:{self.model_artifact_id}:"
-            f"{self.opened_at.isoformat()}"
+            f"{self.camera_id}:{self.module}:{self.model_artifact_id}:{self.opened_at.isoformat()}"
         )
 
     def transition_to(self, target: ReviewStatus) -> CandidateEventV1:

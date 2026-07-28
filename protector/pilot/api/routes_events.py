@@ -22,8 +22,8 @@ from protector.pilot.api.dependencies import (
     require_roles,
 )
 from protector.pilot.domain import CandidateEventV1
-from protector.pilot.storage.models import AuditEntryModel, CandidateEventModel, ReviewModel
-from protector.pilot.storage.repositories import IdempotencyConflictError
+from protector.pilot.storage.models import AuditEntryModel, CandidateEventModel
+from protector.pilot.storage.repositories import IdempotencyConflictError, StaleStateError
 
 router = APIRouter(prefix="/api", tags=["events"])
 
@@ -53,7 +53,22 @@ def _event_from_row(row: CandidateEventModel) -> CandidateEventV1:
 
 
 def _event_payload(event: CandidateEventV1) -> dict[str, object]:
-    return redact_secrets(event.model_dump(mode="json"))
+    return redact_secrets(
+        {
+            "schema_version": event.schema_version,
+            "event_id": str(event.event_id),
+            "camera_id": event.camera_id,
+            "module": event.module,
+            "opened_at": event.opened_at.isoformat(),
+            "last_seen_at": event.last_seen_at.isoformat(),
+            "peak_confidence": event.peak_confidence,
+            "reason": event.reason,
+            "model_artifact_id": event.model_artifact_id,
+            "gate_mode": event.gate_mode,
+            "evidence_status": event.evidence_status,
+            "review_status": event.review_status,
+        }
+    )
 
 
 def _notification_key(event_id: UUID, idempotency_key: str) -> str:
@@ -65,12 +80,11 @@ def _notification_key(event_id: UUID, idempotency_key: str) -> str:
 def list_events(
     current: Annotated[ServerSession, Depends(get_current_session)],
     context: Annotated[ApiContext, Depends(get_context)],
-    camera_id: str | None = None,
-    module: str | None = None,
+    camera_id: Annotated[str | None, Query(max_length=128)] = None,
+    module: Annotated[str | None, Query(max_length=128)] = None,
     gate_mode: Literal["disabled", "shadow", "operator"] | None = None,
     review_status: (
-        Literal["observation", "candidate", "confirmed", "rejected", "expired", "escalated"]
-        | None
+        Literal["observation", "candidate", "confirmed", "rejected", "expired", "escalated"] | None
     ) = None,
     opened_from: datetime | None = None,
     opened_to: datetime | None = None,
@@ -125,7 +139,9 @@ def get_event(
     try:
         event = context.repository.get_event(event_id)
     except KeyError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="event not found") from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="event not found"
+        ) from exc
     return _event_payload(event)
 
 
@@ -145,42 +161,6 @@ class ReviewRequest(BaseModel):
         return value.astimezone(timezone.utc)
 
 
-def _matching_review_response(
-    *,
-    existing: ReviewModel,
-    event_id: UUID,
-    current: ServerSession,
-    body: ReviewRequest,
-    context: ApiContext,
-    idempotency_key: str,
-) -> dict[str, object]:
-    if (
-        existing.reviewer_id,
-        existing.to_status,
-        existing.notes,
-        _as_utc(existing.reviewed_at),
-    ) != (
-        current.user.user_id,
-        body.target_status,
-        body.notes,
-        body.reviewed_at,
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "idempotency_conflict"},
-        )
-    event = context.repository.get_event(event_id)
-    if event.gate_mode == "operator" and event.review_status == "confirmed":
-        context.repository.enqueue_notification(
-            event_id=event_id,
-            idempotency_key=_notification_key(event_id, idempotency_key),
-        )
-    return {
-        "review_id": existing.review_id,
-        "event": _event_payload(event),
-    }
-
-
 @router.post("/events/{event_id}/review")
 def review_event(
     event_id: UUID,
@@ -196,65 +176,39 @@ def review_event(
     if csrf_session.session_id != role_session.session_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="session mismatch")
     current = role_session
-    with context.repository.session_factory() as session:
-        existing = session.scalar(
-            select(ReviewModel).where(
-                ReviewModel.event_id == str(event_id),
-                ReviewModel.idempotency_key == idempotency_key,
-            )
-        )
-    if existing is not None:
-        return _matching_review_response(
-            existing=existing,
-            event_id=event_id,
-            current=current,
-            body=body,
-            context=context,
-            idempotency_key=idempotency_key,
-        )
-
     try:
-        event = context.repository.get_event(event_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="event not found") from exc
-    if event.review_status != body.expected_status:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "stale_state",
-                "expected": body.expected_status,
-                "actual": event.review_status,
-            },
-        )
-
-    try:
-        review = context.repository.review_event(
+        result = context.repository.review_event_and_enqueue_notification(
             event_id=event_id,
             reviewer_id=current.user.user_id,
             target_status=body.target_status,
-            idempotency_key=idempotency_key,
+            expected_status=body.expected_status,
+            review_idempotency_key=idempotency_key,
+            notification_idempotency_key=_notification_key(event_id, idempotency_key),
             notes=body.notes,
             reviewed_at=body.reviewed_at,
         )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="event not found"
+        ) from exc
     except IdempotencyConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "idempotency_conflict"},
         ) from exc
-    except (RuntimeError, ValueError) as exc:
+    except StaleStateError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "stale_state"},
+            detail={
+                "code": "stale_state",
+                "expected": exc.expected,
+                "actual": exc.actual,
+            },
         ) from exc
 
     event = context.repository.get_event(event_id)
-    if event.gate_mode == "operator" and event.review_status == "confirmed":
-        context.repository.enqueue_notification(
-            event_id=event_id,
-            idempotency_key=_notification_key(event_id, idempotency_key),
-        )
     return {
-        "review_id": review.review_id,
+        "review_id": result.review.review_id,
         "event": _event_payload(event),
     }
 
@@ -263,9 +217,9 @@ def review_event(
 def list_audit(
     current: Annotated[ServerSession, Depends(get_current_session)],
     context: Annotated[ApiContext, Depends(get_context)],
-    entity_type: str | None = None,
-    entity_id: str | None = None,
-    action: str | None = None,
+    entity_type: Annotated[str | None, Query(max_length=128)] = None,
+    entity_id: Annotated[str | None, Query(max_length=255)] = None,
+    action: Annotated[str | None, Query(max_length=255)] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
 ) -> dict[str, object]:
@@ -294,15 +248,17 @@ def list_audit(
         total = int(session.scalar(count_statement) or 0)
     return {
         "items": [
-            {
-                "audit_id": row.audit_id,
-                "occurred_at": row.occurred_at,
-                "actor_user_id": row.actor_user_id,
-                "action": row.action,
-                "entity_type": row.entity_type,
-                "entity_id": row.entity_id,
-                "payload": redact_secrets(row.payload),
-            }
+            redact_secrets(
+                {
+                    "audit_id": row.audit_id,
+                    "occurred_at": row.occurred_at,
+                    "actor_user_id": row.actor_user_id,
+                    "action": row.action,
+                    "entity_type": row.entity_type,
+                    "entity_id": row.entity_id,
+                    "payload": redact_secrets(row.payload),
+                }
+            )
             for row in rows
         ],
         "limit": limit,

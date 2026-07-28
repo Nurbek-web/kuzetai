@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
 from protector.pilot.api.auth import SessionUser
-from protector.pilot.api.dependencies import ApiContext, get_context, require_csrf
+from protector.pilot.api.dependencies import ApiContext, get_context, redact_secrets, require_csrf
 from protector.pilot.storage.models import UserModel
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
@@ -36,7 +36,7 @@ def login(
 ) -> dict[str, object]:
     username = body.username.strip().casefold()
     client_context = _client_context(request)
-    if context.throttle.is_limited(username, client_context):
+    if not context.throttle.admit_attempt(username, client_context):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="login throttled")
 
     with context.repository.session_factory() as database_session:
@@ -46,16 +46,31 @@ def login(
 
     encoded = user.password_hash if user is not None else context.passwords.dummy_hash
     password_valid = context.passwords.verify(encoded, body.password)
-    totp_valid = bool(
-        user is not None
-        and user.totp_secret_encrypted
-        and context.totp.verify(user.totp_secret_encrypted, body.totp_code)
+    counter: int | None = None
+    if user is not None and user.totp_secret_encrypted:
+        try:
+            counter = context.totp.match_current_counter(
+                user.totp_secret_encrypted,
+                body.totp_code,
+            )
+        except ValueError:
+            counter = None
+    credentials_valid = bool(
+        user is not None and user.is_active and password_valid and counter is not None
     )
-    if user is None or not user.is_active or not password_valid or not totp_valid:
-        context.throttle.record_failure(username, client_context)
+    counter_accepted = bool(
+        credentials_valid
+        and context.repository.accept_totp_counter(
+            user_id=user.user_id,
+            counter=counter,
+            expected_password_hash=user.password_hash,
+            expected_encrypted_secret=user.totp_secret_encrypted,
+        )
+    )
+    if not credentials_valid or not counter_accepted:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
 
-    context.throttle.reset(username, client_context)
+    context.throttle.record_success(username)
     context.sessions.revoke(request.cookies.get(context.sessions.cookie_name))
     token, session = context.sessions.create(
         SessionUser(user_id=user.user_id, username=user.username, role=user.role)
@@ -71,11 +86,13 @@ def login(
     )
     response.headers["Cache-Control"] = "no-store"
     return {
-        "user": {
-            "user_id": user.user_id,
-            "username": user.username,
-            "role": user.role,
-        },
+        "user": redact_secrets(
+            {
+                "user_id": user.user_id,
+                "username": user.username,
+                "role": user.role,
+            }
+        ),
         "csrf_token": session.csrf_token,
         "expires_in": context.sessions.ttl_seconds,
     }

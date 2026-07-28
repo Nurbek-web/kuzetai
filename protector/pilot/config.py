@@ -1,4 +1,5 @@
 """Validated, immutable configuration for the bounded 20-camera pilot."""
+
 from __future__ import annotations
 
 import os
@@ -81,9 +82,7 @@ class CameraFeed(FrozenModel):
 
     @field_validator("analytics_hz")
     @classmethod
-    def freeze_analytics_schedule(
-        cls, analytics_hz: Mapping[str, float]
-    ) -> Mapping[str, float]:
+    def freeze_analytics_schedule(cls, analytics_hz: Mapping[str, float]) -> Mapping[str, float]:
         return MappingProxyType(dict(analytics_hz))
 
     @field_serializer("analytics_hz")
@@ -162,6 +161,7 @@ class PilotSecrets(FrozenModel):
     object_store_access_key: SecretStr
     object_store_secret_key: SecretStr
     session_secret: SecretStr
+    totp_encryption_key: SecretStr
 
     @classmethod
     def required_names(cls) -> tuple[str, ...]:
@@ -170,6 +170,7 @@ class PilotSecrets(FrozenModel):
             "object_store_access_key",
             "object_store_secret_key",
             "session_secret",
+            "totp_encryption_key",
         )
 
     @classmethod

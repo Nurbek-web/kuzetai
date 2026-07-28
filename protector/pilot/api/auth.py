@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import secrets
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from threading import RLock
 from typing import Literal
 
@@ -49,10 +53,23 @@ class PasswordService:
 
 
 class TotpService:
-    """TOTP enrolment and verification without retaining enrolment material."""
+    """TOTP provisioning plus a versioned authenticated-encryption boundary."""
 
-    def __init__(self, *, issuer: str = "Kuzet AI") -> None:
+    _VERSION = b"\x01"
+    _NONCE_BYTES = 16
+    _TAG_BYTES = 32
+    _AAD = b"kuzet-ai:totp-seed:v1"
+
+    def __init__(self, *, encryption_key: str, issuer: str = "Kuzet AI") -> None:
         self._issuer = issuer
+        try:
+            key = base64.b64decode(encryption_key, altchars=b"-_", validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("TOTP encryption key must be URL-safe base64") from exc
+        if len(key) != 32:
+            raise ValueError("TOTP encryption key must decode to exactly 32 bytes")
+        self._encryption_key = hmac.digest(key, b"encryption", "sha256")
+        self._authentication_key = hmac.digest(key, b"authentication", "sha256")
 
     def enrol(self, username: str) -> TotpEnrolment:
         normalized = username.strip()
@@ -62,11 +79,68 @@ class TotpService:
         uri = pyotp.TOTP(secret).provisioning_uri(name=normalized, issuer_name=self._issuer)
         return TotpEnrolment(secret=secret, provisioning_uri=uri)
 
-    @staticmethod
-    def verify(secret: str, code: str) -> bool:
+    def encrypt_secret(self, secret: str) -> str:
+        plaintext = secret.encode("ascii")
+        nonce = secrets.token_bytes(self._NONCE_BYTES)
+        ciphertext = self._xor_stream(plaintext, nonce)
+        authenticated = self._VERSION + nonce + ciphertext
+        tag = hmac.digest(
+            self._authentication_key,
+            self._AAD + authenticated,
+            "sha256",
+        )
+        return base64.urlsafe_b64encode(authenticated + tag).decode()
+
+    def decrypt_secret(self, encrypted: str) -> str:
+        try:
+            envelope = base64.b64decode(encrypted, altchars=b"-_", validate=True)
+            minimum = 1 + self._NONCE_BYTES + 1 + self._TAG_BYTES
+            if len(envelope) < minimum or envelope[:1] != self._VERSION:
+                raise ValueError
+            authenticated = envelope[: -self._TAG_BYTES]
+            provided_tag = envelope[-self._TAG_BYTES :]
+            expected_tag = hmac.digest(
+                self._authentication_key,
+                self._AAD + authenticated,
+                "sha256",
+            )
+            if not hmac.compare_digest(provided_tag, expected_tag):
+                raise ValueError
+            nonce = authenticated[1 : 1 + self._NONCE_BYTES]
+            ciphertext = authenticated[1 + self._NONCE_BYTES :]
+            return self._xor_stream(ciphertext, nonce).decode("ascii")
+        except (UnicodeDecodeError, binascii.Error, ValueError) as exc:
+            raise ValueError("invalid encrypted TOTP secret") from exc
+
+    def match_current_counter(
+        self,
+        encrypted_secret: str,
+        code: str,
+        *,
+        at: datetime | None = None,
+    ) -> int | None:
         if len(code) != 6 or not code.isdigit():
-            return False
-        return bool(pyotp.TOTP(secret).verify(code, valid_window=1))
+            return None
+        secret = self.decrypt_secret(encrypted_secret)
+        checked_at = at or datetime.now(timezone.utc)
+        if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+            raise ValueError("TOTP verification time must be UTC-aware")
+        totp = pyotp.TOTP(secret)
+        if not totp.verify(code, for_time=checked_at, valid_window=0):
+            return None
+        return int(totp.timecode(checked_at))
+
+    def _xor_stream(self, value: bytes, nonce: bytes) -> bytes:
+        output = bytearray()
+        for counter in range((len(value) + 31) // 32):
+            output.extend(
+                hmac.digest(
+                    self._encryption_key,
+                    self._AAD + nonce + counter.to_bytes(4, "big"),
+                    "sha256",
+                )
+            )
+        return bytes(left ^ right for left, right in zip(value, output, strict=False))
 
 
 @dataclass(frozen=True)
@@ -172,18 +246,20 @@ class _ThrottleEntry:
 
 
 class LoginThrottle:
-    """Bounded single-process login throttle with a replaceable narrow interface."""
+    """Bounded atomic single-process admission by account and client context."""
 
     def __init__(
         self,
         *,
         max_attempts: int = 5,
+        client_max_attempts: int = 50,
         window_seconds: int = 60,
         max_entries: int = 10_000,
     ) -> None:
-        if max_attempts < 1 or window_seconds < 1 or max_entries < 1:
+        if max_attempts < 1 or client_max_attempts < 1 or window_seconds < 1 or max_entries < 2:
             raise ValueError("throttle limits must be positive")
         self.max_attempts = max_attempts
+        self.client_max_attempts = client_max_attempts
         self.window_seconds = window_seconds
         self.max_entries = max_entries
         self._entries: OrderedDict[tuple[str, str], _ThrottleEntry] = OrderedDict()
@@ -194,45 +270,38 @@ class LoginThrottle:
         with self._lock:
             return len(self._entries)
 
-    @staticmethod
-    def _key(username: str, client_context: str) -> tuple[str, str]:
-        return username.strip().casefold(), client_context
-
-    def is_limited(self, username: str, client_context: str) -> bool:
+    def admit_attempt(self, username: str, client_context: str) -> bool:
+        """Atomically reserve one attempt, failing closed at either limit or capacity."""
         now = time.monotonic()
-        key = self._key(username, client_context)
+        keys = (
+            (("account", username.strip().casefold()), self.max_attempts),
+            (("client", client_context), self.client_max_attempts),
+        )
         with self._lock:
             self._purge_expired(now)
-            entry = self._entries.get(key)
-            if entry is None:
-                return len(self._entries) >= self.max_entries
-            self._trim(entry, now)
-            if not entry.failures:
-                self._entries.pop(key, None)
+            missing = sum(key not in self._entries for key, _ in keys)
+            if len(self._entries) + missing > self.max_entries:
                 return False
-            entry.last_seen = now
-            self._entries.move_to_end(key)
-            return len(entry.failures) >= self.max_attempts
+            for key, limit in keys:
+                entry = self._entries.get(key)
+                if entry is not None:
+                    self._trim(entry, now)
+                    if len(entry.failures) >= limit:
+                        return False
+            for key, _ in keys:
+                entry = self._entries.get(key)
+                if entry is None:
+                    entry = _ThrottleEntry(failures=deque(), last_seen=now)
+                    self._entries[key] = entry
+                entry.failures.append(now)
+                entry.last_seen = now
+                self._entries.move_to_end(key)
+            return True
 
-    def record_failure(self, username: str, client_context: str) -> None:
-        now = time.monotonic()
-        key = self._key(username, client_context)
+    def record_success(self, username: str) -> None:
+        """Clear the account bucket; client pressure remains independent."""
         with self._lock:
-            self._purge_expired(now)
-            entry = self._entries.get(key)
-            if entry is None:
-                if len(self._entries) >= self.max_entries:
-                    return
-                entry = _ThrottleEntry(failures=deque(), last_seen=now)
-                self._entries[key] = entry
-            self._trim(entry, now)
-            entry.failures.append(now)
-            entry.last_seen = now
-            self._entries.move_to_end(key)
-
-    def reset(self, username: str, client_context: str) -> None:
-        with self._lock:
-            self._entries.pop(self._key(username, client_context), None)
+            self._entries.pop(("account", username.strip().casefold()), None)
 
     def _trim(self, entry: _ThrottleEntry, now: float) -> None:
         cutoff = now - self.window_seconds
