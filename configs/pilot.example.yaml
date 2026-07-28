@@ -1,0 +1,53 @@
+# Non-secret template for the fixed 20-camera controlled pilot.  Put RTSP
+# credentials only in the named environment variables (or Docker secret files),
+# never in this file.  Every camera declares its own analytics schedule: 0.0 Hz
+# means disabled; 30.0 Hz is the camera-frame-rate ceiling.
+ready_to_start:
+  feeds:
+    - &camera
+      camera_id: camera-01
+      rtsp_url:
+        environment: PILOT_CAMERA_01_RTSP_URL
+      codec: h264
+      resolution: {width: 1920, height: 1080}
+      bitrate_kbps: 2000
+      analytics_hz: {person: 10.0, fire_smoke: 1.0, weapon: 1.0}
+    - {<<: *camera, camera_id: camera-02, rtsp_url: {environment: PILOT_CAMERA_02_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-03, rtsp_url: {environment: PILOT_CAMERA_03_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-04, rtsp_url: {environment: PILOT_CAMERA_04_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-05, rtsp_url: {environment: PILOT_CAMERA_05_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-06, rtsp_url: {environment: PILOT_CAMERA_06_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-07, rtsp_url: {environment: PILOT_CAMERA_07_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-08, rtsp_url: {environment: PILOT_CAMERA_08_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-09, rtsp_url: {environment: PILOT_CAMERA_09_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-10, rtsp_url: {environment: PILOT_CAMERA_10_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-11, rtsp_url: {environment: PILOT_CAMERA_11_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-12, rtsp_url: {environment: PILOT_CAMERA_12_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-13, rtsp_url: {environment: PILOT_CAMERA_13_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-14, rtsp_url: {environment: PILOT_CAMERA_14_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-15, rtsp_url: {environment: PILOT_CAMERA_15_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-16, rtsp_url: {environment: PILOT_CAMERA_16_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-17, rtsp_url: {environment: PILOT_CAMERA_17_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-18, rtsp_url: {environment: PILOT_CAMERA_18_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-19, rtsp_url: {environment: PILOT_CAMERA_19_RTSP_URL}}
+    - {<<: *camera, camera_id: camera-20, rtsp_url: {environment: PILOT_CAMERA_20_RTSP_URL}}
+  # Fill these with the approved customer-site records before Day 1.
+  ntp_source: customer NTP source and approval record
+  camera_map: customer-approved camera map revision
+  site_access: approved site access and network change record
+  compute: NVIDIA L4 pilot node acceptance record
+  notification_channel: customer-selected notification connector
+  model_rights_decisions: model-rights register revision
+
+# `KZ` documents the contractual residency decision; HTTPS protects evidence in transit.
+storage:
+  country_code: KZ
+  endpoint: https://object-storage.customer.example
+  bucket: kuzet-pilot-evidence
+
+# All queues are explicit and bounded (1..10000); tune only after capacity testing.
+queues:
+  decode: 64
+  analytics: 256
+  verifier: 32
+  events: 128
