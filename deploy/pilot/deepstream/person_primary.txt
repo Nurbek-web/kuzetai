@@ -1,0 +1,23 @@
+# nvinfer configuration for the approved person model only.  No model is
+# bundled or downloaded by this repository.  Build the FP16 L4 engine from the
+# signed model registry and mount it at the paths below after manifest checks.
+[property]
+gpu-id=0
+process-mode=1
+gie-unique-id=1
+network-type=0
+network-mode=2
+batch-size=20
+model-color-format=0
+net-scale-factor=0.003921568627
+infer-dims=3;640;640
+maintain-aspect-ratio=1
+symmetric-padding=1
+cluster-mode=2
+num-detected-classes=1
+onnx-file=/models/approved/person_primary.onnx
+model-engine-file=/models/approved/person_primary_l4_fp16.engine
+labelfile-path=/models/approved/person_primary.labels
+# Populate output-layer names for the approved model export; do not substitute
+# a demo detector's outputs or artifacts.
+output-blob-names=REPLACE_WITH_APPROVED_MODEL_OUTPUTS

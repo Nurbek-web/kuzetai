@@ -1,0 +1,10 @@
+# Shared batched NvDCF tracker.  It is intentionally one tracker after the
+# shared primary inference element, not a model/tracker stack per camera.
+tracker:
+  tracker-width: 960
+  tracker-height: 544
+  gpu-id: 0
+  enable-batch-process: 1
+  enable-past-frame: 0
+  ll-lib-file: /opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+  ll-config-file: /opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml

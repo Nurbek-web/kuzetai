@@ -53,6 +53,7 @@ class _CameraState:
     last_frame_at: datetime | None = None
     last_received_monotonic: float | None = None
     last_monotonic_seq: int | None = None
+    last_frame_monotonic_seq: int | None = None
     last_source_time_skew_seconds: float | None = None
     reconnect_count: int = 0
     reconnect_backoff_seconds: float = 0.0
@@ -130,6 +131,7 @@ class CameraSupervisor:
         state.epoch_number += 1
         state.stream_epoch = self._epoch_for(state.camera_id, state.epoch_number)
         state.last_monotonic_seq = None
+        state.last_frame_monotonic_seq = None
         state.last_source_time = None
 
     def mark_degraded(self, camera_id: str, reason: str) -> None:
@@ -175,6 +177,49 @@ class CameraSupervisor:
         state.scheduled_samples += 1
         state.dropped_samples += 1
         state.degraded_reason = reason
+
+    def record_frame(self, *, camera_id: str, source_time: datetime, monotonic_seq: int) -> bool:
+        """Record a decoded-frame heartbeat without creating a synthetic detection."""
+        state = self._state_for(camera_id)
+        now = self._wall()
+        if source_time.tzinfo is None or source_time.utcoffset() is None:
+            self._degrade(state, "malformed_source_time")
+            return False
+        source_time = source_time.astimezone(now.tzinfo)
+        state.last_source_time_skew_seconds = abs((now - source_time).total_seconds())
+        source_restarted = state.last_source_time is not None and source_time < state.last_source_time
+        if source_restarted:
+            self._begin_epoch(state)
+            if state.state == "degraded":
+                self._transition(state, "offline")
+                self._transition(state, "reconnecting")
+            elif state.state == "offline":
+                self._transition(state, "reconnecting")
+        if (now - source_time).total_seconds() > self._stale_after_seconds:
+            self._degrade(state, "stale_source_time")
+            return False
+        if (
+            state.last_frame_monotonic_seq is not None
+            and monotonic_seq <= state.last_frame_monotonic_seq
+        ):
+            state.degraded_reason = "non_increasing_frame_sequence"
+            return False
+        reconnected = state.state == "reconnecting"
+        if state.state == "starting":
+            self._transition(state, "online")
+        elif state.state == "reconnecting":
+            self._transition(state, "online")
+        elif state.state in {"degraded", "offline"}:
+            return False
+        state.last_source_time = source_time
+        state.last_frame_at = now
+        state.last_received_monotonic = self._monotonic()
+        state.last_frame_monotonic_seq = monotonic_seq
+        if reconnected:
+            state.reconnect_backoff_seconds = 0.0
+            state.reconnect_at_monotonic = None
+        state.degraded_reason = None
+        return True
 
     def reject_malformed_timestamp(self, camera_id: str) -> None:
         state = self._state_for(camera_id)

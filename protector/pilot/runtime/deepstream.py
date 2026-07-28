@@ -1,0 +1,916 @@
+"""NVIDIA-only DeepStream adapter with an import-safe graph contract.
+
+The graph contract is deliberately pure Python so M2 CI can validate the
+twenty-camera topology and refusal gates.  GI, GStreamer, and ``pyds`` are
+loaded only after the target host has passed the manifest checks in ``start``.
+``pyds`` is isolated here while the Service Maker metadata publication API is
+evaluated (replacement issue: PILOT-DS-001); it never escapes this adapter.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
+
+from pydantic import Field, field_validator
+
+from protector.pilot.config import FrozenModel, SiteConfig, load_site_config
+from protector.pilot.gates import (
+    CapacityReportV1,
+    ModelArtifactV1,
+    ModelGate,
+    ShadowStageReportV1,
+    TargetSiteReportV1,
+)
+from protector.pilot.runtime.supervisor import CameraHealth, CameraSupervisor
+
+DEEPSTREAM_IMAGE = (
+    "nvcr.io/nvidia/deepstream:9.1-samples-multiarch"
+    "@sha256:10eca409b3894e91c1bac915c9f1346307e56695e552487cbe8cf2f58a3f998f"
+)
+DEEPSTREAM_X86_TENSORRT = "10.16.0.72"
+DEEPSTREAM_X86_CUDA = "13.2"
+GPU_MEMORY_TYPE = "nvbuf-mem-cuda-device"
+PYDS_REPLACEMENT_ISSUE = "PILOT-DS-001: replace isolated pyds probe with Service Maker API"
+PERSON_PRIMARY_CONFIG_PATH = Path("/app/deploy/pilot/deepstream/person_primary.txt")
+NVTRACKER_CONFIG_PATH = Path("/app/deploy/pilot/deepstream/nvtracker.yml")
+_OBJECT_SEQUENCE_BITS = 16
+_MAX_OBJECTS_PER_FRAME = 1 << _OBJECT_SEQUENCE_BITS
+_NVTRACKER_PROPERTIES = (
+    "tracker-width",
+    "tracker-height",
+    "gpu-id",
+    "enable-batch-process",
+    "enable-past-frame",
+    "ll-lib-file",
+    "ll-config-file",
+)
+
+_FORBIDDEN_CORE_FACTORIES = frozenset(
+    {"appsink", "opencv", "cv2", "numpy", "numpy-frame-copy", "cpu-frame-copy"}
+)
+
+
+class GraphContractError(ValueError):
+    """The requested graph or runtime artifact is unsafe for pilot startup."""
+
+
+class NvidiaBindingsUnavailable(RuntimeError):
+    """The target-only DeepStream adapter was invoked without its NVIDIA stack."""
+
+
+class SourcePlan(FrozenModel):
+    """Immutable per-camera source topology before all streams converge at the mux."""
+
+    camera_id: str
+    source_id: int = Field(ge=0)
+    codec: Literal["h264", "h265"]
+    queue_capacity: int = Field(gt=0)
+    has_encoded_evidence_branch: bool = True
+    has_nvdec_branch: bool = True
+
+    @property
+    def depay_factory(self) -> str:
+        return "rtph264depay" if self.codec == "h264" else "rtph265depay"
+
+    @property
+    def parser_factory(self) -> str:
+        return "h264parse" if self.codec == "h264" else "h265parse"
+
+
+class ElementSpec(FrozenModel):
+    """A graph element and the small property subset safety gates inspect."""
+
+    name: str
+    factory: str
+    properties: Mapping[str, Any]
+
+
+class OptionalBranchSpec(FrozenModel):
+    """A conditional analytic that cannot apply backpressure to the core path."""
+
+    module: Literal["fire_smoke", "weapon"]
+    enabled: bool = False
+    shadow_only: bool = True
+    queue: ElementSpec
+    valve: ElementSpec
+
+
+class DeepStreamGraphSpec(FrozenModel):
+    """A single shared 20-stream graph; it contains no CPU-frame publication path."""
+
+    sources: tuple[SourcePlan, ...]
+    elements: tuple[ElementSpec, ...]
+    optional_branches: tuple[OptionalBranchSpec, ...]
+    metadata_only_publication: bool = True
+
+    @classmethod
+    def from_site(cls, site: SiteConfig) -> DeepStreamGraphSpec:
+        feeds = site.ready_to_start.feeds
+        sources = tuple(
+            SourcePlan(
+                camera_id=feed.camera_id,
+                source_id=index,
+                codec=feed.codec,
+                queue_capacity=site.queues.decode,
+            )
+            for index, feed in enumerate(feeds)
+        )
+        elements = (
+            ElementSpec(
+                name="streammux",
+                factory="nvstreammux",
+                properties={
+                    "batch-size": len(feeds),
+                    "live-source": 1,
+                    "nvbuf-memory-type": GPU_MEMORY_TYPE,
+                },
+            ),
+            ElementSpec(
+                name="primary-queue",
+                factory="queue",
+                properties={
+                    "max-size-buffers": site.queues.analytics,
+                    "max-size-bytes": 0,
+                    "max-size-time": 0,
+                    "leaky": "downstream",
+                },
+            ),
+            ElementSpec(
+                name="person-primary",
+                factory="nvinfer",
+                properties={"role": "primary", "batch-size": len(feeds), "precision": "fp16"},
+            ),
+            ElementSpec(name="tracker", factory="nvtracker", properties={"shared": True}),
+            ElementSpec(name="analytics", factory="nvdsanalytics", properties={"shared": True}),
+            ElementSpec(
+                name="metadata-sink", factory="fakesink", properties={"sync": False, "metadata-only": True}
+            ),
+        )
+        optional_branches = tuple(
+            OptionalBranchSpec(
+                module=module,
+                queue=ElementSpec(
+                    name=f"{module}-queue",
+                    factory="queue",
+                    properties={
+                        "max-size-buffers": site.queues.verifier,
+                        "max-size-bytes": 0,
+                        "max-size-time": 0,
+                        "leaky": "downstream",
+                    },
+                ),
+                valve=ElementSpec(
+                    name=f"{module}-valve", factory="valve", properties={"drop": True}
+                ),
+            )
+            for module in ("fire_smoke", "weapon")
+        )
+        graph = cls(sources=sources, elements=elements, optional_branches=optional_branches)
+        graph.validate()
+        return graph
+
+    @property
+    def primary_inference_count(self) -> int:
+        return sum(
+            element.factory == "nvinfer" and element.properties.get("role") == "primary"
+            for element in self.elements
+        )
+
+    @property
+    def tracker_count(self) -> int:
+        return sum(element.factory == "nvtracker" for element in self.elements)
+
+    @property
+    def analytics_count(self) -> int:
+        return sum(element.factory == "nvdsanalytics" for element in self.elements)
+
+    def element(self, name: str) -> ElementSpec:
+        for element in self.elements:
+            if element.name == name:
+                return element
+        raise KeyError(name)
+
+    def optional_branch(self, module: str) -> OptionalBranchSpec:
+        for branch in self.optional_branches:
+            if branch.module == module:
+                return branch
+        raise KeyError(module)
+
+    def replace_element(self, replacement: ElementSpec) -> DeepStreamGraphSpec:
+        return self.model_copy(
+            update={
+                "elements": tuple(
+                    replacement if element.name == replacement.name else element
+                    for element in self.elements
+                )
+            }
+        )
+
+    def with_element(
+        self, *, name: str, factory: str, properties: Mapping[str, Any]
+    ) -> DeepStreamGraphSpec:
+        return self.model_copy(
+            update={"elements": (*self.elements, ElementSpec(name=name, factory=factory, properties=properties))}
+        )
+
+    def validate(self) -> None:
+        if len(self.sources) != 20:
+            raise GraphContractError("DeepStream graph requires exactly 20 source bins")
+        source_ids = [source.source_id for source in self.sources]
+        camera_ids = [source.camera_id for source in self.sources]
+        if len(set(source_ids)) != len(source_ids) or len(set(camera_ids)) != len(camera_ids):
+            raise GraphContractError("source IDs and camera IDs must be unique")
+        if not all(source.has_encoded_evidence_branch and source.has_nvdec_branch for source in self.sources):
+            raise GraphContractError("every source requires encoded evidence and NVDEC branches")
+        if not self.metadata_only_publication:
+            raise GraphContractError("core graph may publish metadata only")
+        if len({element.name for element in self.elements}) != len(self.elements):
+            raise GraphContractError("graph element names must be unique")
+        if any(element.factory.lower() in _FORBIDDEN_CORE_FACTORIES for element in self.elements):
+            raise GraphContractError("forbidden CPU frame sink/copy element in core graph")
+
+        muxes = [element for element in self.elements if element.factory == "nvstreammux"]
+        if len(muxes) != 1:
+            raise GraphContractError("graph requires one shared nvstreammux")
+        mux = muxes[0]
+        if mux.properties.get("batch-size") != 20 or mux.properties.get("live-source") != 1:
+            raise GraphContractError("streammux must use batch-size=20 and live-source=1")
+        if mux.properties.get("nvbuf-memory-type") != GPU_MEMORY_TYPE:
+            raise GraphContractError("streammux must keep decoded surfaces in NVIDIA GPU memory")
+        if self.primary_inference_count != 1:
+            raise GraphContractError("graph requires one primary shared nvinfer")
+        if self.tracker_count != 1:
+            raise GraphContractError("graph requires one shared nvtracker")
+        if self.analytics_count != 1:
+            raise GraphContractError("graph requires one shared nvdsanalytics")
+        primary = next(
+            element
+            for element in self.elements
+            if element.factory == "nvinfer" and element.properties.get("role") == "primary"
+        )
+        if primary.properties.get("batch-size") != 20 or primary.properties.get("precision") != "fp16":
+            raise GraphContractError("primary nvinfer must be shared FP16 batch-size=20")
+
+        for element in self.elements:
+            if element.factory == "queue":
+                self._validate_queue(element)
+        if {branch.module for branch in self.optional_branches} != {"fire_smoke", "weapon"}:
+            raise GraphContractError("fire_smoke and weapon branches must both be declared")
+        for branch in self.optional_branches:
+            if branch.enabled or not branch.shadow_only:
+                raise GraphContractError("conditional analytics must start disabled and shadow-only")
+            self._validate_queue(branch.queue)
+            if branch.valve.factory != "valve" or branch.valve.properties.get("drop") is not True:
+                raise GraphContractError("conditional analytics require a closed valve")
+
+    @staticmethod
+    def _validate_queue(queue: ElementSpec) -> None:
+        if queue.properties.get("max-size-buffers", 0) <= 0:
+            raise GraphContractError("every queue must be explicitly bounded")
+        if queue.properties.get("leaky") != "downstream":
+            raise GraphContractError("every queue must be downstream-leaky")
+
+
+class RuntimeModelManifestV1(FrozenModel):
+    """The exact promoted model and engine required for target-host graph startup."""
+
+    schema_version: Literal["deepstream-runtime-manifest.v1"]
+    site_id: str
+    artifact: ModelArtifactV1
+    artifact_path: Path | None = None
+    engine_sha256: str | None
+    engine_path: Path | None = None
+    precision: str
+    target_compute_capability: str
+    tensorrt_version: str
+    target_site_report: TargetSiteReportV1 | None
+    capacity_report: CapacityReportV1 | None
+    shadow_stage_report: ShadowStageReportV1 | None
+
+    @field_validator("engine_sha256")
+    @classmethod
+    def engine_hash_is_digest_when_present(cls, value: str | None) -> str | None:
+        if value is not None and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value.lower())):
+            raise ValueError("engine_sha256 must be a 64-character hexadecimal digest")
+        return value
+
+    def validate_for_host(
+        self,
+        *,
+        compute_capability: str,
+        tensorrt_version: str,
+        require_files: bool = False,
+    ) -> None:
+        if self.artifact.sha256 is None:
+            raise GraphContractError("model artifact sha256 is required")
+        if self.artifact.analytic != "person":
+            raise GraphContractError("shared primary graph requires a person analytic")
+        if self.artifact.class_list != ("person",):
+            raise GraphContractError("shared primary graph requires exactly the person class list")
+        if self.engine_sha256 is None:
+            raise GraphContractError("engine sha256 is required")
+        if self.precision != "fp16":
+            raise GraphContractError("runtime manifest requires FP16 engine mode")
+        if self.target_compute_capability != compute_capability:
+            raise GraphContractError("engine compute capability does not match target host")
+        if self.tensorrt_version != tensorrt_version:
+            raise GraphContractError("engine TensorRT version does not match target runtime")
+        if self.target_site_report is None or self.target_site_report.site_id != self.site_id:
+            raise GraphContractError("target-site report does not match runtime site")
+        gate = ModelGate.evaluate(
+            self.artifact,
+            self.target_site_report,
+            self.capacity_report,
+            current_mode="shadow",
+            shadow_stage_report=self.shadow_stage_report,
+        )
+        if gate.mode != "operator":
+            raise GraphContractError(f"model promotion gate failed: {', '.join(gate.reasons)}")
+        if require_files:
+            self._validate_artifact_file(self.artifact_path, self.artifact.sha256, "model")
+            self._validate_artifact_file(self.engine_path, self.engine_sha256, "engine")
+
+    @staticmethod
+    def _validate_artifact_file(path: Path | None, expected_sha256: str, label: str) -> None:
+        if path is None or not path.is_file():
+            raise GraphContractError(f"{label} file is required for target startup")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected_sha256:
+            raise GraphContractError(f"{label} file sha256 does not match runtime manifest")
+
+
+class FrameMetadataV1(FrozenModel):
+    """Scalar metadata extracted by DeepStream; it deliberately has no frame surface."""
+
+    camera_id: str
+    source_time: datetime
+    timestamp_quality: Literal["camera_rtcp", "host_ntp_fallback"] = "camera_rtcp"
+    monotonic_seq: int = Field(ge=0)
+    class_name: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    bbox: tuple[float, float, float, float]
+    track_id: str | None = None
+
+
+class MetadataPublisher:
+    """Converts scalar probe metadata into the versioned observation contract."""
+
+    def __init__(self, *, supervisor: CameraSupervisor, model_artifact_id: str) -> None:
+        self._supervisor = supervisor
+        self._model_artifact_id = model_artifact_id
+
+    def publish(self, metadata: FrameMetadataV1) -> Any:
+        return self._supervisor.accept_sample(
+            camera_id=metadata.camera_id,
+            source_time=metadata.source_time,
+            monotonic_seq=metadata.monotonic_seq,
+            timestamp_quality=metadata.timestamp_quality,
+            module="person",
+            class_name="person",
+            confidence=metadata.confidence,
+            bbox=metadata.bbox,
+            track_id=metadata.track_id,
+            model_artifact_id=self._model_artifact_id,
+        )
+
+    def record_frame(self, *, camera_id: str, source_time: datetime, monotonic_seq: int) -> bool:
+        """Refresh source health even when this decoded frame has zero detections."""
+        return self._supervisor.record_frame(
+            camera_id=camera_id,
+            source_time=source_time,
+            monotonic_seq=monotonic_seq,
+        )
+
+
+def resolve_rtsp_locations(site: SiteConfig) -> dict[str, str]:
+    """Resolve RTSP secrets only when the target runtime is about to connect."""
+    return {
+        feed.camera_id: feed.rtsp_url.resolve().get_secret_value()
+        for feed in site.ready_to_start.feeds
+    }
+
+
+def person_config_paths_match(manifest: RuntimeModelManifestV1, config_path: Path) -> None:
+    """Refuse a config that would load files other than the hash-verified pair."""
+    if manifest.artifact_path is None or manifest.engine_path is None:
+        raise GraphContractError("model and engine paths are required for nvinfer startup")
+    try:
+        properties = dict(
+            line.split("=", 1)
+            for line in config_path.read_text(encoding="utf-8").splitlines()
+            if "=" in line and not line.lstrip().startswith("#")
+        )
+    except OSError as exc:
+        raise GraphContractError("person nvinfer configuration is unavailable") from exc
+    if (
+        properties.get("onnx-file") != str(manifest.artifact_path)
+        or properties.get("model-engine-file") != str(manifest.engine_path)
+    ):
+        raise GraphContractError("person nvinfer configuration does not load manifest-verified paths")
+
+
+def metadata_observation_sequence(frame_number: int, object_ordinal: int) -> int:
+    """Give each object a unique sequence while preserving the source-frame order.
+
+    The lower 16 bits reserve room for at most 65,536 objects in one decoded
+    frame; that bound is far above the pilot's valid person-detection load and
+    fails closed rather than colliding a dedupe identity.
+    """
+    if frame_number < 0 or not 0 <= object_ordinal < _MAX_OBJECTS_PER_FRAME:
+        raise GraphContractError("invalid frame/object ordinal for observation sequence")
+    return (frame_number << _OBJECT_SEQUENCE_BITS) | object_ordinal
+
+
+def configure_nvtracker(tracker: Any, config_path: Path) -> None:
+    """Apply DS 9.1 Gst-nvtracker properties from the shared NvDCF YAML."""
+    try:
+        import yaml
+
+        raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        settings = raw_config["tracker"]
+        values = {name: settings[name] for name in _NVTRACKER_PROPERTIES}
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise GraphContractError("invalid NvDCF tracker configuration") from exc
+    for name, value in values.items():
+        tracker.set_property(name, value)
+
+
+class SourceRecoveryCoordinator:
+    """Routes inner source-bin failures to one camera and rebuilds after its backoff."""
+
+    _SOURCE_ELEMENT_PREFIXES = frozenset(
+        {"source", "rtsp", "depay", "parse", "encoded-tee", "evidence", "decode", "nvdec"}
+    )
+
+    def __init__(
+        self,
+        *,
+        supervisor: CameraSupervisor,
+        source_ids: Mapping[str, int],
+        rebuild_source: Callable[[str], None],
+    ) -> None:
+        self._supervisor = supervisor
+        self._source_ids = dict(source_ids)
+        self._camera_by_source_id = {source_id: camera_id for camera_id, source_id in source_ids.items()}
+        self._rebuild_source = rebuild_source
+        self._last_rebuild_reconnect_count: dict[str, int] = {}
+
+    def handle_element_error(self, element_name: str) -> None:
+        camera_id = self._camera_for_element(element_name)
+        if camera_id is not None:
+            self.handle_camera_failure(camera_id, "rtsp_pipeline_error")
+
+    def handle_camera_failure(self, camera_id: str, reason: str) -> None:
+        if self._supervisor.health_for(camera_id).state not in {
+            "offline",
+            "reconnecting",
+        }:
+            self._supervisor.disconnect(camera_id, reason)
+
+    def advance(self) -> None:
+        self._supervisor.advance()
+        for camera_id in self._source_ids:
+            health = self._supervisor.health_for(camera_id)
+            if (
+                health.state == "reconnecting"
+                and self._last_rebuild_reconnect_count.get(camera_id) != health.reconnect_count
+            ):
+                try:
+                    self._rebuild_source(camera_id)
+                    self._supervisor.recover(camera_id)
+                    self._last_rebuild_reconnect_count[camera_id] = health.reconnect_count
+                except Exception:
+                    self._supervisor.disconnect(camera_id, "rtsp_rebuild_failed")
+
+    def _camera_for_element(self, element_name: str) -> str | None:
+        prefix, separator, suffix = element_name.rpartition("-")
+        if not separator or prefix not in self._SOURCE_ELEMENT_PREFIXES:
+            return None
+        try:
+            return self._camera_by_source_id.get(int(suffix))
+        except ValueError:
+            return None
+
+
+def stop_pipeline(pipeline: Any, gst: Any) -> None:
+    """Use the class-level NULL enum, never a state enum instance from a pipeline."""
+    pipeline.set_state(gst.State.NULL)
+
+
+@dataclass(frozen=True, slots=True)
+class _NvidiaBindings:
+    gst: Any
+    glib: Any
+    pyds: Any
+
+
+def _load_nvidia_bindings() -> _NvidiaBindings:
+    """Import deprecated pyds only inside the NVIDIA target adapter boundary."""
+    try:
+        gi = importlib.import_module("gi")
+        gi.require_version("Gst", "1.0")
+        repository = importlib.import_module("gi.repository")
+        pyds = importlib.import_module("pyds")
+    except (ImportError, ValueError, AttributeError) as exc:
+        raise NvidiaBindingsUnavailable(
+            "NVIDIA DeepStream bindings are unavailable; run only on the pinned Linux x86_64 L4 image"
+        ) from exc
+    return _NvidiaBindings(gst=repository.Gst, glib=repository.GLib, pyds=pyds)
+
+
+RuntimeInfo = Callable[[], tuple[str, str]]
+BindingLoader = Callable[[], object]
+
+
+class DeepStreamDataPlane:
+    """Target-only adapter that turns the validated specification into one GStreamer graph."""
+
+    def __init__(
+        self,
+        *,
+        runtime_manifest: RuntimeModelManifestV1,
+        runtime_info: RuntimeInfo,
+        binding_loader: BindingLoader = _load_nvidia_bindings,
+        person_config_path: Path = PERSON_PRIMARY_CONFIG_PATH,
+    ) -> None:
+        self._manifest = runtime_manifest
+        self._runtime_info = runtime_info
+        self._binding_loader = binding_loader
+        self._person_config_path = person_config_path
+        self._graph: DeepStreamGraphSpec | None = None
+        self._pipeline: Any | None = None
+        self._supervisor: CameraSupervisor | None = None
+        self._bindings: _NvidiaBindings | None = None
+        self._recovery: SourceRecoveryCoordinator | None = None
+        self._locations: dict[str, str] = {}
+        self._metadata_publisher: MetadataPublisher | None = None
+
+    def start(self, site: SiteConfig) -> None:
+        if self._pipeline is not None:
+            raise RuntimeError("DeepStream data plane is already running")
+        graph = DeepStreamGraphSpec.from_site(site)
+        compute_capability, tensorrt_version = self._runtime_info()
+        self._manifest.validate_for_host(
+            compute_capability=compute_capability,
+            tensorrt_version=tensorrt_version,
+            require_files=True,
+        )
+        person_config_paths_match(self._manifest, self._person_config_path)
+        try:
+            bindings = self._binding_loader()
+        except (ImportError, ModuleNotFoundError, NvidiaBindingsUnavailable) as exc:
+            raise NvidiaBindingsUnavailable(
+                "NVIDIA DeepStream bindings are unavailable; graph execution is target-host only"
+            ) from exc
+        if not isinstance(bindings, _NvidiaBindings):
+            raise NvidiaBindingsUnavailable("binding loader returned an invalid NVIDIA adapter")
+        locations = resolve_rtsp_locations(site)
+        self._graph = graph
+        self._bindings = bindings
+        self._locations = dict(locations)
+        self._supervisor = CameraSupervisor(
+            camera_ids=tuple(source.camera_id for source in graph.sources),
+            observation_queue_size=site.queues.events,
+            monotonic_clock=time.monotonic,
+            wall_clock=lambda: datetime.now(UTC),
+        )
+        self._recovery = SourceRecoveryCoordinator(
+            supervisor=self._supervisor,
+            source_ids={source.camera_id: source.source_id for source in graph.sources},
+            rebuild_source=self._rebuild_source,
+        )
+        self._metadata_publisher = MetadataPublisher(
+            supervisor=self._supervisor,
+            model_artifact_id=self._manifest.artifact.artifact_id,
+        )
+        try:
+            self._pipeline = self._build_pipeline(bindings, graph, locations)
+            bus = self._pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", self._on_bus_message)
+            bindings.glib.timeout_add(250, self._advance_recovery)
+            self._pipeline.set_state(bindings.gst.State.PLAYING)
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        if self._pipeline is not None and self._bindings is not None:
+            stop_pipeline(self._pipeline, self._bindings.gst)
+        self._pipeline = None
+        self._graph = None
+        self._bindings = None
+        self._recovery = None
+        self._locations = {}
+        self._metadata_publisher = None
+        if self._supervisor is not None:
+            self._supervisor.clear_observations()
+        self._supervisor = None
+
+    def health(self) -> list[CameraHealth]:
+        return [] if self._supervisor is None else self._supervisor.health()
+
+    def drain_observations(self) -> list[Any]:
+        """Deliver bounded metadata observations; decoded GPU surfaces never leave the graph."""
+        return [] if self._supervisor is None else self._supervisor.drain_observations()
+
+    def _advance_recovery(self) -> bool:
+        if self._recovery is not None:
+            self._recovery.advance()
+        return self._pipeline is not None
+
+    def _build_pipeline(
+        self, bindings: _NvidiaBindings, graph: DeepStreamGraphSpec, locations: Mapping[str, str]
+    ) -> Any:
+        gst = bindings.gst
+        gst.init(None)
+        pipeline = gst.Pipeline.new("kuzet-pilot-shared-graph")
+        self._pipeline = pipeline
+        mux = self._make_element(gst, "nvstreammux", "streammux")
+        mux.set_property("batch-size", 20)
+        mux.set_property("live-source", 1)
+        mux.set_property("nvbuf-memory-type", 2)  # NVBUF_MEM_CUDA_DEVICE on dGPU.
+        pipeline.add(mux)
+        for source in graph.sources:
+            source_bin = self._build_source_bin(gst, source, locations[source.camera_id])
+            pipeline.add(source_bin)
+            source_pad = source_bin.get_static_pad("decoded_src")
+            sink_pad = mux.request_pad_simple(f"sink_{source.source_id}")
+            if source_pad.link(sink_pad) != gst.PadLinkReturn.OK:
+                raise RuntimeError(f"failed to link camera {source.camera_id} to streammux")
+
+        primary_queue = self._make_queue(gst, graph.element("primary-queue"))
+        person = self._make_element(gst, "nvinfer", "person-primary")
+        person.set_property("config-file-path", str(self._person_config_path))
+        core_tee = self._make_element(gst, "tee", "conditional-analytics-tee")
+        core_queue = self._make_queue(
+            gst,
+            ElementSpec(
+                name="core-analytics-queue",
+                factory="queue",
+                properties=graph.element("primary-queue").properties,
+            ),
+        )
+        tracker = self._make_element(gst, "nvtracker", "tracker")
+        configure_nvtracker(tracker, NVTRACKER_CONFIG_PATH)
+        analytics = self._make_element(gst, "nvdsanalytics", "analytics")
+        metadata_sink = self._make_element(gst, "fakesink", "metadata-sink")
+        metadata_sink.set_property("sync", False)
+        for element in (primary_queue, person, core_tee, core_queue, tracker, analytics, metadata_sink):
+            pipeline.add(element)
+        if not gst.Element.link_many(mux, primary_queue, person, core_tee):
+            raise RuntimeError("failed to link shared primary person path")
+        if not core_tee.link(core_queue) or not gst.Element.link_many(
+            core_queue, tracker, analytics, metadata_sink
+        ):
+            raise RuntimeError("failed to link shared person/tracker/analytics path")
+        for branch in graph.optional_branches:
+            branch_queue = self._make_queue(gst, branch.queue)
+            valve = self._make_element(gst, "valve", branch.valve.name)
+            valve.set_property("drop", True)
+            sink = self._make_element(gst, "fakesink", f"{branch.module}-disabled-sink")
+            sink.set_property("sync", False)
+            for element in (branch_queue, valve, sink):
+                pipeline.add(element)
+            if not core_tee.link(branch_queue) or not gst.Element.link_many(branch_queue, valve, sink):
+                raise RuntimeError(f"failed to isolate disabled {branch.module} branch")
+        analytics.get_static_pad("src").add_probe(gst.PadProbeType.BUFFER, self._metadata_probe, bindings)
+        # Task 7 attaches evidence writers to the encoded_src pads; optional model
+        # work remains disabled here and receives no core-path link until promoted.
+        return pipeline
+
+    def _build_source_bin(self, gst: Any, source: SourcePlan, location: str) -> Any:
+        source_bin = gst.Bin.new(f"source-{source.source_id}")
+        rtspsrc = self._make_element(gst, "rtspsrc", f"rtsp-{source.source_id}")
+        rtspsrc.set_property("location", location)
+        rtspsrc.set_property("latency", 200)
+        depay = self._make_element(gst, source.depay_factory, f"depay-{source.source_id}")
+        parser = self._make_element(gst, source.parser_factory, f"parse-{source.source_id}")
+        tee = self._make_element(gst, "tee", f"encoded-tee-{source.source_id}")
+        queue_properties = {
+            "max-size-buffers": source.queue_capacity,
+            "max-size-bytes": 0,
+            "max-size-time": 0,
+            "leaky": "downstream",
+        }
+        evidence_queue = self._make_queue(
+            gst,
+            ElementSpec(name=f"evidence-{source.source_id}", factory="queue", properties=queue_properties),
+        )
+        decode_queue = self._make_queue(
+            gst,
+            ElementSpec(name=f"decode-{source.source_id}", factory="queue", properties=queue_properties),
+        )
+        decoder = self._make_element(gst, "nvv4l2decoder", f"nvdec-{source.source_id}")
+        for element in (rtspsrc, depay, parser, tee, evidence_queue, decode_queue, decoder):
+            source_bin.add(element)
+        rtspsrc.connect("pad-added", self._link_dynamic_rtsp_pad, depay)
+        if not gst.Element.link_many(depay, parser, tee):
+            raise RuntimeError(f"failed to build encoded branch for {source.camera_id}")
+        if not tee.link(evidence_queue) or not tee.link(decode_queue) or not decode_queue.link(decoder):
+            raise RuntimeError(f"failed to split evidence/NVDEC branches for {source.camera_id}")
+        source_bin.add_pad(gst.GhostPad.new("encoded_src", evidence_queue.get_static_pad("src")))
+        source_bin.add_pad(gst.GhostPad.new("decoded_src", decoder.get_static_pad("src")))
+        return source_bin
+
+    @staticmethod
+    def _make_element(gst: Any, factory: str, name: str) -> Any:
+        element = gst.ElementFactory.make(factory, name)
+        if element is None:
+            raise RuntimeError(f"required GStreamer element is unavailable: {factory}")
+        return element
+
+    @classmethod
+    def _make_queue(cls, gst: Any, spec: ElementSpec) -> Any:
+        queue = cls._make_element(gst, "queue", spec.name)
+        queue.set_property("max-size-buffers", spec.properties["max-size-buffers"])
+        queue.set_property("max-size-bytes", spec.properties["max-size-bytes"])
+        queue.set_property("max-size-time", spec.properties["max-size-time"])
+        queue.set_property("leaky", 2)  # GstQueueLeaky.DOWNSTREAM
+        return queue
+
+    @staticmethod
+    def _link_dynamic_rtsp_pad(_: Any, pad: Any, depay: Any) -> None:
+        sink = depay.get_static_pad("sink")
+        if not sink.is_linked():
+            pad.link(sink)
+
+    def _metadata_probe(self, _: Any, info: Any, bindings: _NvidiaBindings) -> Any:
+        """Publish scalar metadata only; surfaces are neither mapped nor copied to CPU memory."""
+        buffer = info.get_buffer()
+        if buffer is not None:
+            batch_meta = bindings.pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
+            if batch_meta is not None:
+                self._publish_batch_metadata(batch_meta, bindings.pyds)
+        return bindings.gst.PadProbeReturn.OK
+
+    def _publish_batch_metadata(self, batch_meta: Any, pyds: Any) -> None:
+        if self._graph is None or self._metadata_publisher is None:
+            return
+        frame_node = batch_meta.frame_meta_list
+        while frame_node is not None:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(frame_node.data)
+            except StopIteration:
+                break
+            source_id = getattr(frame_meta, "source_id", getattr(frame_meta, "pad_index", -1))
+            if not isinstance(source_id, int) or not 0 <= source_id < len(self._graph.sources):
+                frame_node = self._next_metadata_node(frame_node)
+                continue
+            ntp_timestamp = int(getattr(frame_meta, "ntp_timestamp", 0))
+            source_time = (
+                datetime.fromtimestamp(ntp_timestamp / 1_000_000_000, UTC)
+                if ntp_timestamp > 0
+                else datetime.now(UTC)
+            )
+            timestamp_quality = "camera_rtcp" if ntp_timestamp > 0 else "host_ntp_fallback"
+            frame_width = max(1, int(getattr(frame_meta, "source_frame_width", 1)))
+            frame_height = max(1, int(getattr(frame_meta, "source_frame_height", 1)))
+            camera_id = self._graph.sources[source_id].camera_id
+            if not self._metadata_publisher.record_frame(
+                camera_id=camera_id,
+                source_time=source_time,
+                monotonic_seq=int(frame_meta.frame_num),
+            ):
+                if self._recovery is not None:
+                    self._recovery.handle_camera_failure(camera_id, "invalid_frame_heartbeat")
+                frame_node = self._next_metadata_node(frame_node)
+                continue
+            object_node = frame_meta.obj_meta_list
+            object_ordinal = 0
+            while object_node is not None:
+                try:
+                    object_meta = pyds.NvDsObjectMeta.cast(object_node.data)
+                except StopIteration:
+                    break
+                rect = object_meta.rect_params
+                left = max(0.0, min(1.0, float(rect.left) / frame_width))
+                top = max(0.0, min(1.0, float(rect.top) / frame_height))
+                right = max(0.0, min(1.0, float(rect.left + rect.width) / frame_width))
+                bottom = max(0.0, min(1.0, float(rect.top + rect.height) / frame_height))
+                if left < right and top < bottom:
+                    self._metadata_publisher.publish(
+                        FrameMetadataV1(
+                            camera_id=camera_id,
+                            source_time=source_time,
+                            timestamp_quality=timestamp_quality,
+                            monotonic_seq=metadata_observation_sequence(
+                                int(frame_meta.frame_num), object_ordinal
+                            ),
+                            class_name=str(getattr(object_meta, "obj_label", "person")),
+                            confidence=float(object_meta.confidence),
+                            bbox=(left, top, right, bottom),
+                            track_id=str(object_meta.object_id),
+                        )
+                    )
+                object_ordinal += 1
+                object_node = self._next_metadata_node(object_node)
+            frame_node = self._next_metadata_node(frame_node)
+
+    @staticmethod
+    def _next_metadata_node(node: Any) -> Any:
+        try:
+            return node.next
+        except StopIteration:
+            return None
+
+    def _on_bus_message(self, _: Any, message: Any) -> None:
+        if self._recovery is None:
+            return
+        source_name = message.src.get_name() if message.src is not None else ""
+        message_type = str(message.type).lower()
+        if "error" in message_type or "eos" in message_type:
+            self._recovery.handle_element_error(source_name)
+
+    def _rebuild_source(self, camera_id: str) -> None:
+        """Placeholder for a target-only source-bin rebuild after local backoff.
+
+        The next Task 7 evidence writer owns the encoded-src relink.  Rebuilding
+        stays camera-local so an RTSP error never reconstructs the shared model,
+        tracker, or other camera source bins.
+        """
+        if self._pipeline is None or self._graph is None or self._bindings is None:
+            return
+        source = next(item for item in self._graph.sources if item.camera_id == camera_id)
+        old_bin = self._pipeline.get_by_name(f"source-{source.source_id}")
+        if old_bin is None:
+            raise RuntimeError(f"missing source bin for {camera_id}")
+        old_source_pad = old_bin.get_static_pad("decoded_src")
+        mux_sink_pad = old_source_pad.get_peer()
+        if mux_sink_pad is None:
+            raise RuntimeError(f"source bin {camera_id} has no streammux pad")
+        old_bin.set_state(self._bindings.gst.State.NULL)
+        old_source_pad.unlink(mux_sink_pad)
+        self._pipeline.remove(old_bin)
+        replacement = self._build_source_bin(
+            self._bindings.gst, source, self._locations[camera_id]
+        )
+        self._pipeline.add(replacement)
+        replacement_pad = replacement.get_static_pad("decoded_src")
+        if replacement_pad.link(mux_sink_pad) != self._bindings.gst.PadLinkReturn.OK:
+            self._pipeline.remove(replacement)
+            raise RuntimeError(f"failed to relink rebuilt source bin for {camera_id}")
+        replacement.sync_state_with_parent()
+
+
+def _target_runtime_info() -> tuple[str, str]:
+    """Read target facts only after this fail-closed image has been scheduled on NVIDIA."""
+    compute_capability = subprocess.run(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip().splitlines()
+    if len(compute_capability) != 1:
+        raise RuntimeError("target runtime must expose exactly one NVIDIA GPU")
+    tensorrt_version = subprocess.run(
+        [sys.executable, "-c", "import tensorrt as trt; print(trt.__version__)"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not tensorrt_version:
+        raise RuntimeError("target runtime did not report TensorRT version")
+    return compute_capability[0], tensorrt_version
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run only with signed target inputs; bare image invocation exits non-zero."""
+    parser = argparse.ArgumentParser(description="Run the Kuzet shared DeepStream data plane")
+    parser.add_argument("--site-config", type=Path, required=True)
+    parser.add_argument("--runtime-manifest", type=Path, required=True)
+    arguments = parser.parse_args(argv)
+    try:
+        import yaml
+
+        site = load_site_config(arguments.site_config)
+        runtime_manifest = RuntimeModelManifestV1.model_validate(
+            yaml.safe_load(arguments.runtime_manifest.read_text(encoding="utf-8"))
+        )
+        runtime = DeepStreamDataPlane(
+            runtime_manifest=runtime_manifest,
+            runtime_info=_target_runtime_info,
+        )
+        runtime.start(site)
+    except (GraphContractError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+        parser.error(str(exc))
+    try:
+        assert runtime._bindings is not None
+        runtime._bindings.glib.MainLoop().run()
+    finally:
+        runtime.stop()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - target process entrypoint.
+    raise SystemExit(main())

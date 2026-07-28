@@ -202,3 +202,20 @@ def test_health_snapshot_reports_age_skew_queue_and_visible_drop_counts() -> Non
     assert health.queue_age_seconds == 0.0
     assert health.degraded_reason == "fixture_drop"
     assert [item.monotonic_seq for item in supervisor.drain_observations()] == [1]
+
+
+def test_decoded_frame_heartbeat_updates_camera_health_without_inventing_a_person_observation() -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks)
+
+    accepted = supervisor.record_frame(
+        camera_id="camera-a", source_time=clocks.wall(), monotonic_seq=0
+    )
+
+    health = supervisor.health_for("camera-a")
+    assert accepted is True
+    assert health.state == "online"
+    assert health.last_frame_age_seconds == 0.0
+    assert health.scheduled_samples == 0
+    assert health.dropped_samples == 0
+    assert supervisor.drain_observations() == []

@@ -1,0 +1,24 @@
+# Runtime-manifest template for the only core model in the shared graph.
+# This intentionally is NOT a runnable default: fill every placeholder from the
+# signed model register after the exact L4 engine is exported.  The runtime
+# refuses missing hashes, rights evidence, site promotion, or capacity evidence.
+schema_version: deepstream-runtime-manifest.v1
+site_id: REPLACE_WITH_CUSTOMER_SITE_ID
+artifact:
+  schema_version: model-artifact.v1
+  artifact_id: REPLACE_WITH_APPROVED_PERSON_ARTIFACT_ID
+  sha256: null
+  source: null
+  commercial_rights: null
+  class_list: []
+  preprocessing: null
+  analytic: person
+artifact_path: null
+engine_sha256: null
+engine_path: null
+precision: fp16
+target_compute_capability: "8.9" # NVIDIA L4 / Ada; verify on the target host.
+tensorrt_version: "10.16.0.72" # DeepStream 9.1 x86 compatibility.
+target_site_report: null
+capacity_report: null
+shadow_stage_report: null
