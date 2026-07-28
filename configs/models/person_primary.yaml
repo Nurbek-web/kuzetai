@@ -16,7 +16,8 @@ artifact:
 artifact_path: null
 engine_sha256: null
 engine_path: null
-nvinfer_config_path: null
+# Mount the populated, signed config at this exact target-container path.
+nvinfer_config_path: /run/config/person_primary.txt
 nvinfer_config_sha256: null
 precision: fp16
 target_compute_capability: "8.9" # NVIDIA L4 / Ada; verify on the target host.

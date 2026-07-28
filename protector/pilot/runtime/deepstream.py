@@ -42,7 +42,6 @@ DEEPSTREAM_X86_TENSORRT = "10.16.0.72"
 DEEPSTREAM_X86_CUDA = "13.2"
 GPU_MEMORY_TYPE = "nvbuf-mem-cuda-device"
 PYDS_REPLACEMENT_ISSUE = "PILOT-DS-001: replace isolated pyds probe with Service Maker API"
-PERSON_PRIMARY_CONFIG_PATH = Path("/app/deploy/pilot/deepstream/person_primary.txt")
 NVTRACKER_CONFIG_PATH = Path("/app/deploy/pilot/deepstream/nvtracker.yml")
 _OBJECT_SEQUENCE_BITS = 16
 _MAX_OBJECTS_PER_FRAME = 1 << _OBJECT_SEQUENCE_BITS
@@ -445,6 +444,7 @@ def person_config_paths_match(manifest: RuntimeModelManifestV1, config_path: Pat
         "model-color-format": "0",
         "net-scale-factor": "0.003921568627",
         "maintain-aspect-ratio": "1",
+        "symmetric-padding": "1",
     }
     if manifest.artifact.preprocessing != "letterbox-rgb-640x640" or any(
         properties.get(key) != value for key, value in required_person_properties.items()
@@ -465,6 +465,25 @@ def should_link_rtsp_video_pad(caps: Mapping[str, str], codec: Literal["h264", "
         and caps.get("media", "").lower() == "video"
         and caps.get("encoding-name", "").upper() == expected_encoding
     )
+
+
+def rtsp_caps_fields(caps: Any | None) -> dict[str, str] | None:
+    """Read one negotiated RTP structure without assuming caps are ready."""
+    if caps is None or caps.get_size() < 1:
+        return None
+    structure = caps.get_structure(0)
+    if structure is None:
+        return None
+    return {
+        "name": structure.get_name(),
+        "media": structure.get_string("media") or "",
+        "encoding-name": structure.get_string("encoding-name") or "",
+    }
+
+
+def evidence_placeholder_properties() -> dict[str, bool]:
+    """Nonblocking discard sink replaced by Task 7's bounded encoded writer."""
+    return {"sync": False, "async": False}
 
 
 def metadata_observation_sequence(frame_number: int, object_ordinal: int) -> int:
@@ -506,17 +525,30 @@ class SourceRecoveryCoordinator:
         supervisor: CameraSupervisor,
         source_ids: Mapping[str, int],
         rebuild_source: Callable[[str], None],
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._supervisor = supervisor
         self._source_ids = dict(source_ids)
         self._camera_by_source_id = {source_id: camera_id for camera_id, source_id in source_ids.items()}
         self._rebuild_source = rebuild_source
+        self._monotonic = monotonic_clock
         self._last_rebuild_reconnect_count: dict[str, int] = {}
+        self._attempt_started_at: dict[str, float] = {}
 
     def handle_element_error(self, element_name: str) -> None:
         camera_id = self._camera_for_element(element_name)
         if camera_id is not None:
             self.handle_camera_failure(camera_id, "rtsp_pipeline_error")
+
+    def camera_for_element(self, element: Any) -> str | None:
+        """Resolve internally-created rtspsrc children through source-bin ancestry."""
+        current = element
+        while current is not None:
+            camera_id = self._camera_for_element(current.get_name())
+            if camera_id is not None:
+                return camera_id
+            current = current.get_parent()
+        return None
 
     def handle_camera_failure(self, camera_id: str, reason: str, *, force: bool = False) -> None:
         if force or self._supervisor.health_for(camera_id).state not in {
@@ -537,8 +569,13 @@ class SourceRecoveryCoordinator:
                     self._rebuild_source(camera_id)
                     self._supervisor.recover(camera_id)
                     self._last_rebuild_reconnect_count[camera_id] = health.reconnect_count
+                    self._attempt_started_at[camera_id] = self._monotonic()
                 except Exception:
                     self._supervisor.disconnect(camera_id, "rtsp_rebuild_failed")
+
+    def first_frame_grace_expired(self, camera_id: str, *, grace_seconds: float) -> bool:
+        started = self._attempt_started_at.get(camera_id)
+        return started is not None and self._monotonic() - started > grace_seconds
 
     def _camera_for_element(self, element_name: str) -> str | None:
         prefix, separator, suffix = element_name.rpartition("-")
@@ -589,13 +626,11 @@ class DeepStreamDataPlane:
         runtime_manifest: RuntimeModelManifestV1,
         runtime_info: RuntimeInfo,
         binding_loader: BindingLoader = _load_nvidia_bindings,
-        person_config_path: Path = PERSON_PRIMARY_CONFIG_PATH,
         fatal_callback: Callable[[], None] | None = None,
     ) -> None:
         self._manifest = runtime_manifest
         self._runtime_info = runtime_info
         self._binding_loader = binding_loader
-        self._person_config_path = person_config_path
         self._fatal_callback = fatal_callback or (lambda: None)
         self._graph: DeepStreamGraphSpec | None = None
         self._pipeline: Any | None = None
@@ -673,6 +708,7 @@ class DeepStreamDataPlane:
         self._locations = {}
         self._metadata_publisher = None
         self._started_monotonic = None
+        self._awaiting_frame_since = {}
         if self._supervisor is not None:
             self._supervisor.clear_observations()
         self._supervisor = None
@@ -707,12 +743,19 @@ class DeepStreamDataPlane:
                     else:
                         self._awaiting_frame_since.pop(health.camera_id, None)
                     continue
-                if health.state not in {"starting", "reconnecting"}:
+                if health.state == "reconnecting":
+                    if self._recovery.first_frame_grace_expired(
+                        health.camera_id, grace_seconds=5.0
+                    ):
+                        self._recovery.handle_camera_failure(
+                            health.camera_id, "source_frame_timeout", force=True
+                        )
                     continue
-                if health.state == "starting" and health.last_frame_age_seconds is not None:
-                    self._awaiting_frame_since.pop(health.camera_id, None)
+                if health.state != "starting":
+                    continue
                 began = self._awaiting_frame_since.setdefault(
-                    health.camera_id, self._started_monotonic or now
+                    health.camera_id,
+                    self._started_monotonic if self._started_monotonic is not None else now,
                 )
                 if now - began > 5.0:
                     self._recovery.handle_camera_failure(health.camera_id, "source_frame_timeout", force=True)
@@ -780,8 +823,8 @@ class DeepStreamDataPlane:
             if not core_tee.link(branch_queue) or not gst.Element.link_many(branch_queue, valve, sink):
                 raise RuntimeError(f"failed to isolate disabled {branch.module} branch")
         analytics.get_static_pad("src").add_probe(gst.PadProbeType.BUFFER, self._metadata_probe, bindings)
-        # Task 7 attaches evidence writers to the encoded_src pads; optional model
-        # work remains disabled here and receives no core-path link until promoted.
+        # Task 7 replaces per-source evidence discard sinks with bounded writers;
+        # optional model work remains disabled until independently promoted.
         return pipeline
 
     def _build_source_bin(self, gst: Any, source: SourcePlan, location: str) -> Any:
@@ -802,19 +845,37 @@ class DeepStreamDataPlane:
             gst,
             ElementSpec(name=f"evidence-{source.source_id}", factory="queue", properties=queue_properties),
         )
+        evidence_discard = self._make_element(
+            gst, "fakesink", f"evidence-discard-{source.source_id}"
+        )
+        for name, value in evidence_placeholder_properties().items():
+            evidence_discard.set_property(name, value)
         decode_queue = self._make_queue(
             gst,
             ElementSpec(name=f"decode-{source.source_id}", factory="queue", properties=queue_properties),
         )
         decoder = self._make_element(gst, "nvv4l2decoder", f"nvdec-{source.source_id}")
-        for element in (rtspsrc, depay, parser, tee, evidence_queue, decode_queue, decoder):
+        for element in (
+            rtspsrc,
+            depay,
+            parser,
+            tee,
+            evidence_queue,
+            evidence_discard,
+            decode_queue,
+            decoder,
+        ):
             source_bin.add(element)
         rtspsrc.connect("pad-added", self._link_dynamic_rtsp_pad, depay, source.codec)
         if not gst.Element.link_many(depay, parser, tee):
             raise RuntimeError(f"failed to build encoded branch for {source.camera_id}")
-        if not tee.link(evidence_queue) or not tee.link(decode_queue) or not decode_queue.link(decoder):
+        if (
+            not tee.link(evidence_queue)
+            or not evidence_queue.link(evidence_discard)
+            or not tee.link(decode_queue)
+            or not decode_queue.link(decoder)
+        ):
             raise RuntimeError(f"failed to split evidence/NVDEC branches for {source.camera_id}")
-        source_bin.add_pad(gst.GhostPad.new("encoded_src", evidence_queue.get_static_pad("src")))
         source_bin.add_pad(gst.GhostPad.new("decoded_src", decoder.get_static_pad("src")))
         return source_bin
 
@@ -839,13 +900,8 @@ class DeepStreamDataPlane:
         _: Any, pad: Any, depay: Any, codec: Literal["h264", "h265"]
     ) -> None:
         caps = pad.get_current_caps() or pad.query_caps(None)
-        structure = caps.get_structure(0)
-        fields = {
-            "name": structure.get_name(),
-            "media": structure.get_string("media") or "",
-            "encoding-name": structure.get_string("encoding-name") or "",
-        }
-        if not should_link_rtsp_video_pad(fields, codec):
+        fields = rtsp_caps_fields(caps)
+        if fields is None or not should_link_rtsp_video_pad(fields, codec):
             return
         sink = depay.get_static_pad("sink")
         if not sink.is_linked():
@@ -860,100 +916,103 @@ class DeepStreamDataPlane:
                 batch_meta = bindings.pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
                 if batch_meta is not None:
                     self._publish_batch_metadata(batch_meta, bindings.pyds)
-        except (AttributeError, OverflowError, TypeError, ValueError):
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
             self._invalid_metadata_count += 1
         return bindings.gst.PadProbeReturn.OK
 
     def _publish_batch_metadata(self, batch_meta: Any, pyds: Any) -> None:
         if self._graph is None or self._metadata_publisher is None:
             return
-        frame_node = batch_meta.frame_meta_list
+        try:
+            frame_node = batch_meta.frame_meta_list
+        except AttributeError:
+            self._invalid_metadata_count += 1
+            return
         while frame_node is not None:
             try:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_node.data)
-            except StopIteration:
-                break
-            source_id = getattr(frame_meta, "source_id", getattr(frame_meta, "pad_index", -1))
-            if not isinstance(source_id, int) or not 0 <= source_id < len(self._graph.sources):
-                frame_node = self._next_metadata_node(frame_node)
-                continue
-            ntp_timestamp = int(getattr(frame_meta, "ntp_timestamp", 0))
-            source_time = (
-                datetime.fromtimestamp(ntp_timestamp / 1_000_000_000, UTC)
-                if ntp_timestamp > 0
-                else datetime.now(UTC)
-            )
-            timestamp_quality = "camera_rtcp" if ntp_timestamp > 0 else "host_ntp_fallback"
-            frame_width = int(getattr(frame_meta, "source_frame_width", 0))
-            frame_height = int(getattr(frame_meta, "source_frame_height", 0))
-            if frame_width <= 0 or frame_height <= 0:
-                raise ValueError("invalid frame dimensions")
-            camera_id = self._graph.sources[source_id].camera_id
-            if not self._metadata_publisher.record_frame(
-                camera_id=camera_id,
-                source_time=source_time,
-                monotonic_seq=int(frame_meta.frame_num),
-            ):
-                if self._recovery is not None:
-                    self._recovery.handle_camera_failure(camera_id, "invalid_frame_heartbeat")
-                frame_node = self._next_metadata_node(frame_node)
-                continue
-            object_node = frame_meta.obj_meta_list
-            object_ordinal = 0
-            while object_node is not None:
-                try:
-                    object_meta = pyds.NvDsObjectMeta.cast(object_node.data)
-                except StopIteration:
-                    break
-                try:
-                    rect = object_meta.rect_params
-                    raw = (float(rect.left), float(rect.top), float(rect.width), float(rect.height))
-                    confidence = float(object_meta.confidence)
-                    if not all(math.isfinite(value) for value in (*raw, confidence)):
-                        raise ValueError("non-finite metadata")
-                    if not 0.0 <= confidence <= 1.0 or raw[2] <= 0.0 or raw[3] <= 0.0:
-                        raise ValueError("invalid detection metadata")
-                    left = max(0.0, min(1.0, raw[0] / frame_width))
-                    top = max(0.0, min(1.0, raw[1] / frame_height))
-                    right = max(0.0, min(1.0, (raw[0] + raw[2]) / frame_width))
-                    bottom = max(0.0, min(1.0, (raw[1] + raw[3]) / frame_height))
-                    if not (left < right and top < bottom):
-                        raise ValueError("invalid normalised bbox")
-                    self._metadata_publisher.publish(
-                        FrameMetadataV1(
-                            camera_id=camera_id,
-                            source_time=source_time,
-                            timestamp_quality=timestamp_quality,
-                            monotonic_seq=metadata_observation_sequence(
-                                int(frame_meta.frame_num), object_ordinal
-                            ),
-                            class_name="person",
-                            confidence=confidence,
-                            bbox=(left, top, right, bottom),
-                            track_id=str(object_meta.object_id),
-                        )
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    self._invalid_metadata_count += 1
-                object_ordinal += 1
-                object_node = self._next_metadata_node(object_node)
+                self._publish_frame_metadata(frame_meta, pyds)
+            except (AttributeError, OSError, OverflowError, StopIteration, TypeError, ValueError):
+                self._invalid_metadata_count += 1
             frame_node = self._next_metadata_node(frame_node)
+
+    def _publish_frame_metadata(self, frame_meta: Any, pyds: Any) -> None:
+        assert self._graph is not None
+        assert self._metadata_publisher is not None
+        source_id = getattr(frame_meta, "source_id", getattr(frame_meta, "pad_index", -1))
+        if not isinstance(source_id, int) or not 0 <= source_id < len(self._graph.sources):
+            raise ValueError("invalid source ID")
+        ntp_timestamp = int(getattr(frame_meta, "ntp_timestamp", 0))
+        source_time = (
+            datetime.fromtimestamp(ntp_timestamp / 1_000_000_000, UTC)
+            if ntp_timestamp > 0
+            else datetime.now(UTC)
+        )
+        timestamp_quality = "camera_rtcp" if ntp_timestamp > 0 else "host_ntp_fallback"
+        frame_width = int(getattr(frame_meta, "source_frame_width", 0))
+        frame_height = int(getattr(frame_meta, "source_frame_height", 0))
+        frame_number = int(frame_meta.frame_num)
+        if frame_width <= 0 or frame_height <= 0 or frame_number < 0:
+            raise ValueError("invalid frame metadata")
+        camera_id = self._graph.sources[source_id].camera_id
+        if not self._metadata_publisher.record_frame(
+            camera_id=camera_id, source_time=source_time, monotonic_seq=frame_number
+        ):
+            if self._recovery is not None:
+                self._recovery.handle_camera_failure(camera_id, "invalid_frame_heartbeat")
+            return
+        object_node = frame_meta.obj_meta_list
+        object_ordinal = 0
+        while object_node is not None:
+            try:
+                object_meta = pyds.NvDsObjectMeta.cast(object_node.data)
+                rect = object_meta.rect_params
+                raw = (float(rect.left), float(rect.top), float(rect.width), float(rect.height))
+                confidence = float(object_meta.confidence)
+                if not all(math.isfinite(value) for value in (*raw, confidence)):
+                    raise ValueError("non-finite metadata")
+                if not 0.0 <= confidence <= 1.0 or raw[2] <= 0.0 or raw[3] <= 0.0:
+                    raise ValueError("invalid detection metadata")
+                left = max(0.0, min(1.0, raw[0] / frame_width))
+                top = max(0.0, min(1.0, raw[1] / frame_height))
+                right = max(0.0, min(1.0, (raw[0] + raw[2]) / frame_width))
+                bottom = max(0.0, min(1.0, (raw[1] + raw[3]) / frame_height))
+                if not (left < right and top < bottom):
+                    raise ValueError("invalid normalised bbox")
+                self._metadata_publisher.publish(
+                    FrameMetadataV1(
+                        camera_id=camera_id,
+                        source_time=source_time,
+                        timestamp_quality=timestamp_quality,
+                        monotonic_seq=metadata_observation_sequence(frame_number, object_ordinal),
+                        class_name="person",
+                        confidence=confidence,
+                        bbox=(left, top, right, bottom),
+                        track_id=str(object_meta.object_id),
+                    )
+                )
+            except (AttributeError, OSError, OverflowError, StopIteration, TypeError, ValueError):
+                self._invalid_metadata_count += 1
+            object_ordinal += 1
+            object_node = self._next_metadata_node(object_node)
 
     @staticmethod
     def _next_metadata_node(node: Any) -> Any:
         try:
             return node.next
-        except StopIteration:
+        except (AttributeError, StopIteration, TypeError):
             return None
 
     def _on_bus_message(self, _: Any, message: Any) -> None:
-        source_name = message.src.get_name() if message.src is not None else ""
         message_type = str(message.type).lower()
         structure = message.get_structure() if hasattr(message, "get_structure") else None
         is_rtsp_timeout = structure is not None and structure.get_name() == "GstRTSPSrcTimeout"
         if "error" in message_type or "eos" in message_type or is_rtsp_timeout:
-            if self._recovery is not None and self._recovery._camera_for_element(source_name) is not None:
-                self._recovery.handle_element_error(source_name)
+            camera_id = (
+                None if self._recovery is None else self._recovery.camera_for_element(message.src)
+            )
+            if camera_id is not None and self._recovery is not None:
+                self._recovery.handle_camera_failure(camera_id, "rtsp_pipeline_error")
             else:
                 self._failed_reason = "core_pipeline_error"
                 if self._pipeline is not None and self._bindings is not None:
@@ -963,33 +1022,50 @@ class DeepStreamDataPlane:
     def _rebuild_source(self, camera_id: str) -> None:
         """Placeholder for a target-only source-bin rebuild after local backoff.
 
-        The next Task 7 evidence writer owns the encoded-src relink.  Rebuilding
-        stays camera-local so an RTSP error never reconstructs the shared model,
-        tracker, or other camera source bins.
+        Task 7 replaces the source bin's discard sink with an evidence writer.
+        Rebuilding stays camera-local so an RTSP error never reconstructs the
+        shared model, tracker, or other camera source bins.
         """
         if self._pipeline is None or self._graph is None or self._bindings is None:
             return
         source = next(item for item in self._graph.sources if item.camera_id == camera_id)
-        old_bin = self._pipeline.get_by_name(f"source-{source.source_id}")
-        if old_bin is None:
-            raise RuntimeError(f"missing source bin for {camera_id}")
-        old_source_pad = old_bin.get_static_pad("decoded_src")
-        mux_sink_pad = old_source_pad.get_peer()
+        source_name = f"source-{source.source_id}"
+        old_bin = self._pipeline.get_by_name(source_name)
+        old_source_pad = None if old_bin is None else old_bin.get_static_pad("decoded_src")
+        mux = self._pipeline.get_by_name("streammux")
+        mux_sink_pad = (
+            None if mux is None else mux.get_static_pad(f"sink_{source.source_id}")
+        )
+        if mux_sink_pad is None and old_source_pad is not None:
+            mux_sink_pad = old_source_pad.get_peer()
         if mux_sink_pad is None:
             raise RuntimeError(f"source bin {camera_id} has no streammux pad")
-        old_bin.set_state(self._bindings.gst.State.NULL)
-        old_source_pad.unlink(mux_sink_pad)
-        self._pipeline.remove(old_bin)
         replacement = self._build_source_bin(
             self._bindings.gst, source, self._locations[camera_id]
         )
-        self._pipeline.add(replacement)
+        if old_bin is not None and old_source_pad is not None:
+            old_bin.set_state(self._bindings.gst.State.NULL)
+            if old_source_pad.unlink(mux_sink_pad) is False:
+                replacement.set_state(self._bindings.gst.State.NULL)
+                raise RuntimeError(f"failed to unlink old source bin for {camera_id}")
+            self._pipeline.remove(old_bin)
+        if self._pipeline.add(replacement) is False:
+            replacement.set_state(self._bindings.gst.State.NULL)
+            raise RuntimeError(f"failed to add rebuilt source bin for {camera_id}")
         replacement_pad = replacement.get_static_pad("decoded_src")
-        if replacement_pad.link(mux_sink_pad) != self._bindings.gst.PadLinkReturn.OK:
+        replacement_linked = False
+        try:
+            if replacement_pad.link(mux_sink_pad) != self._bindings.gst.PadLinkReturn.OK:
+                raise RuntimeError(f"failed to relink rebuilt source bin for {camera_id}")
+            replacement_linked = True
+            if not replacement.sync_state_with_parent():
+                raise RuntimeError(f"failed to sync rebuilt source bin for {camera_id}")
+        except Exception:
+            if replacement_linked:
+                replacement_pad.unlink(mux_sink_pad)
+            replacement.set_state(self._bindings.gst.State.NULL)
             self._pipeline.remove(replacement)
-            raise RuntimeError(f"failed to relink rebuilt source bin for {camera_id}")
-        if not replacement.sync_state_with_parent():
-            raise RuntimeError(f"failed to sync rebuilt source bin for {camera_id}")
+            raise
 
 
 def _target_runtime_info() -> tuple[str, str]:

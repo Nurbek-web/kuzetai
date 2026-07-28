@@ -35,10 +35,12 @@ from protector.pilot.runtime.deepstream import (
     RuntimeModelManifestV1,
     SourceRecoveryCoordinator,
     configure_nvtracker,
+    evidence_placeholder_properties,
     main,
     metadata_observation_sequence,
     person_config_paths_match,
     resolve_rtsp_locations,
+    rtsp_caps_fields,
     should_link_rtsp_video_pad,
     stop_pipeline,
 )
@@ -139,7 +141,7 @@ def _manifest_with_files(tmp_path: Path) -> RuntimeModelManifestV1:
         (
             f"[property]\nonnx-file={model}\nmodel-engine-file={engine}\nnetwork-mode=2\n"
             "batch-size=20\ninfer-dims=3;640;640\nmodel-color-format=0\n"
-            "net-scale-factor=0.003921568627\nmaintain-aspect-ratio=1\n"
+            "net-scale-factor=0.003921568627\nmaintain-aspect-ratio=1\nsymmetric-padding=1\n"
         ),
         encoding="utf-8",
     )
@@ -243,6 +245,76 @@ def test_optional_analytics_are_disabled_and_isolated_by_valves_and_leaky_queues
         assert branch.queue.properties["max-size-time"] == 0
 
 
+def test_pre_evidence_source_branch_has_nonblocking_discard_placeholder() -> None:
+    class Element:
+        def __init__(self, factory: str, name: str) -> None:
+            self.factory = factory
+            self.name = name
+            self.properties: dict[str, object] = {}
+            self.links: list[Element] = []
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+        def connect(self, *_: object) -> None:
+            return None
+
+        def link(self, other: Element) -> bool:
+            self.links.append(other)
+            return True
+
+        def get_static_pad(self, name: str) -> tuple[str, str]:
+            return self.name, name
+
+    class Bin:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.elements: dict[str, Element] = {}
+            self.ghost_pads: list[tuple[str, tuple[str, str]]] = []
+
+        def add(self, element: Element) -> None:
+            self.elements[element.name] = element
+
+        def add_pad(self, pad: tuple[str, tuple[str, str]]) -> None:
+            self.ghost_pads.append(pad)
+
+    class Gst:
+        class Bin:
+            @staticmethod
+            def new(name: str) -> Bin:
+                return Bin(name)
+
+        class ElementFactory:
+            @staticmethod
+            def make(factory: str, name: str) -> Element:
+                return Element(factory, name)
+
+        class Element:
+            @staticmethod
+            def link_many(*elements: Element) -> bool:
+                return all(left.link(right) for left, right in zip(elements, elements[1:]))
+
+        class GhostPad:
+            @staticmethod
+            def new(name: str, pad: tuple[str, str]) -> tuple[str, tuple[str, str]]:
+                return name, pad
+
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(), runtime_info=lambda: ("8.9", "10.16.0.72")
+    )
+    source_bin = runtime._build_source_bin(
+        Gst, DeepStreamGraphSpec.from_site(_site()).sources[0], "rtsp://redacted"
+    )
+
+    evidence_queue = source_bin.elements["evidence-0"]
+    discard = source_bin.elements["evidence-discard-0"]
+    assert evidence_placeholder_properties() == {"sync": False, "async": False}
+    assert evidence_queue.links == [discard]
+    assert discard.factory == "fakesink"
+    assert discard.properties == {"sync": False, "async": False}
+    assert [name for name, _ in source_bin.ghost_pads] == ["decoded_src"]
+
+
 def test_rtsp_dynamic_pad_accepts_only_matching_video_rtp_caps() -> None:
     assert should_link_rtsp_video_pad(
         {"name": "application/x-rtp", "media": "video", "encoding-name": "H264"}, "h264"
@@ -253,6 +325,23 @@ def test_rtsp_dynamic_pad_accepts_only_matching_video_rtp_caps() -> None:
     assert not should_link_rtsp_video_pad(
         {"name": "application/x-rtp", "media": "video", "encoding-name": "H265"}, "h264"
     )
+
+
+def test_rtsp_caps_reader_ignores_missing_empty_and_structureless_caps() -> None:
+    class EmptyCaps:
+        def get_size(self) -> int:
+            return 0
+
+    class MissingStructureCaps:
+        def get_size(self) -> int:
+            return 1
+
+        def get_structure(self, _: int) -> None:
+            return None
+
+    assert rtsp_caps_fields(None) is None
+    assert rtsp_caps_fields(EmptyCaps()) is None
+    assert rtsp_caps_fields(MissingStructureCaps()) is None
 
 
 def test_runtime_manifest_fails_closed_for_missing_rights_hashes_or_target_mismatch() -> None:
@@ -292,7 +381,6 @@ def test_nvidia_bindings_are_loaded_only_when_the_target_adapter_starts(tmp_path
         runtime_manifest=manifest,
         runtime_info=lambda: ("8.9", "10.16.0.72"),
         binding_loader=missing_bindings,
-        person_config_path=manifest.nvinfer_config_path,
     )
 
     with pytest.raises(NvidiaBindingsUnavailable, match="NVIDIA DeepStream bindings"):
@@ -360,6 +448,115 @@ def test_inner_rtsp_error_routes_to_its_camera_and_rebuilds_only_after_backoff()
     assert supervisor.health_for("camera-01").state == "online"
 
 
+def test_rebuild_attempt_gets_a_fresh_five_second_first_frame_grace() -> None:
+    clocks = Clocks()
+    supervisor = CameraSupervisor(
+        camera_ids=("camera-01",),
+        observation_queue_size=4,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    supervisor.accept_sample(camera_id="camera-01", source_time=clocks.wall(), monotonic_seq=0)
+    recovery = SourceRecoveryCoordinator(
+        supervisor=supervisor,
+        source_ids={"camera-01": 0},
+        rebuild_source=lambda _: None,
+        monotonic_clock=clocks.monotonic,
+    )
+
+    clocks.advance(5.1)
+    recovery.handle_camera_failure("camera-01", "source_frame_timeout")
+    clocks.advance(1.0)
+    recovery.advance()
+    assert recovery.first_frame_grace_expired("camera-01", grace_seconds=5.0) is False
+
+    clocks.advance(4.1)
+    assert recovery.first_frame_grace_expired("camera-01", grace_seconds=5.0) is False
+    clocks.advance(1.0)
+    assert recovery.first_frame_grace_expired("camera-01", grace_seconds=5.0) is True
+
+
+def test_startup_watchdog_treats_monotonic_zero_as_a_valid_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clocks = Clocks()
+    supervisor = CameraSupervisor(
+        camera_ids=("camera-01",),
+        observation_queue_size=4,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    recovery = SourceRecoveryCoordinator(
+        supervisor=supervisor,
+        source_ids={"camera-01": 0},
+        rebuild_source=lambda _: None,
+        monotonic_clock=clocks.monotonic,
+    )
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(), runtime_info=lambda: ("8.9", "10.16.0.72")
+    )
+    runtime._pipeline = object()
+    runtime._supervisor = supervisor
+    runtime._recovery = recovery
+    runtime._started_monotonic = 0.0
+    monkeypatch.setattr(
+        "protector.pilot.runtime.deepstream.time.monotonic", clocks.monotonic
+    )
+
+    clocks.advance(5.1)
+    runtime._advance_recovery()
+
+    assert supervisor.health_for("camera-01").state == "offline"
+
+
+def test_internal_rtsp_child_resolves_camera_from_source_bin_ancestry() -> None:
+    class Element:
+        def __init__(self, name: str, parent: Element | None = None) -> None:
+            self._name = name
+            self._parent = parent
+
+        def get_name(self) -> str:
+            return self._name
+
+        def get_parent(self) -> Element | None:
+            return self._parent
+
+    clocks = Clocks()
+    supervisor = CameraSupervisor(
+        camera_ids=("camera-01",),
+        observation_queue_size=4,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    recovery = SourceRecoveryCoordinator(
+        supervisor=supervisor,
+        source_ids={"camera-01": 0},
+        rebuild_source=lambda _: None,
+        monotonic_clock=clocks.monotonic,
+    )
+    child = Element("udpsrc-internal-17", Element("rtp-session", Element("source-0")))
+
+    assert recovery.camera_for_element(child) == "camera-01"
+    fatal_calls: list[None] = []
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        fatal_callback=lambda: fatal_calls.append(None),
+    )
+    runtime._recovery = recovery
+    message = type(
+        "Message",
+        (),
+        {"src": child, "type": "error", "get_structure": lambda _: None},
+    )()
+
+    runtime._on_bus_message(None, message)
+
+    assert supervisor.health_for("camera-01").state == "offline"
+    assert runtime.failed_reason is None
+    assert fatal_calls == []
+
+
 def test_failed_camera_local_rebuild_returns_only_that_camera_to_backoff() -> None:
     clocks = Clocks()
     supervisor = CameraSupervisor(
@@ -381,6 +578,90 @@ def test_failed_camera_local_rebuild_returns_only_that_camera_to_backoff() -> No
     assert supervisor.health_for("camera-01").state == "offline"
     assert supervisor.health_for("camera-01").reconnect_count == 2
     assert supervisor.health_for("camera-02").state == "starting"
+
+
+def test_source_rebuild_retries_after_replacement_link_failed_and_old_bin_was_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Pad:
+        def __init__(self, *, peer: Pad | None = None, link_result: int = 0) -> None:
+            self._peer = peer
+            self._link_result = link_result
+
+        def get_peer(self) -> Pad | None:
+            return self._peer
+
+        def unlink(self, _: Pad) -> bool:
+            self._peer = None
+            return True
+
+        def link(self, _: Pad) -> int:
+            return self._link_result
+
+    mux_pad = Pad()
+
+    class Bin:
+        def __init__(self, name: str, pad: Pad, *, sync_result: bool = True) -> None:
+            self.name = name
+            self.pad = pad
+            self.sync_result = sync_result
+
+        def get_static_pad(self, _: str) -> Pad:
+            return self.pad
+
+        def set_state(self, _: object) -> None:
+            return None
+
+        def sync_state_with_parent(self) -> bool:
+            return self.sync_result
+
+    class Mux:
+        def get_static_pad(self, name: str) -> Pad | None:
+            return mux_pad if name == "sink_0" else None
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.elements: dict[str, object] = {
+                "source-0": Bin("source-0", Pad(peer=mux_pad)),
+                "streammux": Mux(),
+            }
+
+        def get_by_name(self, name: str) -> object | None:
+            return self.elements.get(name)
+
+        def add(self, element: Bin) -> None:
+            self.elements[element.name] = element
+
+        def remove(self, element: Bin) -> None:
+            self.elements.pop(element.name, None)
+
+    class Gst:
+        class State:
+            NULL = object()
+
+        class PadLinkReturn:
+            OK = 0
+
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(), runtime_info=lambda: ("8.9", "10.16.0.72")
+    )
+    runtime._graph = DeepStreamGraphSpec.from_site(_site())
+    runtime._pipeline = Pipeline()
+    runtime._bindings = type("Bindings", (), {"gst": Gst})()
+    runtime._locations = {"camera-01": "rtsp://redacted"}
+    replacements = iter(
+        (
+            Bin("source-0", Pad(link_result=1)),
+            Bin("source-0", Pad(link_result=0)),
+        )
+    )
+    monkeypatch.setattr(runtime, "_build_source_bin", lambda *_: next(replacements))
+
+    with pytest.raises(RuntimeError, match="relink"):
+        runtime._rebuild_source("camera-01")
+    runtime._rebuild_source("camera-01")
+
+    assert runtime._pipeline.get_by_name("source-0") is not None
 
 
 def test_stale_frame_heartbeat_enters_camera_local_recovery() -> None:
@@ -447,6 +728,7 @@ def test_person_nvinfer_config_must_load_the_exact_hash_verified_paths(tmp_path:
                 "model-color-format=0",
                 "net-scale-factor=0.003921568627",
                 "maintain-aspect-ratio=1",
+                "symmetric-padding=1",
             )
         ),
         encoding="utf-8",
@@ -464,6 +746,22 @@ def test_person_nvinfer_config_must_load_the_exact_hash_verified_paths(tmp_path:
         encoding="utf-8",
     )
     with pytest.raises(GraphContractError, match="configuration sha256"):
+        person_config_paths_match(manifest, config)
+
+
+def test_signed_person_config_requires_symmetric_letterbox_padding(tmp_path: Path) -> None:
+    manifest = _manifest_with_files(tmp_path)
+    assert manifest.nvinfer_config_path is not None
+    config = manifest.nvinfer_config_path
+    config.write_text(
+        config.read_text(encoding="utf-8").replace("symmetric-padding=1\n", ""),
+        encoding="utf-8",
+    )
+    manifest = manifest.model_copy(
+        update={"nvinfer_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest()}
+    )
+
+    with pytest.raises(GraphContractError, match="approved person preprocessing"):
         person_config_paths_match(manifest, config)
 
 
@@ -521,6 +819,7 @@ def test_deployment_artifacts_pin_the_target_and_shared_person_tracker_contract(
     assert "network-mode=2" in person_config
     assert "onnx-file=/models/approved/person_primary.onnx" in person_config
     assert "model-engine-file=/models/approved/person_primary_l4_fp16.engine" in person_config
+    assert "symmetric-padding=1" in person_config
     assert tracker_config["tracker"]["enable-batch-process"] == 1
     assert "NvDCF" in tracker_config["tracker"]["ll-config-file"]
 
@@ -587,6 +886,87 @@ def test_objects_from_one_frame_publish_distinct_deterministic_observation_seque
 
     assert [first.monotonic_seq, second.monotonic_seq] == [196608, 196609]
     assert len(supervisor.drain_observations()) == 2
+
+
+def test_malformed_frame_and_object_do_not_suppress_later_valid_metadata() -> None:
+    class Node:
+        def __init__(self, data: object, next_node: Node | None = None) -> None:
+            self.data = data
+            self.next = next_node
+
+    class Cast:
+        @staticmethod
+        def cast(value: object) -> object:
+            return value
+
+    class Pyds:
+        NvDsFrameMeta = Cast
+        NvDsObjectMeta = Cast
+
+    class Rect:
+        left = 10.0
+        top = 10.0
+        width = 20.0
+        height = 30.0
+
+    class BadObject:
+        confidence = 0.7
+        object_id = 1
+
+    class GoodObject:
+        rect_params = Rect()
+        confidence = 0.9
+        object_id = 2
+
+    clocks = Clocks()
+    ntp = int(clocks.wall().timestamp() * 1_000_000_000)
+    good_frame = type(
+        "Frame",
+        (),
+        {
+            "source_id": 0,
+            "ntp_timestamp": ntp,
+            "source_frame_width": 100,
+            "source_frame_height": 100,
+            "frame_num": 1,
+            "obj_meta_list": Node(BadObject(), Node(GoodObject())),
+        },
+    )()
+    bad_frame = type(
+        "Frame",
+        (),
+        {
+            "source_id": 0,
+            "ntp_timestamp": ntp,
+            "source_frame_width": 0,
+            "source_frame_height": 100,
+            "frame_num": 0,
+            "obj_meta_list": None,
+        },
+    )()
+    supervisor = CameraSupervisor(
+        camera_ids=tuple(f"camera-{number:02d}" for number in range(1, 21)),
+        observation_queue_size=4,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(), runtime_info=lambda: ("8.9", "10.16.0.72")
+    )
+    runtime._graph = DeepStreamGraphSpec.from_site(_site())
+    runtime._supervisor = supervisor
+    runtime._metadata_publisher = MetadataPublisher(
+        supervisor=supervisor, model_artifact_id="person-primary-v1"
+    )
+    batch = type("Batch", (), {"frame_meta_list": Node(bad_frame, Node(good_frame))})()
+
+    runtime._publish_batch_metadata(batch, Pyds)
+
+    observations = runtime.drain_observations()
+    assert len(observations) == 1
+    assert observations[0].track_id == "2"
+    assert runtime.invalid_metadata_count == 2
+    assert supervisor.health_for("camera-01").state == "online"
 
 
 def test_manifest_compares_model_and_engine_file_hashes_before_starting(tmp_path: Path) -> None:
