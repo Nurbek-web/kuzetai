@@ -315,6 +315,89 @@ def test_pre_evidence_source_branch_has_nonblocking_discard_placeholder() -> Non
     assert [name for name, _ in source_bin.ghost_pads] == ["decoded_src"]
 
 
+def test_encoded_writer_replaces_discard_only_after_factory_succeeds() -> None:
+    class Element:
+        def __init__(self, factory: str, name: str) -> None:
+            self.factory = factory
+            self.name = name
+            self.properties: dict[str, object] = {}
+            self.links: list[Element] = []
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+        def connect(self, *_: object) -> None:
+            return None
+
+        def link(self, other: Element) -> bool:
+            self.links.append(other)
+            return True
+
+        def get_static_pad(self, name: str) -> tuple[str, str]:
+            return self.name, name
+
+    class Bin:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.elements: dict[str, Element] = {}
+
+        def add(self, element: Element) -> None:
+            self.elements[element.name] = element
+
+        def add_pad(self, _: object) -> None:
+            return None
+
+    class Gst:
+        class Bin:
+            @staticmethod
+            def new(name: str) -> Bin:
+                return Bin(name)
+
+        class ElementFactory:
+            @staticmethod
+            def make(factory: str, name: str) -> Element:
+                return Element(factory, name)
+
+        class Element:
+            @staticmethod
+            def link_many(*elements: Element) -> bool:
+                return all(left.link(right) for left, right in zip(elements, elements[1:]))
+
+        class GhostPad:
+            @staticmethod
+            def new(name: str, pad: object) -> tuple[str, object]:
+                return name, pad
+
+    def writer_factory(gst: object, source: object) -> Element:
+        return Gst.ElementFactory.make("splitmuxsink", f"evidence-writer-{source.source_id}")
+
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        evidence_sink_factory=writer_factory,
+    )
+    source = DeepStreamGraphSpec.from_site(_site()).sources[0]
+    source_bin = runtime._build_source_bin(Gst, source, "rtsp://redacted")
+
+    queue = source_bin.elements["evidence-0"]
+    writer = source_bin.elements["evidence-writer-0"]
+    assert queue.links == [writer]
+    assert "evidence-discard-0" not in source_bin.elements
+    assert source_bin.elements["parse-0"].properties["config-interval"] == -1
+
+    def failed_factory(_: object, __: object) -> Element:
+        raise RuntimeError("writer unavailable")
+
+    fallback_runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        evidence_sink_factory=failed_factory,
+    )
+    fallback = fallback_runtime._build_source_bin(Gst, source, "rtsp://redacted")
+    assert fallback.elements["evidence-0"].links == [fallback.elements["evidence-discard-0"]]
+    assert fallback_runtime.evidence_attachment_failures == 1
+
+
 def test_rtsp_dynamic_pad_accepts_only_matching_video_rtp_caps() -> None:
     assert should_link_rtsp_video_pad(
         {"name": "application/x-rtp", "media": "video", "encoding-name": "H264"}, "h264"

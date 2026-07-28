@@ -802,6 +802,68 @@ class PilotRepository:
                     ) from insert_error
                 return existing
 
+    def finalize_evidence(
+        self,
+        evidence: EvidenceInput,
+        *,
+        status: Literal["ready", "failed"],
+    ) -> EvidenceModel:
+        """Atomically align one evidence row and its candidate's visible status.
+
+        Object publication happens before this transaction.  A retry may promote
+        ``failed`` to ``ready`` after the object store verifies the same key and
+        digest, but a ready identity can never be downgraded or repurposed.
+        """
+        with self.session_factory.begin() as session:
+            event = session.get(CandidateEventModel, str(evidence.event_id))
+            if event is None:
+                raise KeyError(f"unknown event: {evidence.event_id}")
+            event_transitions = {
+                "pending": {"ready", "failed"},
+                "failed": {"failed", "ready"},
+                "ready": {"ready"},
+            }
+            if status not in event_transitions.get(event.evidence_status, set()):
+                raise StaleStateError(expected=status, actual=event.evidence_status)
+
+            row = session.scalar(
+                select(EvidenceModel).where(
+                    or_(
+                        EvidenceModel.evidence_id == str(evidence.evidence_id),
+                        EvidenceModel.object_key == evidence.object_key,
+                    )
+                )
+            )
+            if row is None:
+                row = EvidenceModel(
+                    evidence_id=str(evidence.evidence_id),
+                    event_id=str(evidence.event_id),
+                    object_key=evidence.object_key,
+                    sha256=evidence.sha256,
+                    codec=evidence.codec,
+                    start_at=evidence.start_at,
+                    end_at=evidence.end_at,
+                    source_reference=evidence.source_reference,
+                    status=status,
+                )
+                session.add(row)
+            else:
+                if not self._evidence_material_matches(row, evidence):
+                    raise IdempotencyConflictError(
+                        "evidence identity was reused with different data"
+                    )
+                evidence_transitions = {
+                    "pending": {"ready", "failed"},
+                    "failed": {"failed", "ready"},
+                    "ready": {"ready"},
+                }
+                if status not in evidence_transitions.get(row.status, set()):
+                    raise IdempotencyConflictError("ready evidence cannot be downgraded")
+                row.status = status
+            event.evidence_status = status
+            session.flush()
+            return row
+
     @staticmethod
     def _evidence_matches(row: EvidenceModel, evidence: EvidenceInput) -> bool:
         return (
@@ -824,6 +886,28 @@ class PilotRepository:
             _as_utc(evidence.end_at),
             evidence.source_reference,
             evidence.status,
+        )
+
+    @staticmethod
+    def _evidence_material_matches(row: EvidenceModel, evidence: EvidenceInput) -> bool:
+        return (
+            row.evidence_id,
+            row.event_id,
+            row.object_key,
+            row.sha256,
+            row.codec,
+            _as_utc(row.start_at),
+            _as_utc(row.end_at),
+            row.source_reference,
+        ) == (
+            str(evidence.evidence_id),
+            str(evidence.event_id),
+            evidence.object_key,
+            evidence.sha256,
+            evidence.codec,
+            _as_utc(evidence.start_at),
+            _as_utc(evidence.end_at),
+            evidence.source_reference,
         )
 
     def persist_journal_item(self, item: Any) -> None:

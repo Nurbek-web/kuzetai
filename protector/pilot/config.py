@@ -28,6 +28,7 @@ QueueSize = Annotated[int, Field(ge=1, le=10_000)]
 RingBufferSeconds = Annotated[int, Field(ge=1, le=15)]
 EvidenceRetentionDays = Annotated[int, Field(ge=1, le=90)]
 MetadataRetentionDays = Annotated[int, Field(ge=1, le=365)]
+FiniteStorageBytes = Annotated[int, Field(gt=0, le=1_000_000_000_000)]
 DOCKER_SECRETS_DIR = Path("/run/secrets")
 
 
@@ -121,8 +122,16 @@ class EvidenceRetention(FrozenModel):
     continuous_video_owner: Literal["customer_nvr"]
     continuous_video_storage_enabled: Literal[False]
     encoded_ring_buffer_seconds: RingBufferSeconds
+    encoded_ring_max_camera_bytes: FiniteStorageBytes = 64_000_000
+    encoded_ring_max_spool_bytes: FiniteStorageBytes = 1_280_000_000
     evidence_retention_days: EvidenceRetentionDays
     metadata_retention_days: MetadataRetentionDays
+
+    @model_validator(mode="after")
+    def total_spool_covers_one_camera(self) -> EvidenceRetention:
+        if self.encoded_ring_max_spool_bytes < self.encoded_ring_max_camera_bytes:
+            raise ValueError("total encoded ring byte bound must cover one camera")
+        return self
 
 
 class KazakhstanStorage(FrozenModel):

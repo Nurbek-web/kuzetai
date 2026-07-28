@@ -149,6 +149,8 @@ def test_storage_keeps_continuous_video_in_customer_nvr_and_bounds_retention():
     assert retention.continuous_video_owner == "customer_nvr"
     assert retention.continuous_video_storage_enabled is False
     assert retention.encoded_ring_buffer_seconds == 15
+    assert retention.encoded_ring_max_camera_bytes > 0
+    assert retention.encoded_ring_max_spool_bytes >= retention.encoded_ring_max_camera_bytes
 
     wrong_owner = _site_payload()
     wrong_owner["storage"]["retention"]["continuous_video_owner"] = "kuzet"
@@ -169,6 +171,17 @@ def test_storage_keeps_continuous_video_in_customer_nvr_and_bounds_retention():
     unbounded_metadata["storage"]["retention"]["metadata_retention_days"] = 366
     with pytest.raises(ValidationError):
         SiteConfig.model_validate(unbounded_metadata)
+
+    zero_disk_bound = _site_payload()
+    zero_disk_bound["storage"]["retention"]["encoded_ring_max_camera_bytes"] = 0
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(zero_disk_bound)
+
+    inverted_disk_bound = _site_payload()
+    inverted_disk_bound["storage"]["retention"]["encoded_ring_max_camera_bytes"] = 2_000
+    inverted_disk_bound["storage"]["retention"]["encoded_ring_max_spool_bytes"] = 1_000
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(inverted_disk_bound)
 
 
 @pytest.mark.parametrize(

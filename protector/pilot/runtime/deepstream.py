@@ -615,6 +615,7 @@ def _load_nvidia_bindings() -> _NvidiaBindings:
 
 RuntimeInfo = Callable[[], tuple[str, str]]
 BindingLoader = Callable[[], object]
+EvidenceSinkFactory = Callable[[Any, SourcePlan], Any | None]
 
 
 class DeepStreamDataPlane:
@@ -627,11 +628,13 @@ class DeepStreamDataPlane:
         runtime_info: RuntimeInfo,
         binding_loader: BindingLoader = _load_nvidia_bindings,
         fatal_callback: Callable[[], None] | None = None,
+        evidence_sink_factory: EvidenceSinkFactory | None = None,
     ) -> None:
         self._manifest = runtime_manifest
         self._runtime_info = runtime_info
         self._binding_loader = binding_loader
         self._fatal_callback = fatal_callback or (lambda: None)
+        self._evidence_sink_factory = evidence_sink_factory
         self._graph: DeepStreamGraphSpec | None = None
         self._pipeline: Any | None = None
         self._supervisor: CameraSupervisor | None = None
@@ -641,6 +644,7 @@ class DeepStreamDataPlane:
         self._metadata_publisher: MetadataPublisher | None = None
         self._failed_reason: str | None = None
         self._invalid_metadata_count = 0
+        self._evidence_attachment_failures = 0
         self._started_monotonic: float | None = None
         self._awaiting_frame_since: dict[str, float] = {}
 
@@ -667,6 +671,7 @@ class DeepStreamDataPlane:
         locations = resolve_rtsp_locations(site)
         self._graph = graph
         self._failed_reason = None
+        self._evidence_attachment_failures = 0
         self._started_monotonic = time.monotonic()
         self._bindings = bindings
         self._locations = dict(locations)
@@ -725,6 +730,11 @@ class DeepStreamDataPlane:
     def invalid_metadata_count(self) -> int:
         """Count malformed frame/object metadata dropped without touching GPU surfaces."""
         return self._invalid_metadata_count
+
+    @property
+    def evidence_attachment_failures(self) -> int:
+        """Count camera writers that safely fell back to encoded-data discard."""
+        return self._evidence_attachment_failures
 
     def drain_observations(self) -> list[Any]:
         """Deliver bounded metadata observations; decoded GPU surfaces never leave the graph."""
@@ -834,6 +844,9 @@ class DeepStreamDataPlane:
         rtspsrc.set_property("latency", 200)
         depay = self._make_element(gst, source.depay_factory, f"depay-{source.source_id}")
         parser = self._make_element(gst, source.parser_factory, f"parse-{source.source_id}")
+        # Repeat codec headers at random-access points so every retained fragment
+        # can begin at a decodable keyframe.
+        parser.set_property("config-interval", -1)
         tee = self._make_element(gst, "tee", f"encoded-tee-{source.source_id}")
         queue_properties = {
             "max-size-buffers": source.queue_capacity,
@@ -845,11 +858,22 @@ class DeepStreamDataPlane:
             gst,
             ElementSpec(name=f"evidence-{source.source_id}", factory="queue", properties=queue_properties),
         )
-        evidence_discard = self._make_element(
-            gst, "fakesink", f"evidence-discard-{source.source_id}"
-        )
-        for name, value in evidence_placeholder_properties().items():
-            evidence_discard.set_property(name, value)
+        evidence_sink = None
+        if self._evidence_sink_factory is not None:
+            try:
+                evidence_sink = self._evidence_sink_factory(gst, source)
+            except Exception:
+                # The source bin is not live yet; retain Task 6's safe discard
+                # branch when the bounded writer cannot be constructed.
+                self._evidence_attachment_failures += 1
+                evidence_sink = None
+        using_discard = evidence_sink is None
+        if using_discard:
+            evidence_sink = self._make_element(
+                gst, "fakesink", f"evidence-discard-{source.source_id}"
+            )
+            for name, value in evidence_placeholder_properties().items():
+                evidence_sink.set_property(name, value)
         decode_queue = self._make_queue(
             gst,
             ElementSpec(name=f"decode-{source.source_id}", factory="queue", properties=queue_properties),
@@ -861,7 +885,7 @@ class DeepStreamDataPlane:
             parser,
             tee,
             evidence_queue,
-            evidence_discard,
+            evidence_sink,
             decode_queue,
             decoder,
         ):
@@ -869,12 +893,23 @@ class DeepStreamDataPlane:
         rtspsrc.connect("pad-added", self._link_dynamic_rtsp_pad, depay, source.codec)
         if not gst.Element.link_many(depay, parser, tee):
             raise RuntimeError(f"failed to build encoded branch for {source.camera_id}")
-        if (
-            not tee.link(evidence_queue)
-            or not evidence_queue.link(evidence_discard)
-            or not tee.link(decode_queue)
-            or not decode_queue.link(decoder)
-        ):
+        if not tee.link(evidence_queue):
+            raise RuntimeError(f"failed to split evidence/NVDEC branches for {source.camera_id}")
+        if not evidence_queue.link(evidence_sink):
+            if using_discard:
+                raise RuntimeError(f"failed to attach evidence discard for {source.camera_id}")
+            self._evidence_attachment_failures += 1
+            if hasattr(source_bin, "remove"):
+                source_bin.remove(evidence_sink)
+            evidence_sink = self._make_element(
+                gst, "fakesink", f"evidence-discard-{source.source_id}"
+            )
+            for name, value in evidence_placeholder_properties().items():
+                evidence_sink.set_property(name, value)
+            source_bin.add(evidence_sink)
+            if not evidence_queue.link(evidence_sink):
+                raise RuntimeError(f"failed to attach safe evidence discard for {source.camera_id}")
+        if not tee.link(decode_queue) or not decode_queue.link(decoder):
             raise RuntimeError(f"failed to split evidence/NVDEC branches for {source.camera_id}")
         source_bin.add_pad(gst.GhostPad.new("decoded_src", decoder.get_static_pad("src")))
         return source_bin

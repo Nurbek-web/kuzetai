@@ -50,6 +50,8 @@ storage:
     continuous_video_owner: customer_nvr
     continuous_video_storage_enabled: false
     encoded_ring_buffer_seconds: 15
+    encoded_ring_max_camera_bytes: 64000000
+    encoded_ring_max_spool_bytes: 1280000000
     evidence_retention_days: 30
     metadata_retention_days: 365
 
