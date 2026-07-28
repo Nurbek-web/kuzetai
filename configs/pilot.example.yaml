@@ -44,6 +44,14 @@ storage:
   country_code: KZ
   endpoint: https://object-storage.customer.example
   bucket: kuzet-pilot-evidence
+  # The customer NVR is the continuous-video system of record. Kuzet retains only
+  # bounded encoded evidence, thumbnails, metadata, and audit records.
+  retention:
+    continuous_video_owner: customer_nvr
+    continuous_video_storage_enabled: false
+    encoded_ring_buffer_seconds: 15
+    evidence_retention_days: 30
+    metadata_retention_days: 365
 
 # All queues are explicit and bounded (1..10000); tune only after capacity testing.
 queues:

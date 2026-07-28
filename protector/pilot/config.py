@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Literal
 
 import yaml
@@ -13,6 +15,7 @@ from pydantic import (
     HttpUrl,
     SecretStr,
     StringConstraints,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -21,6 +24,10 @@ NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_len
 PositiveBitrate = Annotated[int, Field(gt=0)]
 AnalyticsHz = Annotated[float, Field(ge=0.0, le=30.0)]
 QueueSize = Annotated[int, Field(ge=1, le=10_000)]
+RingBufferSeconds = Annotated[int, Field(ge=1, le=15)]
+EvidenceRetentionDays = Annotated[int, Field(ge=1, le=90)]
+MetadataRetentionDays = Annotated[int, Field(ge=1, le=365)]
+DOCKER_SECRETS_DIR = Path("/run/secrets")
 
 
 class FrozenModel(BaseModel):
@@ -70,7 +77,18 @@ class CameraFeed(FrozenModel):
     codec: Literal["h264", "h265"]
     resolution: Resolution
     bitrate_kbps: PositiveBitrate
-    analytics_hz: dict[NonEmptyString, AnalyticsHz]
+    analytics_hz: Mapping[NonEmptyString, AnalyticsHz]
+
+    @field_validator("analytics_hz")
+    @classmethod
+    def freeze_analytics_schedule(
+        cls, analytics_hz: Mapping[str, float]
+    ) -> Mapping[str, float]:
+        return MappingProxyType(dict(analytics_hz))
+
+    @field_serializer("analytics_hz")
+    def serialize_analytics_schedule(self, analytics_hz: Mapping[str, float]) -> dict[str, float]:
+        return dict(analytics_hz)
 
     @model_validator(mode="after")
     def includes_person_analytics(self) -> CameraFeed:
@@ -82,7 +100,7 @@ class CameraFeed(FrozenModel):
 class ReadyToStart(FrozenModel):
     """Inputs that must be signed off before the pilot starts."""
 
-    feeds: Annotated[list[CameraFeed], Field(min_length=20, max_length=20)]
+    feeds: Annotated[tuple[CameraFeed, ...], Field(min_length=20, max_length=20)]
     ntp_source: NonEmptyString
     camera_map: NonEmptyString
     site_access: NonEmptyString
@@ -92,16 +110,27 @@ class ReadyToStart(FrozenModel):
 
     @field_validator("feeds")
     @classmethod
-    def camera_ids_are_unique(cls, feeds: list[CameraFeed]) -> list[CameraFeed]:
+    def camera_ids_are_unique(cls, feeds: tuple[CameraFeed, ...]) -> tuple[CameraFeed, ...]:
         if len({feed.camera_id for feed in feeds}) != len(feeds):
             raise ValueError("camera IDs must be unique")
         return feeds
+
+
+class EvidenceRetention(FrozenModel):
+    """The pilot retains bounded evidence and metadata; the customer NVR owns video."""
+
+    continuous_video_owner: Literal["customer_nvr"]
+    continuous_video_storage_enabled: Literal[False]
+    encoded_ring_buffer_seconds: RingBufferSeconds
+    evidence_retention_days: EvidenceRetentionDays
+    metadata_retention_days: MetadataRetentionDays
 
 
 class KazakhstanStorage(FrozenModel):
     country_code: Literal["KZ"]
     endpoint: HttpUrl
     bucket: NonEmptyString
+    retention: EvidenceRetention
 
     @field_validator("endpoint")
     @classmethod
@@ -144,13 +173,13 @@ class PilotSecrets(FrozenModel):
         )
 
     @classmethod
-    def from_environment(cls, *, secrets_dir: Path = Path("/run/secrets")) -> PilotSecrets:
+    def from_environment(cls) -> PilotSecrets:
         values: dict[str, SecretStr] = {}
         for name in cls.required_names():
             environment_name = f"PILOT_{name.upper()}"
             value = os.environ.get(environment_name)
             if value is None:
-                secret_file = secrets_dir / name
+                secret_file = DOCKER_SECRETS_DIR / name
                 try:
                     value = secret_file.read_text(encoding="utf-8").strip()
                 except FileNotFoundError as exc:

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from protector.pilot import config as pilot_config
 from protector.pilot.config import PilotSecrets, SiteConfig, load_site_config
 
 
@@ -35,6 +36,13 @@ def _site_payload() -> dict[str, object]:
             "country_code": "KZ",
             "endpoint": "https://object-storage.customer.example",
             "bucket": "kuzet-pilot-evidence",
+            "retention": {
+                "continuous_video_owner": "customer_nvr",
+                "continuous_video_storage_enabled": False,
+                "encoded_ring_buffer_seconds": 15,
+                "evidence_retention_days": 30,
+                "metadata_retention_days": 365,
+            },
         },
         "queues": {
             "decode": 64,
@@ -132,6 +140,34 @@ def test_site_requires_kazakhstan_https_storage_and_explicit_bounded_queues():
         SiteConfig.model_validate(unbounded_queue)
 
 
+def test_storage_keeps_continuous_video_in_customer_nvr_and_bounds_retention():
+    site = SiteConfig.model_validate(_site_payload())
+    retention = site.storage.retention
+    assert retention.continuous_video_owner == "customer_nvr"
+    assert retention.continuous_video_storage_enabled is False
+    assert retention.encoded_ring_buffer_seconds == 15
+
+    wrong_owner = _site_payload()
+    wrong_owner["storage"]["retention"]["continuous_video_owner"] = "kuzet"
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(wrong_owner)
+
+    continuous_storage = _site_payload()
+    continuous_storage["storage"]["retention"]["continuous_video_storage_enabled"] = True
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(continuous_storage)
+
+    unbounded_evidence = _site_payload()
+    unbounded_evidence["storage"]["retention"]["evidence_retention_days"] = 91
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(unbounded_evidence)
+
+    unbounded_metadata = _site_payload()
+    unbounded_metadata["storage"]["retention"]["metadata_retention_days"] = 366
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(unbounded_metadata)
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -158,6 +194,27 @@ def test_site_settings_are_immutable():
         site.queues.decode = 128
 
 
+def test_site_settings_freeze_nested_feeds_and_analytics():
+    site = SiteConfig.model_validate(_site_payload())
+
+    with pytest.raises(AttributeError):
+        site.ready_to_start.feeds.pop()
+    with pytest.raises(TypeError):
+        site.ready_to_start.feeds[0].analytics_hz["person"] = 1.0
+
+
+def test_immutable_settings_serialize_to_json_compatible_data():
+    site = SiteConfig.model_validate(_site_payload())
+
+    serialized = site.model_dump(mode="json")
+
+    assert serialized["ready_to_start"]["feeds"][0]["analytics_hz"] == {
+        "person": 10.0,
+        "fire_smoke": 1.0,
+        "weapon": 1.0,
+    }
+
+
 def test_secrets_load_only_from_environment_or_docker_secret_files(monkeypatch, tmp_path: Path):
     for name in PilotSecrets.required_names():
         monkeypatch.setenv(f"PILOT_{name.upper()}", f"env-{name}")
@@ -169,8 +226,12 @@ def test_secrets_load_only_from_environment_or_docker_secret_files(monkeypatch, 
         monkeypatch.delenv(f"PILOT_{name.upper()}")
         (tmp_path / name).write_text(f"file-{name}", encoding="utf-8")
 
-    docker_secrets = PilotSecrets.from_environment(secrets_dir=tmp_path)
+    monkeypatch.setattr(pilot_config, "DOCKER_SECRETS_DIR", tmp_path, raising=False)
+    docker_secrets = PilotSecrets.from_environment()
     assert docker_secrets.session_secret.get_secret_value() == "file-session_secret"
+
+    with pytest.raises(TypeError):
+        PilotSecrets.from_environment(secrets_dir=tmp_path)
 
 
 def test_yaml_rejects_committed_secret_values(tmp_path: Path):
