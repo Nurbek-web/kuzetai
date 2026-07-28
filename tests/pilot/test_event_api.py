@@ -34,7 +34,10 @@ TOTP_KEY = base64.urlsafe_b64encode(b"e" * 32).decode()
 def api_context(tmp_path: Path) -> tuple[TestClient, PilotRepository, str]:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'api.db'}")
     Base.metadata.create_all(engine)
-    repository = PilotRepository(create_session_factory(engine))
+    repository = PilotRepository(
+        create_session_factory(engine),
+        totp_encryption_key=TOTP_KEY,
+    )
     repository.add_site(site_id="site-1", name="Pilot School")
     repository.add_camera(
         camera_id="cam-01",

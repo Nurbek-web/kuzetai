@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
-import hmac
 import secrets
 import time
 from collections import OrderedDict, deque
@@ -18,7 +15,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-from protector.pilot.totp_envelope import decode_totp_envelope, encode_totp_envelope
+from protector.pilot.totp_envelope import TotpEnvelopeProtector
 
 Role = Literal["viewer", "operator", "admin"]
 
@@ -57,21 +54,9 @@ class PasswordService:
 class TotpService:
     """TOTP provisioning plus a versioned authenticated-encryption boundary."""
 
-    _VERSION = b"\x01"
-    _NONCE_BYTES = 16
-    _TAG_BYTES = 32
-    _AAD = b"kuzet-ai:totp-seed:v1"
-
     def __init__(self, *, encryption_key: str, issuer: str = "Kuzet AI") -> None:
         self._issuer = issuer
-        try:
-            key = base64.b64decode(encryption_key, altchars=b"-_", validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError("TOTP encryption key must be URL-safe base64") from exc
-        if len(key) != 32:
-            raise ValueError("TOTP encryption key must decode to exactly 32 bytes")
-        self._encryption_key = hmac.digest(key, b"encryption", "sha256")
-        self._authentication_key = hmac.digest(key, b"authentication", "sha256")
+        self._envelopes = TotpEnvelopeProtector(encryption_key)
 
     def enrol(self, username: str) -> TotpEnrolment:
         normalized = username.strip()
@@ -82,37 +67,10 @@ class TotpService:
         return TotpEnrolment(secret=secret, provisioning_uri=uri)
 
     def encrypt_secret(self, secret: str) -> str:
-        plaintext = secret.encode("ascii")
-        nonce = secrets.token_bytes(self._NONCE_BYTES)
-        ciphertext = self._xor_stream(plaintext, nonce)
-        authenticated = self._VERSION + nonce + ciphertext
-        tag = hmac.digest(
-            self._authentication_key,
-            self._AAD + authenticated,
-            "sha256",
-        )
-        return encode_totp_envelope(authenticated + tag)
+        return self._envelopes.encrypt_secret(secret)
 
     def decrypt_secret(self, encrypted: str) -> str:
-        try:
-            envelope = decode_totp_envelope(encrypted)
-            minimum = 1 + self._NONCE_BYTES + 1 + self._TAG_BYTES
-            if len(envelope) < minimum or envelope[:1] != self._VERSION:
-                raise ValueError
-            authenticated = envelope[: -self._TAG_BYTES]
-            provided_tag = envelope[-self._TAG_BYTES :]
-            expected_tag = hmac.digest(
-                self._authentication_key,
-                self._AAD + authenticated,
-                "sha256",
-            )
-            if not hmac.compare_digest(provided_tag, expected_tag):
-                raise ValueError
-            nonce = authenticated[1 : 1 + self._NONCE_BYTES]
-            ciphertext = authenticated[1 + self._NONCE_BYTES :]
-            return self._xor_stream(ciphertext, nonce).decode("ascii")
-        except (UnicodeDecodeError, binascii.Error, ValueError) as exc:
-            raise ValueError("invalid encrypted TOTP secret") from exc
+        return self._envelopes.decrypt_secret(encrypted)
 
     def match_current_counter(
         self,
@@ -131,19 +89,6 @@ class TotpService:
         if not totp.verify(code, for_time=checked_at, valid_window=0):
             return None
         return int(totp.timecode(checked_at))
-
-    def _xor_stream(self, value: bytes, nonce: bytes) -> bytes:
-        output = bytearray()
-        for counter in range((len(value) + 31) // 32):
-            output.extend(
-                hmac.digest(
-                    self._encryption_key,
-                    self._AAD + nonce + counter.to_bytes(4, "big"),
-                    "sha256",
-                )
-            )
-        return bytes(left ^ right for left, right in zip(value, output, strict=False))
-
 
 @dataclass(frozen=True)
 class SessionUser:

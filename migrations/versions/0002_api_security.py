@@ -5,24 +5,65 @@ Revises: 0001_pilot_core
 Create Date: 2026-07-28
 """
 
+import os
+from pathlib import Path
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import context, op
 
 from protector.pilot.totp_envelope import (
-    TOTP_ENVELOPE_PREFIX,
+    PORTABLE_TOTP_ENVELOPE_CHECK,
+    POSTGRESQL_TOTP_ENVELOPE_PREDICATE,
+    SQLITE_TOTP_ENVELOPE_PREDICATE,
+    TOTP_MIGRATION_KEY_INSTRUCTION,
     TOTP_ROTATION_INSTRUCTION,
-    validate_totp_envelope,
+    TotpEnvelopeProtector,
 )
 
 revision: str = "0002_api_security"
 down_revision: Union[str, Sequence[str], None] = "0001_pilot_core"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
+TOTP_SECRET_PATH = Path("/run/secrets/totp_encryption_key")
+
+
+def _configured_totp_key() -> str:
+    configured = context.config.attributes.get("totp_encryption_key")
+    if configured is None:
+        configured = os.getenv("PILOT_TOTP_ENCRYPTION_KEY")
+    if configured is None:
+        try:
+            configured = TOTP_SECRET_PATH.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as exc:
+            raise RuntimeError(TOTP_MIGRATION_KEY_INSTRUCTION) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"unable to read {TOTP_SECRET_PATH} for authenticated TOTP migration"
+            ) from exc
+    if hasattr(configured, "get_secret_value"):
+        configured = configured.get_secret_value()
+    if not isinstance(configured, str) or not configured:
+        raise RuntimeError(TOTP_MIGRATION_KEY_INSTRUCTION)
+    return configured
+
+
+def _constraint_sql(dialect_name: str) -> str:
+    if dialect_name == "postgresql":
+        return (
+            "totp_secret_encrypted IS NULL OR "
+            f"({POSTGRESQL_TOTP_ENVELOPE_PREDICATE})"
+        )
+    if dialect_name == "sqlite":
+        return (
+            "totp_secret_encrypted IS NULL OR "
+            f"({SQLITE_TOTP_ENVELOPE_PREDICATE})"
+        )
+    return PORTABLE_TOTP_ENVELOPE_CHECK
 
 
 def upgrade() -> None:
+    dialect_name = context.get_context().dialect.name
     if context.is_offline_mode():
         op.execute(
             sa.text(
@@ -33,10 +74,7 @@ def upgrade() -> None:
                         SELECT 1
                         FROM users
                         WHERE totp_secret_encrypted IS NOT NULL
-                          AND NOT (
-                              totp_secret_encrypted LIKE '{TOTP_ENVELOPE_PREFIX}%'
-                              AND length(totp_secret_encrypted) >= 76
-                          )
+                          AND NOT ({POSTGRESQL_TOTP_ENVELOPE_PREDICATE})
                     ) THEN
                         RAISE EXCEPTION USING
                             ERRCODE = '23514',
@@ -53,10 +91,12 @@ def upgrade() -> None:
                 "SELECT totp_secret_encrypted FROM users "
                 "WHERE totp_secret_encrypted IS NOT NULL"
             )
-        )
-        for encrypted_seed in encrypted_seeds.scalars():
+        ).scalars().all()
+        if encrypted_seeds:
             try:
-                validate_totp_envelope(encrypted_seed)
+                protector = TotpEnvelopeProtector(_configured_totp_key())
+                for encrypted_seed in encrypted_seeds:
+                    protector.authenticate(encrypted_seed)
             except ValueError as exc:
                 raise RuntimeError(TOTP_ROTATION_INSTRUCTION) from exc
 
@@ -64,9 +104,7 @@ def upgrade() -> None:
         batch_op.add_column(sa.Column("totp_last_accepted_counter", sa.BigInteger(), nullable=True))
         batch_op.create_check_constraint(
             "ck_users_totp_encrypted_envelope",
-            "totp_secret_encrypted IS NULL OR "
-            "(totp_secret_encrypted LIKE 'totp:v1:%' "
-            "AND length(totp_secret_encrypted) >= 76)",
+            _constraint_sql(dialect_name),
         )
 
 

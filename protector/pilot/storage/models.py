@@ -23,6 +23,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from protector.pilot.totp_envelope import PORTABLE_TOTP_ENVELOPE_CHECK
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -363,9 +365,7 @@ class UserModel(Base):
     __table_args__ = (
         CheckConstraint("role IN ('viewer', 'operator', 'admin')", name="ck_users_role"),
         CheckConstraint(
-            "totp_secret_encrypted IS NULL OR "
-            "(totp_secret_encrypted LIKE 'totp:v1:%' "
-            "AND length(totp_secret_encrypted) >= 76)",
+            PORTABLE_TOTP_ENVELOPE_CHECK,
             name="ck_users_totp_encrypted_envelope",
         ),
     )

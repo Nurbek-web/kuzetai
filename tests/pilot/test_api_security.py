@@ -43,7 +43,8 @@ def _lifespan_lock_worker(
     result_connection: object,
 ) -> None:
     repository = PilotRepository(
-        create_session_factory(create_engine("sqlite+pysqlite:///:memory:"))
+        create_session_factory(create_engine("sqlite+pysqlite:///:memory:")),
+        totp_encryption_key=TOTP_KEY,
     )
     try:
         app = create_app(
@@ -70,7 +71,10 @@ def _lifespan_lock_worker(
 def _repository(tmp_path: Path) -> PilotRepository:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / f'{uuid4()}.db'}")
     Base.metadata.create_all(engine)
-    repository = PilotRepository(create_session_factory(engine))
+    repository = PilotRepository(
+        create_session_factory(engine),
+        totp_encryption_key=TOTP_KEY,
+    )
     repository.add_site(site_id="site-1", name=f"School {uuid4()}")
     repository.add_camera(
         camera_id="cam-01",
@@ -163,7 +167,10 @@ def test_totp_counter_advance_is_atomic_and_persists_across_repository_instances
     with ThreadPoolExecutor(max_workers=8) as executor:
         accepted = list(executor.map(lambda _: accept(), range(8)))
 
-    restarted = PilotRepository(repository.session_factory)
+    restarted = PilotRepository(
+        repository.session_factory,
+        totp_encryption_key=TOTP_KEY,
+    )
     assert accepted.count(True) == 1
     assert (
         restarted.accept_totp_counter(
@@ -270,7 +277,8 @@ def test_two_real_app_lifespans_admit_one_process_and_stale_exit_releases_lock(
             assert worker.exitcode == 0
 
     repository = PilotRepository(
-        create_session_factory(create_engine("sqlite+pysqlite:///:memory:"))
+        create_session_factory(create_engine("sqlite+pysqlite:///:memory:")),
+        totp_encryption_key=TOTP_KEY,
     )
     recovered = create_app(
         repository=repository,

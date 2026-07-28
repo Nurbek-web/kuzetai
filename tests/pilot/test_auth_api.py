@@ -25,7 +25,10 @@ TOTP_KEY = base64.urlsafe_b64encode(b"t" * 32).decode()
 def auth_context(tmp_path: Path) -> tuple[TestClient, PilotRepository, dict[str, str]]:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'auth.db'}")
     Base.metadata.create_all(engine)
-    repository = PilotRepository(create_session_factory(engine))
+    repository = PilotRepository(
+        create_session_factory(engine),
+        totp_encryption_key=TOTP_KEY,
+    )
     password_service = PasswordService()
     totp_service = TotpService(encryption_key=TOTP_KEY)
     secrets: dict[str, str] = {}

@@ -32,7 +32,7 @@ from protector.pilot.storage.models import (
     SiteModel,
     UserModel,
 )
-from protector.pilot.totp_envelope import validate_totp_envelope
+from protector.pilot.totp_envelope import TOTP_ROTATION_INSTRUCTION, TotpEnvelopeProtector
 
 
 class IdempotencyConflictError(ValueError):
@@ -124,8 +124,18 @@ def _event_from_row(row: CandidateEventModel) -> CandidateEventV1:
 class PilotRepository:
     """Small transactional boundary shared by the API and journal replay worker."""
 
-    def __init__(self, session_factory: SessionFactory) -> None:
+    def __init__(
+        self,
+        session_factory: SessionFactory,
+        *,
+        totp_encryption_key: str | None = None,
+    ) -> None:
         self.session_factory = session_factory
+        self._totp_envelopes = (
+            TotpEnvelopeProtector(totp_encryption_key)
+            if totp_encryption_key is not None
+            else None
+        )
 
     def add_site(self, *, site_id: str, name: str, timezone_name: str = "Asia/Almaty") -> SiteModel:
         with self.session_factory.begin() as session:
@@ -346,7 +356,16 @@ class PilotRepository:
         is_active: bool = True,
     ) -> UserModel:
         if totp_secret_encrypted is not None:
-            validate_totp_envelope(totp_secret_encrypted)
+            if self._totp_envelopes is None:
+                raise ValueError(
+                    "TOTP protection key is required to authenticate a seed before persistence"
+                )
+            try:
+                self._totp_envelopes.authenticate(totp_secret_encrypted)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid encrypted TOTP secret; {TOTP_ROTATION_INSTRUCTION}"
+                ) from exc
         with self.session_factory.begin() as session:
             row = UserModel(
                 user_id=user_id,
