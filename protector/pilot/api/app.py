@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from protector.pilot.api.auth import LoginThrottle, PasswordService, SessionManager, TotpService
 from protector.pilot.api.dependencies import ApiContext
@@ -19,6 +20,13 @@ from protector.pilot.api.routes_auth import router as auth_router
 from protector.pilot.api.routes_cameras import router as cameras_router
 from protector.pilot.api.routes_events import router as events_router
 from protector.pilot.api.routes_internal import router as internal_router
+from protector.pilot.api.web import (
+    STATIC_ROOT,
+    EvidencePreviewProvider,
+)
+from protector.pilot.api.web import (
+    router as web_router,
+)
 from protector.pilot.storage.repositories import PilotRepository
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024
@@ -142,6 +150,50 @@ class RequestBodyLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+class PilotWebSecurityHeadersMiddleware:
+    """Apply a closed content policy to console and same-origin static responses."""
+
+    _headers = (
+        (
+            b"content-security-policy",
+            (
+                b"default-src 'none'; script-src 'self'; style-src 'self'; "
+                b"img-src 'self' data:; media-src 'self'; connect-src 'self'; "
+                b"form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+            ),
+        ),
+        (b"x-frame-options", b"DENY"),
+        (b"x-content-type-options", b"nosniff"),
+        (b"referrer-policy", b"no-referrer"),
+        (b"cache-control", b"no-store"),
+    )
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[[], Awaitable[dict[str, Any]]],
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/pilot"):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                protected_names = {name for name, _ in self._headers}
+                message["headers"] = [
+                    (name, value)
+                    for name, value in message.get("headers", ())
+                    if name.lower() not in protected_names
+                ] + list(self._headers)
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 def _configured_worker_count(explicit: int | None) -> int:
     configured = [
         value
@@ -171,6 +223,7 @@ def create_app(
     worker_count: int | None = None,
     max_request_body_bytes: int = MAX_REQUEST_BODY_BYTES,
     runtime_lock_path: str | Path | None = None,
+    evidence_preview_provider: EvidencePreviewProvider | None = None,
 ) -> FastAPI:
     """Construct an explicitly configured app; secrets have no committed defaults."""
 
@@ -210,7 +263,9 @@ def create_app(
         totp=TotpService(encryption_key=totp_encryption_key),
         throttle=throttle or LoginThrottle(),
         machine_token=machine_token,
+        evidence_preview_provider=evidence_preview_provider,
     )
+    app.add_middleware(PilotWebSecurityHeadersMiddleware)
     app.add_middleware(
         RequestBodyLimitMiddleware,
         max_body_bytes=max_request_body_bytes,
@@ -236,4 +291,6 @@ def create_app(
     app.include_router(cameras_router)
     app.include_router(events_router)
     app.include_router(internal_router)
+    app.mount("/pilot/static", StaticFiles(directory=STATIC_ROOT), name="pilot-static")
+    app.include_router(web_router)
     return app

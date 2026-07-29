@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}{% if event %}Event {{ event.event_id }}{% else %}Event not found{% endif %} · Kuzet AI{% endblock %}
+{% block body %}
+<main id="main-content" class="page-shell detail-shell">
+  <a class="back-link" href="/pilot">← Back to site overview</a>
+  {% if not event %}
+    <section class="panel">
+      <p class="eyebrow">Candidate event</p>
+      <h1>Event not found</h1>
+      <p>The requested event is unavailable or no longer retained.</p>
+    </section>
+  {% else %}
+    <section class="page-heading">
+      <div>
+        <p class="eyebrow">Candidate event · {{ event.event_id }}</p>
+        <h1>{{ event.module }} on {{ camera_name }}</h1>
+        <p class="candidate-boundary">Human confirmation required before any escalation.</p>
+      </div>
+      <span class="status-badge review-{{ event.review_status }}">{{ event.review_status }}</span>
+    </section>
+
+    <div class="detail-grid">
+      <section class="panel" aria-labelledby="event-summary-heading">
+        <h2 id="event-summary-heading">Event summary</h2>
+        <dl class="detail-facts">
+          <div><dt>Camera</dt><dd>{{ camera_name }} · {{ event.camera_id }}</dd></div>
+          <div><dt>Source timestamp</dt><dd>{{ utc_iso(event.opened_at) }}</dd></div>
+          <div><dt>Last seen</dt><dd>{{ utc_iso(event.last_seen_at) }}</dd></div>
+          <div><dt>Peak confidence</dt><dd>{{ (event.peak_confidence * 100)|round|int }}%</dd></div>
+          <div><dt>Model version</dt><dd>{{ event.model_artifact_id }}</dd></div>
+          <div><dt>Review state</dt><dd>{{ event.review_status }}</dd></div>
+        </dl>
+        <div class="tag-row">
+          <span class="tag" data-module="{{ event.module }}">{{ event.module }}</span>
+          <span class="tag gate-{{ event.gate_mode }}"
+                data-gate-mode="{{ event.gate_mode }}">{{ event.gate_mode }}</span>
+        </div>
+        <h3>Candidate reason</h3>
+        <p>{{ event.reason }}</p>
+      </section>
+
+      <section class="panel" aria-labelledby="evidence-heading"
+               data-evidence-status="{{ event.evidence_status }}">
+        <h2 id="evidence-heading">Evidence</h2>
+        {% if event.evidence_status == "ready" and preview_available %}
+          <video class="evidence-preview" controls preload="metadata"
+                 src="/pilot/evidence/{{ event.event_id }}">
+            Your browser cannot play this evidence preview.
+          </video>
+        {% elif event.evidence_status == "ready" %}
+          <p class="empty-state">Preview is unavailable on this deployment.</p>
+        {% elif event.evidence_status == "pending" %}
+          <p class="empty-state">Evidence is still being prepared.</p>
+        {% elif event.evidence_status == "failed" %}
+          <p class="empty-state state-error">Evidence preparation failed.</p>
+        {% else %}
+          <p class="empty-state">Evidence is unavailable for this candidate.</p>
+        {% endif %}
+      </section>
+    </div>
+
+    <section class="panel review-panel" aria-labelledby="review-heading">
+      <h2 id="review-heading">Human review</h2>
+      {% if can_review %}
+        <form data-review-form="{{ event.event_id }}" data-event-id="{{ event.event_id }}">
+          <div class="field">
+            <label for="review-notes">Operator notes</label>
+            <textarea id="review-notes" name="notes" maxlength="2000" rows="4"
+                      placeholder="Record the evidence used for this decision"></textarea>
+          </div>
+          <p class="form-message" data-form-message role="status" aria-live="polite"></p>
+          <div class="action-row">
+            <button class="button button-primary" type="submit" name="target_status"
+                    value="confirmed">Confirm candidate</button>
+            <button class="button button-danger" type="submit" name="target_status"
+                    value="rejected">Reject candidate</button>
+          </div>
+        </form>
+      {% elif event.gate_mode != "operator" %}
+        <p class="empty-state">Shadow analytics cannot be escalated. This signal is visible only
+          for evaluation.</p>
+      {% elif event.review_status != "candidate" %}
+        <p class="empty-state">This event has already been reviewed.</p>
+      {% else %}
+        <p class="empty-state">Your viewer role is read-only.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel" aria-labelledby="history-heading">
+      <h2 id="history-heading">Review history</h2>
+      {% if history %}
+        <ol class="history-list">
+          {% for review, username in history %}
+            <li>
+              <div>
+                <strong>{{ username }}</strong>
+                <span>{{ review.from_status }} → {{ review.to_status }}</span>
+              </div>
+              <time datetime="{{ utc_iso(review.reviewed_at) }}">
+                {{ utc_iso(review.reviewed_at) }}
+              </time>
+              {% if review.notes %}<p>{{ review.notes }}</p>{% endif %}
+            </li>
+          {% endfor %}
+        </ol>
+      {% else %}
+        <p class="empty-state">No review decisions recorded.</p>
+      {% endif %}
+    </section>
+  {% endif %}
+</main>
+{% endblock %}

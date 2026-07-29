@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Kuzet AI Pilot{% endblock %}</title>
+  <link rel="stylesheet" href="/pilot/static/pilot.css">
+  {% if current %}<meta name="csrf-token" content="{{ current.csrf_token }}">{% endif %}
+  <script src="/pilot/static/pilot.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <header class="site-header">
+    <a class="brand" href="/pilot" aria-label="Kuzet AI pilot dashboard">
+      <span class="brand-mark" aria-hidden="true">K</span>
+      <span>Kuzet AI <small>controlled pilot</small></span>
+    </a>
+    {% if current %}
+      <div class="session-actions">
+        <p class="session-label">{{ current.user.username }} · {{ current.user.role }}</p>
+        <button class="session-logout" type="button" data-logout>Sign out</button>
+      </div>
+    {% endif %}
+  </header>
+  {% block body %}{% endblock %}
+</body>
+</html>

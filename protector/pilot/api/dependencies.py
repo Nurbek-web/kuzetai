@@ -29,6 +29,7 @@ class ApiContext:
     totp: TotpService
     throttle: LoginThrottle
     machine_token: str = field(repr=False)
+    evidence_preview_provider: Any | None = field(default=None, repr=False)
 
 
 def get_context(request: Request) -> ApiContext:

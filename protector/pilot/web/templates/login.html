@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Kuzet AI Pilot{% endblock %}
+{% block body %}
+<main id="main-content" class="login-shell">
+  <section class="panel login-panel" aria-labelledby="login-heading">
+    <p class="eyebrow">Operator console</p>
+    <h1 id="login-heading">Sign in</h1>
+    <p class="muted">Use your password and current six-digit authenticator code.</p>
+    <form id="login-form" data-login-form>
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" required
+               maxlength="255">
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password"
+               required maxlength="1024">
+      </div>
+      <div class="field">
+        <label for="totp-code">Authenticator code</label>
+        <input id="totp-code" name="totp_code" type="text" autocomplete="one-time-code"
+               inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required>
+      </div>
+      <p class="form-message" data-form-message role="status" aria-live="polite"></p>
+      <button class="button button-primary" type="submit">Sign in securely</button>
+    </form>
+  </section>
+</main>
+{% endblock %}
