@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
+from protector.pilot.gates import is_operator_notification_eligible
 from protector.pilot.notifications.base import (
     ConfirmedEventView,
     EvidenceLinkSigner,
@@ -26,6 +27,7 @@ from protector.pilot.storage.models import (
     CameraModel,
     CandidateEventModel,
     DeliveryAttemptModel,
+    ModelArtifactModel,
     NotificationOutboxModel,
     ReviewModel,
     SiteModel,
@@ -375,9 +377,14 @@ class NotificationWorker:
                     SiteModel,
                     ReviewModel,
                     UserModel,
+                    ModelArtifactModel,
                 )
                 .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
                 .join(SiteModel, SiteModel.site_id == CameraModel.site_id)
+                .join(
+                    ModelArtifactModel,
+                    ModelArtifactModel.artifact_id == CandidateEventModel.model_artifact_id,
+                )
                 .join(
                     ReviewModel,
                     and_(
@@ -393,11 +400,15 @@ class NotificationWorker:
         )
         if len(rows) != 1:
             return None
-        event, camera, site, review, reviewer = rows[0]
+        event, camera, site, review, reviewer, artifact = rows[0]
         if (
             event.gate_mode != "operator"
             or event.review_status != "confirmed"
             or event.transition_history != "observation>candidate>confirmed"
+            or not is_operator_notification_eligible(
+                artifact_analytic=artifact.analytic,
+                event_module=event.module,
+            )
             or review.event_id != event.event_id
             or reviewer.role not in ("operator", "admin")
             or not reviewer.is_active
@@ -455,7 +466,7 @@ class NotificationWorker:
                     .where(NotificationOutboxModel.outbox_id == claim.outbox_id)
                     .with_for_update()
                 )
-                if not self._owns_lease(outbox, claim):
+                if not self._owns_lease(outbox, claim, now=now):
                     session.rollback()
                     return
                 attempt = session.get(DeliveryAttemptModel, claim.attempt_id)
@@ -530,7 +541,7 @@ class NotificationWorker:
                     .where(NotificationOutboxModel.outbox_id == claim.outbox_id)
                     .with_for_update()
                 )
-                if not self._owns_lease(outbox, claim):
+                if not self._owns_lease(outbox, claim, now=now):
                     session.rollback()
                     return
                 attempt = session.get(DeliveryAttemptModel, claim.attempt_id)
@@ -587,11 +598,18 @@ class NotificationWorker:
                 raise
 
     @staticmethod
-    def _owns_lease(outbox: NotificationOutboxModel | None, claim: _Claim) -> bool:
+    def _owns_lease(
+        outbox: NotificationOutboxModel | None,
+        claim: _Claim,
+        *,
+        now: datetime,
+    ) -> bool:
         return bool(
             outbox is not None
             and outbox.status == "delivering"
             and outbox.lease_token == claim.lease_token
+            and outbox.lease_expires_at is not None
+            and _as_utc(outbox.lease_expires_at) > now
         )
 
     def _dead_letter(

@@ -14,14 +14,37 @@ from pydantic import Field, field_validator, model_validator
 from protector.pilot.config import FrozenModel, NonEmptyString, SiteConfig
 from protector.pilot.domain import GateMode
 
-_OPERATOR_ELIGIBLE_ANALYTICS = frozenset(
-    {"person", "zone", "loitering", "line_crossing", "weapon", "fire_smoke"}
-)
+_OPERATOR_NOTIFICATION_CATEGORIES = {
+    "person": frozenset(
+        {"person", "restricted_zone", "intrusion", "loitering", "line_crossing"}
+    ),
+    "zone": frozenset({"restricted_zone", "intrusion"}),
+    "loitering": frozenset({"loitering"}),
+    "line_crossing": frozenset({"line_crossing"}),
+    "weapon": frozenset({"weapon"}),
+    "fire_smoke": frozenset({"fire_smoke"}),
+}
+_OPERATOR_ELIGIBLE_ANALYTICS = frozenset(_OPERATOR_NOTIFICATION_CATEGORIES)
 _SHADOW_ONLY_ANALYTICS = frozenset({"violence", "xclip", "vit", "fight", "fall"})
 PILOT_TARGET_GPU_ARCHITECTURE = "NVIDIA L4 (Ada)"
 PILOT_TARGET_COMPUTE_CAPABILITY = "8.9"
 PILOT_TENSORRT_VERSION = "10.16.0.72"
 _HEX = frozenset("0123456789abcdef")
+
+
+def is_operator_notification_eligible(
+    *,
+    artifact_analytic: str,
+    event_module: str,
+) -> bool:
+    """Bind a persisted model analytic to an approved pilot event category."""
+
+    if not isinstance(artifact_analytic, str) or not isinstance(event_module, str):
+        return False
+    return event_module in _OPERATOR_NOTIFICATION_CATEGORIES.get(
+        artifact_analytic,
+        frozenset(),
+    )
 
 
 def _require_utc(value: datetime) -> datetime:

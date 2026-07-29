@@ -35,6 +35,7 @@ from protector.pilot.storage.models import (
     Base,
     CandidateEventModel,
     DeliveryAttemptModel,
+    ModelArtifactModel,
     NotificationOutboxModel,
     SiteModel,
 )
@@ -264,6 +265,60 @@ def test_signed_application_link_is_event_bound_expiring_and_origin_safe() -> No
             event_id=EVENT_ID,
             now=NOW,
         )
+
+
+@pytest.mark.parametrize(
+    "application_origin",
+    (
+        "https://pilot.example.kz:bad",
+        "https://pilot.example.kz:0",
+        "https://pilot.example.kz:65536",
+        "https://pilot%2eexample.kz",
+        "https://pilot.example.kz%3A8443",
+        "https://pilot.example.kz\\@evil.example",
+        " https://pilot.example.kz",
+        "https://pilot.example.kz\t",
+        "https://pilot.example.kz/\n",
+        "https://Pilot.Example.kz",
+        "https://pilot.example.kz:443",
+        "https://pilot.example.kz:08443",
+        "https://pilot.example.kz.",
+        "https://pilot_example.kz",
+    ),
+)
+def test_signed_link_origin_rejects_malformed_or_noncanonical_authority(
+    application_origin: str,
+) -> None:
+    with pytest.raises(ValueError, match="application origin"):
+        EvidenceLinkSigner(
+            secret=SIGNING_SECRET,
+            application_origin=application_origin,
+            ttl=timedelta(minutes=5),
+        )
+
+
+def test_signed_link_origin_accepts_canonical_hostname_with_optional_valid_port() -> None:
+    signer = EvidenceLinkSigner(
+        secret=SIGNING_SECRET,
+        application_origin="https://pilot.example.kz:8443",
+        ttl=timedelta(minutes=5),
+    )
+
+    assert signer.issue(EVENT_ID, now=NOW).startswith(
+        f"https://pilot.example.kz:8443/pilot/events/{EVENT_ID}?"
+    )
+
+
+def test_signed_link_origin_does_not_expose_url_parser_errors() -> None:
+    with pytest.raises(ValueError) as captured:
+        EvidenceLinkSigner(
+            secret=SIGNING_SECRET,
+            application_origin="https://pilot.example.kz:not-a-port",
+            ttl=timedelta(minutes=5),
+        )
+
+    assert str(captured.value) == "application origin must be a bare canonical HTTPS origin"
+    assert captured.value.__cause__ is None
 
 
 def test_event_view_rejects_control_and_path_injection_and_hides_signed_link() -> None:
@@ -684,6 +739,84 @@ def test_concurrent_workers_claim_once_and_expired_lease_recovers(
         assert attempts[0].error == "delivery lease expired"
 
 
+@pytest.mark.parametrize("late_result", ["success", "failure"])
+def test_callback_after_lease_expiry_cannot_finalize_before_recovery(
+    tmp_path: Path,
+    late_result: str,
+) -> None:
+    repository = _repository(tmp_path, name=f"late-{late_result}")
+    _confirm(repository)
+    clock = MutableClock()
+
+    @dataclass
+    class LateConnector:
+        calls: int = 0
+
+        async def send_confirmed(
+            self,
+            event_view: ConfirmedEventView,
+            idempotency_key: str,
+        ) -> str:
+            del event_view, idempotency_key
+            self.calls += 1
+            clock.advance(6)
+            if late_result == "failure":
+                raise RuntimeError("late provider failure")
+            return "message-after-expiry"
+
+    late_connector = LateConnector()
+    stale_worker = NotificationWorker(
+        session_factory=repository.session_factory,
+        connector=late_connector,
+        link_signer=_signer(),
+        config=NotificationWorkerConfig(batch_size=1, lease_seconds=5),
+        now=clock,
+        pilot_site_id="site-1",
+    )
+
+    assert asyncio.run(stale_worker.run_once()) == 1
+    assert late_connector.calls == 1
+    with repository.session_factory() as session:
+        outbox = session.scalar(select(NotificationOutboxModel))
+        attempts = list(session.scalars(select(DeliveryAttemptModel)))
+        assert outbox is not None
+        assert outbox.status == "delivering"
+        assert outbox.lease_token is not None
+        assert outbox.lease_expires_at is not None
+        assert len(attempts) == 1
+        assert attempts[0].status == "sending"
+        assert attempts[0].response_reference is None
+        assert attempts[0].error is None
+
+    recovery_connector = RecordingConnector(response_reference="message-recovered")
+    recovery_worker = NotificationWorker(
+        session_factory=repository.session_factory,
+        connector=recovery_connector,
+        link_signer=_signer(),
+        config=NotificationWorkerConfig(batch_size=1, lease_seconds=5),
+        now=clock,
+        pilot_site_id="site-1",
+    )
+
+    assert asyncio.run(recovery_worker.run_once()) == 1
+    assert len(recovery_connector.sent) == 1
+    with repository.session_factory() as session:
+        outbox = session.scalar(select(NotificationOutboxModel))
+        attempts = list(
+            session.scalars(
+                select(DeliveryAttemptModel).order_by(DeliveryAttemptModel.attempt_number)
+            )
+        )
+        assert outbox is not None
+        assert outbox.status == "delivered"
+        assert [(attempt.attempt_number, attempt.status) for attempt in attempts] == [
+            (1, "failed"),
+            (2, "delivered"),
+        ]
+        assert attempts[0].error == "delivery lease expired"
+        assert attempts[1].response_reference == "message-recovered"
+
+
 def test_retry_backoff_is_capped_and_terminal_failure_is_sanitised(
     tmp_path: Path,
 ) -> None:
@@ -879,6 +1012,94 @@ def test_worker_never_claims_corrupt_ineligible_outbox(
         assert outbox is not None
         assert outbox.status == "dead_letter"
         assert list(session.scalars(select(DeliveryAttemptModel))) == []
+
+
+@pytest.mark.parametrize(
+    ("artifact_analytic", "event_module"),
+    (
+        ("fight", "fight"),
+        ("fall", "fall"),
+        ("violence", "violence"),
+        ("xclip", "xclip"),
+        ("vit", "vit"),
+        ("unknown-analytic", "unknown-analytic"),
+        ("person", "fight"),
+    ),
+)
+def test_confirmed_operator_flagged_excluded_or_mismatched_analytic_never_reaches_connector(
+    tmp_path: Path,
+    artifact_analytic: str,
+    event_module: str,
+) -> None:
+    repository = _repository(
+        tmp_path,
+        name=f"excluded-{artifact_analytic}-{event_module}",
+    )
+    _confirm(repository)
+    with repository.session_factory.begin() as session:
+        event = session.get(CandidateEventModel, str(EVENT_ID))
+        artifact = session.get(ModelArtifactModel, "person-v1")
+        assert event is not None
+        assert artifact is not None
+        event.module = event_module
+        artifact.analytic = artifact_analytic
+    connector = RecordingConnector()
+    worker = NotificationWorker(
+        session_factory=repository.session_factory,
+        connector=connector,
+        link_signer=_signer(),
+        config=NotificationWorkerConfig(),
+        now=MutableClock(),
+        pilot_site_id="site-1",
+    )
+
+    assert asyncio.run(worker.run_once()) == 0
+    assert connector.sent == []
+    with repository.session_factory() as session:
+        outbox = session.scalar(select(NotificationOutboxModel))
+        assert outbox is not None
+        assert outbox.status == "dead_letter"
+        assert list(session.scalars(select(DeliveryAttemptModel))) == []
+
+
+def test_worker_revalidates_persisted_analytic_policy_before_finalisation(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, name="analytic-finalisation")
+    _confirm(repository)
+
+    @dataclass
+    class MutatingAnalyticConnector:
+        async def send_confirmed(
+            self,
+            event_view: ConfirmedEventView,
+            idempotency_key: str,
+        ) -> str:
+            del event_view, idempotency_key
+            with repository.session_factory.begin() as session:
+                artifact = session.get(ModelArtifactModel, "person-v1")
+                assert artifact is not None
+                artifact.analytic = "fight"
+            return "message-possibly-sent"
+
+    worker = NotificationWorker(
+        session_factory=repository.session_factory,
+        connector=MutatingAnalyticConnector(),
+        link_signer=_signer(),
+        config=NotificationWorkerConfig(),
+        now=MutableClock(),
+        pilot_site_id="site-1",
+    )
+
+    assert asyncio.run(worker.run_once()) == 1
+    with repository.session_factory() as session:
+        outbox = session.scalar(select(NotificationOutboxModel))
+        attempt = session.scalar(select(DeliveryAttemptModel))
+        assert outbox is not None
+        assert outbox.status == "dead_letter"
+        assert attempt is not None
+        assert attempt.status == "failed"
+        assert attempt.response_reference is None
 
 
 def test_worker_claims_only_its_authoritative_pilot_site(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -13,6 +14,7 @@ from uuid import UUID
 
 MAX_LINK_TTL = timedelta(hours=24)
 MIN_LINK_TTL = timedelta(seconds=1)
+_HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -102,20 +104,43 @@ class EvidenceLinkSigner:
     ) -> None:
         if not isinstance(secret, bytes) or len(secret) < 32:
             raise ValueError("link signing secret must contain at least 32 bytes")
-        parsed = urlsplit(application_origin)
+        origin_error = "application origin must be a bare canonical HTTPS origin"
+        if (
+            not isinstance(application_origin, str)
+            or application_origin != application_origin.strip()
+            or any(character.isspace() for character in application_origin)
+            or _contains_control(application_origin)
+            or "\\" in application_origin
+            or "%" in application_origin
+        ):
+            raise ValueError(origin_error)
+        try:
+            parsed = urlsplit(application_origin)
+            port = parsed.port
+        except (TypeError, ValueError):
+            raise ValueError(origin_error) from None
         if parsed.scheme != "https":
             raise ValueError("application origin must use HTTPS")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("application origin must not contain credentials")
+        hostname = parsed.hostname
         if (
-            not parsed.hostname
+            not hostname
             or parsed.query
             or parsed.fragment
             or parsed.path not in ("", "/")
-            or _contains_control(application_origin)
-            or any(character.isspace() for character in application_origin)
+            or len(hostname) > 253
+            or any(_HOST_LABEL.fullmatch(label) is None for label in hostname.split("."))
+            or port == 0
+            or port == 443
         ):
-            raise ValueError("application origin must be a bare HTTPS origin")
+            raise ValueError(origin_error)
+        expected_authority = hostname if port is None else f"{hostname}:{port}"
+        if (
+            parsed.scheme != application_origin.split(":", maxsplit=1)[0]
+            or parsed.netloc != expected_authority
+        ):
+            raise ValueError(origin_error)
         if ttl < MIN_LINK_TTL or ttl > MAX_LINK_TTL:
             raise ValueError("signed link TTL must be at least one second and at most 24 hours")
         self._secret = secret

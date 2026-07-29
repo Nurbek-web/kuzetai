@@ -11,6 +11,7 @@ from protector.pilot.gates import (
     ModelGate,
     ShadowStageReportV1,
     TargetSiteReportV1,
+    is_operator_notification_eligible,
 )
 
 
@@ -212,6 +213,57 @@ def test_unknown_analytics_fail_closed_even_with_complete_operator_evidence():
 
     assert result.mode == "disabled"
     assert result.reasons == ("analytic is not approved for operator promotion",)
+
+
+@pytest.mark.parametrize(
+    ("artifact_analytic", "event_module"),
+    (
+        ("person", "person"),
+        ("person", "restricted_zone"),
+        ("person", "intrusion"),
+        ("person", "loitering"),
+        ("person", "line_crossing"),
+        ("zone", "restricted_zone"),
+        ("zone", "intrusion"),
+        ("loitering", "loitering"),
+        ("line_crossing", "line_crossing"),
+        ("weapon", "weapon"),
+        ("fire_smoke", "fire_smoke"),
+    ),
+)
+def test_operator_notification_policy_accepts_only_matching_pilot_categories(
+    artifact_analytic: str,
+    event_module: str,
+) -> None:
+    assert is_operator_notification_eligible(
+        artifact_analytic=artifact_analytic,
+        event_module=event_module,
+    )
+
+
+@pytest.mark.parametrize(
+    ("artifact_analytic", "event_module"),
+    (
+        ("fight", "fight"),
+        ("fall", "fall"),
+        ("violence", "violence"),
+        ("xclip", "xclip"),
+        ("vit", "vit"),
+        ("emotion", "emotion"),
+        ("person", "fight"),
+        ("fight", "restricted_zone"),
+        ("weapon", "fire_smoke"),
+        ("fire_smoke", "weapon"),
+    ),
+)
+def test_operator_notification_policy_fails_closed_for_shadow_unknown_and_mismatched_categories(
+    artifact_analytic: str,
+    event_module: str,
+) -> None:
+    assert not is_operator_notification_eligible(
+        artifact_analytic=artifact_analytic,
+        event_module=event_module,
+    )
 
 
 @pytest.mark.parametrize("report_builder", [_site_report_payload, _capacity_report_payload])
