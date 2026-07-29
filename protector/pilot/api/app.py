@@ -30,6 +30,7 @@ from protector.pilot.api.web import (
 from protector.pilot.storage.repositories import PilotRepository
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024
+MAX_PILOT_SITE_ID_LENGTH = 128
 DEFAULT_RUNTIME_LOCK_PATH = Path("/tmp/kuzet-ai-pilot-api.lock")
 
 
@@ -224,6 +225,7 @@ def create_app(
     max_request_body_bytes: int = MAX_REQUEST_BODY_BYTES,
     runtime_lock_path: str | Path | None = None,
     evidence_preview_provider: EvidencePreviewProvider | None = None,
+    pilot_site_id: str | None = None,
 ) -> FastAPI:
     """Construct an explicitly configured app; secrets have no committed defaults."""
 
@@ -235,6 +237,10 @@ def create_app(
         raise ValueError("in-process sessions and throttling require exactly one API worker")
     if max_request_body_bytes < 1:
         raise ValueError("request body limit must be positive")
+    if pilot_site_id is not None:
+        pilot_site_id = pilot_site_id.strip()
+        if not pilot_site_id or len(pilot_site_id) > MAX_PILOT_SITE_ID_LENGTH:
+            raise ValueError("pilot site identity must contain 1 to 128 characters")
     singleton = ProcessSingletonLock(
         runtime_lock_path
         or os.getenv("PILOT_API_LOCK_PATH")
@@ -264,6 +270,7 @@ def create_app(
         throttle=throttle or LoginThrottle(),
         machine_token=machine_token,
         evidence_preview_provider=evidence_preview_provider,
+        pilot_site_id=pilot_site_id,
     )
     app.add_middleware(PilotWebSecurityHeadersMiddleware)
     app.add_middleware(

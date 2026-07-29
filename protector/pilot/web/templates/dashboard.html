@@ -22,7 +22,9 @@
   <section aria-labelledby="camera-health-heading">
     <div class="section-heading">
       <h2 id="camera-health-heading">Camera health</h2>
-      <span class="count-badge">{{ cameras|length }} / 20 configured</span>
+      <span class="count-badge">
+        {% if load_error %}Unavailable{% else %}{{ cameras|length }} / 20 configured{% endif %}
+      </span>
     </div>
     <div class="camera-grid">
       {% for card in cameras %}

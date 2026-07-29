@@ -32,7 +32,8 @@ WEB_ROOT = Path(__file__).parent.parent / "web"
 STATIC_ROOT = WEB_ROOT / "static"
 MAX_EVENT_ROWS = 50
 MAX_PREVIEW_BYTES = 16 * 1024 * 1024
-ALLOWED_PREVIEW_MEDIA_TYPES = frozenset(("video/mp4", "image/jpeg"))
+EXPECTED_PILOT_CAMERA_COUNT = 20
+ALLOWED_PREVIEW_MEDIA_TYPES = frozenset(("video/mp4",))
 
 templates = Jinja2Templates(directory=WEB_ROOT / "templates")
 router = APIRouter(prefix="/pilot", tags=["operator-console"])
@@ -75,6 +76,10 @@ class EventRow:
     camera_name: str
 
 
+class PilotSiteConfigurationError(RuntimeError):
+    """The console cannot identify one authoritative pilot site."""
+
+
 def _current_view_session(request: Request, context: ApiContext) -> ServerSession | None:
     try:
         return get_current_session(request, context)
@@ -88,7 +93,24 @@ def _redirect_to_login() -> RedirectResponse:
     return RedirectResponse("/pilot/login", status_code=status.HTTP_303_SEE_OTHER)
 
 
-def _latest_camera_cards(context: ApiContext) -> list[CameraCard]:
+def _resolve_pilot_site_id(context: ApiContext) -> str:
+    if context.pilot_site_id is not None:
+        return context.pilot_site_id
+    with context.repository.session_factory() as database_session:
+        enabled_site_ids = list(
+            database_session.scalars(
+                select(CameraModel.site_id)
+                .where(CameraModel.enabled.is_(True))
+                .distinct()
+                .order_by(CameraModel.site_id)
+            )
+        )
+    if len(enabled_site_ids) != 1:
+        raise PilotSiteConfigurationError("pilot site identity is ambiguous")
+    return enabled_site_ids[0]
+
+
+def _latest_camera_cards(context: ApiContext, *, pilot_site_id: str) -> list[CameraCard]:
     latest_health_id = (
         select(CameraHealthSampleModel.health_sample_id)
         .where(CameraHealthSampleModel.camera_id == CameraModel.camera_id)
@@ -100,25 +122,32 @@ def _latest_camera_cards(context: ApiContext) -> list[CameraCard]:
         .correlate(CameraModel)
         .scalar_subquery()
     )
-    statement = (
-        select(CameraModel, CameraHealthSampleModel)
-        .outerjoin(
-            CameraHealthSampleModel,
-            CameraHealthSampleModel.health_sample_id == latest_health_id,
-        )
-        .order_by(CameraModel.camera_id)
-        .limit(20)
-    )
     with context.repository.session_factory() as database_session:
-        return [
+        statement = (
+            select(CameraModel, CameraHealthSampleModel)
+            .outerjoin(
+                CameraHealthSampleModel,
+                CameraHealthSampleModel.health_sample_id == latest_health_id,
+            )
+            .where(
+                CameraModel.site_id == pilot_site_id,
+                CameraModel.enabled.is_(True),
+            )
+            .order_by(CameraModel.camera_id)
+        )
+        cards = [
             CameraCard(camera=camera, health=health)
             for camera, health in database_session.execute(statement)
         ]
+    if len(cards) != EXPECTED_PILOT_CAMERA_COUNT:
+        raise RuntimeError("pilot site must have exactly 20 enabled cameras")
+    return cards
 
 
 def _filtered_events(
     context: ApiContext,
     *,
+    pilot_site_id: str,
     query: str | None,
     module: str | None,
     gate_mode: str | None,
@@ -127,6 +156,7 @@ def _filtered_events(
     statement = (
         select(CandidateEventModel, CameraModel.name)
         .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+        .where(CameraModel.site_id == pilot_site_id)
         .order_by(
             CandidateEventModel.opened_at.desc(),
             CandidateEventModel.event_id,
@@ -192,9 +222,11 @@ def dashboard(
     if current is None:
         return _redirect_to_login()
     try:
-        cameras = _latest_camera_cards(context)
+        pilot_site_id = _resolve_pilot_site_id(context)
+        cameras = _latest_camera_cards(context, pilot_site_id=pilot_site_id)
         events = _filtered_events(
             context,
+            pilot_site_id=pilot_site_id,
             query=q,
             module=module,
             gate_mode=gate_mode,
@@ -247,11 +279,24 @@ def event_detail(
     current = _current_view_session(request, context)
     if current is None:
         return _redirect_to_login()
+    try:
+        pilot_site_id = _resolve_pilot_site_id(context)
+    except PilotSiteConfigurationError:
+        return templates.TemplateResponse(
+            request=request,
+            name="event_detail.html",
+            context={"current": current, "event": None},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Cache-Control": "no-store"},
+        )
     with context.repository.session_factory() as database_session:
         event_row = database_session.execute(
             select(CandidateEventModel, CameraModel.name)
             .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
-            .where(CandidateEventModel.event_id == str(event_id))
+            .where(
+                CandidateEventModel.event_id == str(event_id),
+                CameraModel.site_id == pilot_site_id,
+            )
         ).one_or_none()
         if event_row is None:
             return templates.TemplateResponse(
@@ -313,6 +358,13 @@ def evidence_preview(
     provider = context.evidence_preview_provider
     if provider is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="preview unavailable")
+    try:
+        pilot_site_id = _resolve_pilot_site_id(context)
+    except PilotSiteConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="preview unavailable",
+        ) from exc
     with context.repository.session_factory() as database_session:
         evidence_is_ready = database_session.scalar(
             select(EvidenceModel.evidence_id)
@@ -320,8 +372,10 @@ def evidence_preview(
                 CandidateEventModel,
                 CandidateEventModel.event_id == EvidenceModel.event_id,
             )
+            .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
             .where(
                 CandidateEventModel.event_id == str(event_id),
+                CameraModel.site_id == pilot_site_id,
                 CandidateEventModel.evidence_status == "ready",
                 EvidenceModel.status == "ready",
             )

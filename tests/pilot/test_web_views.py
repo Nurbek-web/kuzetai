@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event as sqlalchemy_event
 
 from protector.pilot.api.app import create_app
 from protector.pilot.api.auth import PasswordService, SessionUser, TotpService
@@ -15,7 +16,7 @@ from protector.pilot.api.web import EvidencePreview
 from protector.pilot.domain import CandidateEventV1
 from protector.pilot.gates import CommercialRightsRecordV1, ModelArtifactV1
 from protector.pilot.storage.db import create_engine, create_session_factory
-from protector.pilot.storage.models import Base, CameraHealthSampleModel
+from protector.pilot.storage.models import Base, CameraHealthSampleModel, CameraModel
 from protector.pilot.storage.repositories import EvidenceInput, PilotRepository
 
 UTC = timezone.utc
@@ -29,6 +30,7 @@ SOURCE_REFERENCE_SECRET = "encoded-ring://private/cam-01"
 EVENT_READY = UUID("10000000-0000-0000-0000-000000000001")
 EVENT_SHADOW = UUID("10000000-0000-0000-0000-000000000002")
 EVENT_REVIEWED = UUID("10000000-0000-0000-0000-000000000003")
+EVENT_FOREIGN = UUID("10000000-0000-0000-0000-000000000004")
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,7 @@ def _make_context(
     *,
     evidence_provider: object | None = None,
     include_events: bool = True,
+    pilot_site_id: str | None = "site-1",
 ) -> WebContext:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'web.db'}")
     Base.metadata.create_all(engine)
@@ -228,6 +231,7 @@ def _make_context(
         totp_encryption_key=TOTP_KEY,
         machine_token=MACHINE_TOKEN,
         evidence_preview_provider=evidence_provider,
+        pilot_site_id=pilot_site_id,
     )
     return WebContext(
         client=TestClient(app, base_url="https://testserver"),
@@ -306,6 +310,154 @@ def test_dashboard_renders_exactly_twenty_cameras_using_each_latest_health_sampl
     _assert_html_security_headers(response)
 
 
+def test_dashboard_uses_only_enabled_cameras_from_the_explicit_pilot_site(
+    tmp_path: Path,
+) -> None:
+    context = _make_context(tmp_path)
+    context.repository.add_camera(
+        camera_id="000-disabled-history",
+        site_id="site-1",
+        name="Disabled historical camera",
+        source_reference=SOURCE_SECRET,
+        codec="h264",
+        enabled=False,
+    )
+    context.repository.add_site(site_id="site-2", name="Foreign School")
+    context.repository.add_camera(
+        camera_id="000-foreign",
+        site_id="site-2",
+        name="Foreign enabled camera",
+        source_reference=SOURCE_SECRET,
+        codec="h264",
+    )
+    context.authenticate("viewer")
+
+    response = context.client.get("/pilot")
+
+    assert response.status_code == 200
+    assert response.text.count('data-camera-card="') == 20
+    assert 'data-camera-card="cam-01"' in response.text
+    assert "000-disabled-history" not in response.text
+    assert "Disabled historical camera" not in response.text
+    assert "000-foreign" not in response.text
+    assert "Foreign enabled camera" not in response.text
+
+
+@pytest.mark.parametrize("enabled_count", (19, 21))
+def test_dashboard_fails_visibly_when_enabled_pilot_camera_count_is_not_twenty(
+    tmp_path: Path,
+    enabled_count: int,
+) -> None:
+    context = _make_context(tmp_path)
+    if enabled_count == 19:
+        with context.repository.session_factory.begin() as database_session:
+            camera = database_session.get(CameraModel, "cam-20")
+            assert camera is not None
+            camera.enabled = False
+    else:
+        context.repository.add_camera(
+            camera_id="cam-21",
+            site_id="site-1",
+            name="Camera 21",
+            source_reference=SOURCE_SECRET,
+            codec="h264",
+        )
+    context.authenticate("viewer")
+
+    response = context.client.get("/pilot")
+
+    assert response.status_code == 503
+    assert 'data-error-state role="alert"' in response.text
+    error_tag = response.text[
+        response.text.rfind("<p", 0, response.text.index("data-error-state"))
+        : response.text.index(">", response.text.index("data-error-state")) + 1
+    ]
+    assert "hidden" not in error_tag
+    assert f"{enabled_count} / 20 configured" not in response.text
+
+
+def test_dashboard_without_explicit_site_fails_closed_when_enabled_sites_are_ambiguous(
+    tmp_path: Path,
+) -> None:
+    context = _make_context(tmp_path, pilot_site_id=None)
+    context.repository.add_site(site_id="site-2", name="Foreign School")
+    context.repository.add_camera(
+        camera_id="foreign-cam",
+        site_id="site-2",
+        name="Foreign Camera",
+        source_reference=SOURCE_SECRET,
+        codec="h264",
+    )
+    context.authenticate("viewer")
+
+    response = context.client.get("/pilot")
+
+    assert response.status_code == 503
+    assert 'data-error-state role="alert"' in response.text
+    assert "foreign-cam" not in response.text
+
+
+def test_foreign_site_event_is_absent_and_detail_and_evidence_fail_closed(
+    tmp_path: Path,
+) -> None:
+    context = _make_context(tmp_path, evidence_provider=StubEvidenceProvider())
+    context.repository.add_site(site_id="site-2", name="Foreign School")
+    context.repository.add_camera(
+        camera_id="foreign-cam",
+        site_id="site-2",
+        name="Foreign Camera",
+        source_reference="rtsp://foreign-secret@10.0.0.99/live",
+        codec="h264",
+    )
+    context.repository.add_event(
+        _event(
+            event_id=EVENT_FOREIGN,
+            camera_id="foreign-cam",
+            module="person",
+            gate_mode="operator",
+            reason="foreign-site-only reason",
+            evidence_status="ready",
+        )
+    )
+    context.repository.add_evidence(
+        EvidenceInput(
+            evidence_id=UUID("20000000-0000-0000-0000-000000000002"),
+            event_id=EVENT_FOREIGN,
+            object_key="site-2/foreign-cam/private-evidence.mp4",
+            sha256="c" * 64,
+            codec="h264",
+            start_at=NOW - timedelta(seconds=2),
+            end_at=NOW + timedelta(seconds=4),
+            source_reference="encoded-ring://private/foreign-cam",
+            status="ready",
+        )
+    )
+    context.authenticate("viewer")
+
+    dashboard = context.client.get("/pilot")
+    detail = context.client.get(f"/pilot/events/{EVENT_FOREIGN}")
+    preview = context.client.get(f"/pilot/evidence/{EVENT_FOREIGN}")
+
+    assert dashboard.status_code == 200
+    assert str(EVENT_FOREIGN) not in dashboard.text
+    assert "foreign-site-only reason" not in dashboard.text
+    assert "Foreign Camera" not in dashboard.text
+    assert detail.status_code == 404
+    assert "Event not found" in detail.text
+    assert "foreign-site-only reason" not in detail.text
+    assert preview.status_code == 404
+    assert "foreign" not in preview.text.casefold()
+
+
+@pytest.mark.parametrize("pilot_site_id", ("", "   ", "x" * 129))
+def test_create_app_rejects_empty_or_overlong_pilot_site_identity(
+    tmp_path: Path,
+    pilot_site_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="pilot site identity"):
+        _make_context(tmp_path, pilot_site_id=pilot_site_id)
+
+
 @pytest.mark.parametrize(
     ("role", "should_review"),
     (("viewer", False), ("operator", True), ("admin", True)),
@@ -361,7 +513,7 @@ def test_dashboard_filters_and_search_are_bounded_server_side_and_escaped(
     assert "x" * 101 not in oversized.text
 
 
-def test_dashboard_has_explicit_empty_loading_and_error_states(tmp_path: Path) -> None:
+def test_dashboard_has_explicit_empty_and_loading_states(tmp_path: Path) -> None:
     context = _make_context(tmp_path, include_events=False)
     context.authenticate("viewer")
 
@@ -371,9 +523,40 @@ def test_dashboard_has_explicit_empty_loading_and_error_states(tmp_path: Path) -
     assert "No candidate events have been recorded" in response.text
     assert 'data-loading-state' in response.text
     assert "Loading latest status" in response.text
-    assert 'data-error-state' in response.text
-    assert "Unable to refresh" in response.text
     assert 'type="button" data-refresh' in response.text
+
+
+def test_dashboard_query_failure_returns_visible_error_state(tmp_path: Path) -> None:
+    context = _make_context(tmp_path)
+    context.authenticate("viewer")
+    engine = context.repository.session_factory.kw["bind"]
+
+    def fail_camera_health_query(
+        connection: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context_: object,
+        executemany: bool,
+    ) -> None:
+        del connection, cursor, parameters, context_, executemany
+        if "camera_health_samples" in statement and "FROM cameras" in statement:
+            raise RuntimeError("forced camera-health query failure")
+
+    sqlalchemy_event.listen(engine, "before_cursor_execute", fail_camera_health_query)
+    try:
+        response = context.client.get("/pilot")
+    finally:
+        sqlalchemy_event.remove(engine, "before_cursor_execute", fail_camera_health_query)
+
+    assert response.status_code == 503
+    assert "Unable to refresh the console" in response.text
+    error_tag = response.text[
+        response.text.rfind("<p", 0, response.text.index("data-error-state"))
+        : response.text.index(">", response.text.index("data-error-state")) + 1
+    ]
+    assert "hidden" not in error_tag
+    assert 'data-camera-card="' not in response.text
 
 
 def test_event_detail_renders_candidate_metadata_and_escaped_review_history(
@@ -466,6 +649,10 @@ def test_evidence_preview_is_same_origin_authenticated_bounded_and_no_store(
     (
         StubEvidenceProvider(payload=b"x" * (16 * 1024 * 1024 + 1)),
         StubEvidenceProvider(media_type="text/html"),
+        pytest.param(
+            StubEvidenceProvider(media_type="image/jpeg"),
+            id="jpeg-is-not-renderable-by-video-preview",
+        ),
         StubEvidenceProvider(error=RuntimeError("s3://private/internal-object")),
     ),
 )
@@ -478,7 +665,7 @@ def test_evidence_provider_failures_are_generic_and_fail_closed(
 
     response = context.client.get(f"/pilot/evidence/{EVENT_READY}")
 
-    assert response.status_code in (404, 502)
+    assert response.status_code == 502
     assert "private/internal-object" not in response.text
     assert OBJECT_KEY_SECRET not in response.text
 

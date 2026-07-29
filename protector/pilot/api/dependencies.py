@@ -30,6 +30,7 @@ class ApiContext:
     throttle: LoginThrottle
     machine_token: str = field(repr=False)
     evidence_preview_provider: Any | None = field(default=None, repr=False)
+    pilot_site_id: str | None = None
 
 
 def get_context(request: Request) -> ApiContext:
