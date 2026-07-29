@@ -2023,11 +2023,11 @@ class EvidenceCoordinator:
                         self._publisher.publish(source, evidence)
             else:
                 self._publisher.mark_ready(evidence)
-        except ObjectIntegrityError:
+        except ObjectIntegrityError as primary:
             try:
                 self._publisher.mark_failed(evidence)
             except Exception as transition_error:
-                errors: list[Exception] = [transition_error]
+                errors: list[Exception] = [primary, transition_error]
                 errors.extend(
                     self._release_media_preserving_record(record.reservation_id)
                 )

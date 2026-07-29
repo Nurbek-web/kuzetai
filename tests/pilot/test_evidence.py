@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 
+from protector.pilot.runtime import _limit_exec
 from protector.pilot.runtime.evidence import (
     ClipAssembler,
     ClipAssemblyError,
@@ -94,6 +95,7 @@ class RecordingMediaProbe:
             profile="High" if self.source_compatible or is_output else "High 10",
             pixel_format="yuv420p" if self.source_compatible or is_output else "yuv420p10le",
             browser_compatible=self.source_compatible or is_output,
+            first_packet_keyframe=True,
         )
 
 
@@ -589,6 +591,54 @@ def test_ffprobe_rejects_zero_exit_media_with_invalid_nal_diagnostics(
         FfprobeMediaProbe().probe(tmp_path / "partial.mp4")
 
 
+@pytest.mark.parametrize(
+    ("packet_flags", "accepted"),
+    [
+        (["__", "K_"], False),
+        (["K_", "__"], True),
+    ],
+)
+def test_ffprobe_requires_first_selected_video_packet_to_be_keyframed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    packet_flags: list[str],
+    accepted: bool,
+) -> None:
+    payload = {
+        "streams": [
+            {
+                "codec_name": "h264",
+                "profile": "High",
+                "pix_fmt": "yuv420p",
+            }
+        ],
+        "format": {"duration": "6.0"},
+        "packets": [
+            {"size": "128", "flags": flags}
+            for flags in packet_flags
+        ],
+    }
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=(),
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        ),
+    )
+    probe = FfprobeMediaProbe()
+
+    if not accepted:
+        with pytest.raises(ClipAssemblyError, match="probe failed"):
+            probe.probe(tmp_path / "late-keyframe.mp4")
+        return
+
+    media = probe.probe(tmp_path / "first-keyframe.mp4")
+    assert media.first_packet_keyframe is True
+
+
 @pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="portable FFmpeg descriptor smoke requires local ffmpeg and ffprobe",
@@ -666,6 +716,95 @@ def test_real_ffmpeg_assembles_and_probes_seekable_workspace_descriptor(
         os.fstat(descriptor)
 
 
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="portable FFmpeg limiter smoke requires local ffmpeg and ffprobe",
+)
+def test_real_ffmpeg_child_never_exceeds_tiny_workspace_file_ceiling(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "limited-source.mp4"
+    subprocess.run(
+        (
+            shutil.which("ffmpeg") or "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x240:r=24:d=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ),
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    payload = source.read_bytes()
+    ring = _ring(
+        tmp_path / "limited-spool",
+        Clock(),
+        max_camera_bytes=len(payload) * 4,
+        max_spool_bytes=len(payload) * 4,
+    )
+    for offset in (0, 2, 4):
+        _append(ring, offset=offset, payload=payload)
+    reservation = ring.reserve(
+        reservation_id="limited-descriptor",
+        camera_id="camera-01",
+        stream_epoch="default",
+        event_at=NOW + timedelta(seconds=3),
+        pre_roll=3,
+        post_roll=3,
+    )
+    ceiling = 512
+    workspace = PreviewWorkspace(
+        tmp_path / "limited-previews",
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=4_096,
+        max_file_bytes=ceiling,
+        clock=lambda: NOW,
+    )
+    target = workspace.prepare("limited-descriptor", kind="final")
+    descriptor = target.descriptor
+
+    with pytest.raises(ClipAssemblyError):
+        ClipAssembler(
+            FfmpegCodecTool(),
+            FfprobeMediaProbe(),
+            max_nvenc_jobs=1,
+        ).assemble(reservation, target)
+
+    assert os.fstat(descriptor).st_size <= ceiling
+    assert workspace.cleanup("limited-descriptor") == []
+    assert not tuple(workspace.root.glob(".kuzet-preview-*.tmp"))
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_limit_exec_fails_closed_when_posix_file_limit_cannot_be_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _limit_exec.resource,
+        "setrlimit",
+        lambda *_args: (_ for _ in ()).throw(OSError("limit unavailable")),
+    )
+    monkeypatch.setattr(
+        _limit_exec.os,
+        "execvpe",
+        lambda *_args: pytest.fail("command must not execute without a file limit"),
+    )
+
+    assert _limit_exec.main(["512", "--", "ffmpeg", "-version"]) == 78
+
+
 def test_splitmux_contract_is_encoded_bounded_and_uses_incomplete_paths(tmp_path: Path) -> None:
     spec = gstreamer_splitmux_sink_spec(
         spool_root=tmp_path / "spool",
@@ -712,6 +851,7 @@ def test_splitmux_factory_attaches_bounded_writer_and_atomically_adopts_closed_f
         ring=ring,
         fragment_seconds=2,
         max_fragment_bytes=100,
+        packet_probe=lambda _: True,
     )
     source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
 
@@ -819,6 +959,7 @@ def test_splitmux_messages_map_source_time_adopt_immediately_and_survive_rebuild
         ring=ring,
         fragment_seconds=2,
         max_fragment_bytes=100,
+        packet_probe=lambda _: True,
     )
     source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
     sink = factory(Gst, source)
@@ -869,6 +1010,7 @@ def test_splitmux_messages_map_source_time_adopt_immediately_and_survive_rebuild
         ring=restarted,
         fragment_seconds=2,
         max_fragment_bytes=100,
+        packet_probe=lambda _: True,
     )
     rebuilt_sink = rebuilt(Gst, source)
     second_part = Path(
@@ -907,6 +1049,83 @@ def test_splitmux_messages_map_source_time_adopt_immediately_and_survive_rebuild
     assert second is not None
     assert second.stream_epoch == "epoch-2"
     assert len(restarted.fragments("camera-01")) == 2
+
+
+@pytest.mark.parametrize("reported_keyframe", (None, True))
+def test_splitmux_bus_keyframe_claim_never_replaces_closed_packet_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reported_keyframe: bool | None,
+) -> None:
+    class Structure:
+        def __init__(self, name: str, **values: object) -> None:
+            self.name = name
+            self.values = values
+
+        def get_name(self) -> str:
+            return self.name
+
+        def get_value(self, name: str) -> object:
+            return self.values[name]
+
+    monkeypatch.setattr(
+        FfprobeMediaProbe,
+        "probe",
+        lambda *_args, **_kwargs: MediaInfo(
+            duration_seconds=2.0,
+            codec="h264",
+            profile="High",
+            pixel_format="yuv420p",
+            browser_compatible=True,
+            first_packet_keyframe=False,
+        ),
+    )
+    ring = _ring(tmp_path / "missing-keyframe-spool", Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    incoming = ring.root / ".incoming" / "missing-keyframe"
+    incoming.mkdir(parents=True)
+    part = incoming / "00001.part.mp4"
+    part.write_bytes(b"closed-fragment")
+    mapper = SourceTimeMapper()
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=1_000_000_000,
+        source_time=NOW,
+    )
+    opened_values: dict[str, object] = {"running-time": 0}
+    if reported_keyframe is not None:
+        opened_values["starts-with-keyframe"] = reported_keyframe
+    factory.handle_splitmux_message(
+        camera_id="camera-01",
+        codec="h264",
+        stream_epoch="epoch-1",
+        structure=Structure(
+            "splitmuxsink-fragment-opened",
+            location=str(part),
+            **opened_values,
+        ),
+        source_time_mapper=mapper,
+    )
+
+    with pytest.raises(ValueError, match="keyframe"):
+        factory.handle_splitmux_message(
+            camera_id="camera-01",
+            codec="h264",
+            stream_epoch="epoch-1",
+            structure=Structure(
+                "splitmuxsink-fragment-closed",
+                location=str(part),
+                **{"running-time": 2_000_000_000},
+            ),
+            source_time_mapper=mapper,
+        )
+
+    assert ring.fragments("camera-01") == ()
 
 
 def test_source_time_mapping_keeps_one_canonical_transform_across_rtcp_jitter() -> None:

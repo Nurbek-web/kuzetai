@@ -14,6 +14,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Callable, Mapping
@@ -935,7 +936,7 @@ class _OpenedSplitMuxFragment:
     camera_id: str
     location: Path
     running_time_ns: int
-    starts_with_keyframe: bool
+    starts_with_keyframe: bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -955,6 +956,7 @@ class SplitMuxEvidenceSinkFactory:
         ring: EncodedFragmentRing,
         fragment_seconds: int,
         max_fragment_bytes: int,
+        packet_probe: Callable[[Path], bool] | None = None,
     ) -> None:
         if fragment_seconds not in (1, 2):
             raise ValueError("splitmux fragments must be 1-2 seconds")
@@ -963,6 +965,7 @@ class SplitMuxEvidenceSinkFactory:
         self.ring = ring
         self.fragment_seconds = fragment_seconds
         self.max_fragment_bytes = max_fragment_bytes
+        self._packet_probe = packet_probe or self._probe_first_packet_keyframe
         self._opened: dict[tuple[str, Path], _OpenedSplitMuxFragment] = {}
         self._writers: dict[int, _WriterBinding] = {}
         self._lock = threading.RLock()
@@ -1110,17 +1113,16 @@ class SplitMuxEvidenceSinkFactory:
             keyframe_value = self._structure_value(
                 structure,
                 "starts-with-keyframe",
-                default=True,
+                default=None,
             )
-            if type(keyframe_value) is not bool:
+            if keyframe_value is not None and type(keyframe_value) is not bool:
                 raise ValueError("splitmux keyframe state must be boolean")
+            if keyframe_value is False:
+                raise ValueError("splitmux fragment does not start with a keyframe")
             opened = _OpenedSplitMuxFragment(
                 camera_id=camera_id,
                 location=location,
                 running_time_ns=running_value,
-                # splitmux opens on the keyframe requested by this factory's
-                # send-keyframe-requests contract. A supplied adapter flag can
-                # only tighten that guarantee.
                 starts_with_keyframe=keyframe_value,
             )
             with self._lock:
@@ -1133,6 +1135,16 @@ class SplitMuxEvidenceSinkFactory:
             opened = self._opened.pop(key, None)
         if opened is None or running_value <= opened.running_time_ns:
             raise ValueError("splitmux close did not match a valid open fragment")
+        try:
+            first_packet_keyframe = self._packet_probe(location)
+        except ClipAssemblyError as exc:
+            raise ValueError(
+                "closed splitmux fragment keyframe truth could not be derived"
+            ) from exc
+        if not first_packet_keyframe:
+            raise ValueError(
+                "closed splitmux fragment does not start with a keyframe"
+            )
         start_at = source_time_mapper.map(
             camera_id=camera_id,
             stream_epoch=stream_epoch,
@@ -1149,9 +1161,13 @@ class SplitMuxEvidenceSinkFactory:
             start_at=start_at,
             end_at=end_at,
             codec=codec,
-            starts_with_keyframe=opened.starts_with_keyframe,
+            starts_with_keyframe=True,
             stream_epoch=stream_epoch,
         )
+
+    @staticmethod
+    def _probe_first_packet_keyframe(path: Path) -> bool:
+        return FfprobeMediaProbe().probe(path).first_packet_keyframe
 
     @staticmethod
     def _structure_value(
@@ -1226,6 +1242,7 @@ class MediaInfo:
     profile: str
     pixel_format: str
     browser_compatible: bool
+    first_packet_keyframe: bool
 
 
 class MediaProbe(Protocol):
@@ -1296,11 +1313,16 @@ class FfprobeMediaProbe:
             profile = str(stream.get("profile", ""))
             pixel_format = str(stream.get("pix_fmt", "")).lower()
             packets = payload["packets"]
+            first_packet_keyframe = (
+                isinstance(packets, list)
+                and bool(packets)
+                and "K" in str(packets[0].get("flags", ""))
+            )
             if (
                 not isinstance(packets, list)
                 or not packets
                 or any(int(packet["size"]) <= 0 for packet in packets)
-                or not any("K" in str(packet.get("flags", "")) for packet in packets)
+                or not first_packet_keyframe
             ):
                 raise ValueError("media packet structure is invalid")
         except (
@@ -1326,6 +1348,7 @@ class FfprobeMediaProbe:
             profile=profile,
             pixel_format=pixel_format,
             browser_compatible=browser_compatible,
+            first_packet_keyframe=first_packet_keyframe,
         )
 
 
@@ -1447,6 +1470,18 @@ class FfmpegCodecTool:
         nvenc: bool,
         pass_fds: tuple[int, ...],
     ) -> None:
+        if not isinstance(output, AssemblyOutput):
+            raise ClipAssemblyError(
+                "production ffmpeg assembly requires a finite descriptor output"
+            )
+        if (
+            not isinstance(output.max_bytes, int)
+            or isinstance(output.max_bytes, bool)
+            or output.max_bytes <= 0
+        ):
+            raise ClipAssemblyError(
+                "ffmpeg output byte ceiling must be finite and positive"
+            )
         try:
             with tempfile.TemporaryDirectory(
                 prefix="kuzet-ffmpeg-concat-"
@@ -1468,8 +1503,16 @@ class FfmpegCodecTool:
                     else self.remux_command(concat_file, output)
                 )
                 command = (self.executable, *command[1:])
+                limited_command = (
+                    sys.executable,
+                    "-m",
+                    "protector.pilot.runtime._limit_exec",
+                    str(output.max_bytes),
+                    "--",
+                    *command,
+                )
                 subprocess.run(
-                    command,
+                    limited_command,
                     check=True,
                     capture_output=True,
                     timeout=120,

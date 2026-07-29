@@ -1705,6 +1705,117 @@ def test_remote_ready_identity_mismatch_fails_terminally_without_inference(
     assert client.objects[("evidence", remote_key)]["Body"] == wrong
 
 
+@pytest.mark.parametrize("mismatch_location", ("remote", "local"))
+def test_ready_identity_mismatch_preserves_primary_across_failed_transition_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch_location: str,
+) -> None:
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    seed = tmp_path / f"{mismatch_location}-ordered-mismatch-seed.mp4"
+    seed.write_bytes(b"seed")
+    pending = _evidence(event, seed)
+    root = tmp_path / f"{mismatch_location}-ordered-mismatch-previews"
+    reservation_id = f"{mismatch_location}-ordered-mismatch"
+    workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    target = workspace.prepare(reservation_id, kind="final", evidence=pending)
+    target.write_bytes(b"trusted-final")
+    registered = workspace.register(
+        reservation_id,
+        kind="final",
+        path=target,
+        evidence=pending,
+    )
+    bounded = replace(
+        pending,
+        sha256=registered.sha256,
+        start_at=NOW - timedelta(seconds=2),
+        end_at=NOW + timedelta(seconds=4),
+        status="pending",
+    )
+    workspace.persist_ready_intent(
+        reservation_id,
+        evidence=bounded,
+        size_bytes=registered.size_bytes,
+    )
+    final_path = workspace.path_for(reservation_id, kind="final")
+    client = FakeS3Client()
+    remote_key = f"pilot-evidence/{bounded.object_key}"
+    wrong = b"different-identity"
+    if mismatch_location == "remote":
+        client.objects[("evidence", remote_key)] = {
+            "Body": wrong,
+            "ChecksumSHA256": base64.b64encode(
+                hashlib.sha256(wrong).digest()
+            ).decode(),
+            "ServerSideEncryption": "AES256",
+            "LastModified": NOW,
+        }
+    else:
+        final_path.write_bytes(wrong)
+    workspace.close()
+
+    original_finalize = repository.finalize_evidence
+
+    def unavailable(*_: object, **__: object) -> object:
+        raise RuntimeError("failed transition unavailable")
+
+    monkeypatch.setattr(repository, "finalize_evidence", unavailable)
+    first_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(ExceptionGroup) as first_failure:
+        EvidenceCoordinator(
+            ring=_RecordingRing(),
+            assembler=_FinalBytesAssembler(),
+            publisher=EvidencePublisher(
+                store=_s3_store(client),
+                repository=repository,
+            ),
+            preview_workspace=first_workspace,
+        )
+
+    assert [type(error) for error in first_failure.value.exceptions] == [
+        ObjectIntegrityError,
+        RuntimeError,
+    ]
+    assert first_workspace.item_count == 1
+    first_workspace.close()
+
+    monkeypatch.setattr(repository, "finalize_evidence", original_finalize)
+    second_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    EvidenceCoordinator(
+        ring=_RecordingRing(),
+        assembler=_FinalBytesAssembler(),
+        publisher=EvidencePublisher(
+            store=_s3_store(client),
+            repository=repository,
+        ),
+        preview_workspace=second_workspace,
+    )
+
+    assert repository.get_event(event.event_id).evidence_status == "failed"
+    assert second_workspace.item_count == 0
+
+
 def test_restart_reconciliation_keeps_identity_until_second_restart_succeeds(
     tmp_path: Path,
 ) -> None:

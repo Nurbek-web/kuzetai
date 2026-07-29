@@ -792,6 +792,7 @@ def test_splitmux_bus_close_maps_source_time_and_adopts_through_live_runtime(
         ring=ring,
         fragment_seconds=2,
         max_fragment_bytes=100,
+        packet_probe=lambda _: True,
     )
     graph = DeepStreamGraphSpec.from_site(_site())
     source = graph.sources[0]
