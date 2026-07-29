@@ -1,0 +1,13 @@
+**
+!alembic.ini
+!pyproject.toml
+!migrations/
+!migrations/**
+!protector/
+!protector/**
+!scripts/
+!scripts/pilot/
+!scripts/pilot/**
+!deploy/
+!deploy/pilot/
+!deploy/pilot/**

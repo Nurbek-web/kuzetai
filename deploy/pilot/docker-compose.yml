@@ -1,9 +1,8 @@
 name: kuzet-controlled-pilot
 
-# The NVIDIA data plane is deliberately separate. It is built from the
-# digest-pinned deploy/pilot/Dockerfile.runtime and accepted only on the target
-# L4 host. This Compose project runs one shared control plane, never one model
-# stack per camera.
+# The NVIDIA data plane remains a separate, digest-pinned container on the
+# target host. This project provisions one shared control plane for one exact
+# reviewed site and never launches one model stack per camera.
 
 x-service-hardening: &service-hardening
   read_only: true
@@ -18,6 +17,10 @@ x-service-hardening: &service-hardening
       max-size: 10m
       max-file: "3"
 
+x-api-image: &api-image
+  image: ${PILOT_API_IMAGE_REPOSITORY:?set-reviewed-api-repository}@sha256:${PILOT_API_IMAGE_SHA256:?set-reviewed-64hex-content-digest}
+  user: "10001:10001"
+
 services:
   postgres:
     <<: *service-hardening
@@ -25,10 +28,10 @@ services:
     user: "999:999"
     environment:
       POSTGRES_DB: kuzet_pilot
-      POSTGRES_USER: kuzet
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_USER: kuzet_bootstrap
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
     secrets:
-      - postgres_password
+      - postgres_admin_password
     volumes:
       - postgres_data:/var/lib/postgresql/data
     tmpfs:
@@ -37,7 +40,7 @@ services:
     networks:
       - data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "kuzet", "-d", "kuzet_pilot"]
+      test: ["CMD", "pg_isready", "-U", "kuzet_bootstrap", "-d", "kuzet_pilot"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -47,14 +50,116 @@ services:
     pids_limit: 256
     deploy:
       resources:
-        limits:
-          cpus: "2.0"
-          memory: 2G
+        limits: {cpus: "2.0", memory: 2G}
+
+  role-bootstrap:
+    <<: [*service-hardening, *api-image]
+    restart: "no"
+    entrypoint: ["python", "/app/scripts/pilot/bootstrap_roles.py"]
+    command:
+      - --phase=ensure
+      - --admin-database-url-secret=/run/secrets/admin_database_url
+      - --migrator-password-secret=/run/secrets/migrator_database_password
+      - --api-password-secret=/run/secrets/api_database_password
+      - --retention-password-secret=/run/secrets/retention_database_password
+    secrets:
+      - admin_database_url
+      - migrator_database_password
+      - api_database_password
+      - retention_database_password
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - data
+    depends_on:
+      postgres: {condition: service_healthy}
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256M}
+
+  migrate:
+    <<: [*service-hardening, *api-image]
+    restart: "no"
+    entrypoint: ["python", "/app/scripts/pilot/migrate.py"]
+    command:
+      - --database-url-secret=/run/secrets/migration_database_url
+      - --config=/app/alembic.ini
+    secrets:
+      - migration_database_url
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - data
+    depends_on:
+      role-bootstrap: {condition: service_completed_successfully}
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 512M}
+
+  role-grants:
+    <<: [*service-hardening, *api-image]
+    restart: "no"
+    entrypoint: ["python", "/app/scripts/pilot/bootstrap_roles.py"]
+    command:
+      - --phase=grants
+      - --admin-database-url-secret=/run/secrets/admin_database_url
+    secrets:
+      - admin_database_url
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - data
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256M}
+
+  provision:
+    <<: [*service-hardening, *api-image]
+    restart: "no"
+    entrypoint: ["python", "/app/scripts/pilot/provision.py"]
+    command:
+      - --database-url-secret=/run/secrets/migration_database_url
+      - --site-id=${PILOT_SITE_ID:?set-authoritative-site-id}
+      - --site-name=${PILOT_SITE_NAME:?set-authoritative-site-name}
+      - --timezone=${PILOT_SITE_TIMEZONE:-Asia/Almaty}
+      - --site-config=/run/config/site.yaml
+      - --site-config-sha256=${PILOT_SITE_CONFIG_SHA256:?set-reviewed-site-config-sha256}
+      - --runtime-manifest=/run/config/runtime-manifest.yaml
+      - --runtime-manifest-sha256=${PILOT_RUNTIME_MANIFEST_SHA256:?set-reviewed-runtime-manifest-sha256}
+      - --measured-capacity-report=/run/config/measured-capacity.yaml
+      - --measured-capacity-sha256=${PILOT_MEASURED_CAPACITY_SHA256:?set-target-measured-capacity-sha256}
+    secrets:
+      - migration_database_url
+    volumes:
+      - ${PILOT_SITE_CONFIG_PATH:?set-reviewed-site-config-path}:/run/config/site.yaml:ro
+      - ${PILOT_RUNTIME_MANIFEST_PATH:?set-reviewed-runtime-manifest-path}:/run/config/runtime-manifest.yaml:ro
+      - ${PILOT_MEASURED_CAPACITY_PATH:?set-signed-target-capacity-path}:/run/config/measured-capacity.yaml:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - data
+    depends_on:
+      role-grants: {condition: service_completed_successfully}
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 512M}
 
   api:
-    <<: *service-hardening
-    image: ${PILOT_API_IMAGE_REPOSITORY:?set-reviewed-api-repository}@sha256:${PILOT_API_IMAGE_SHA256:?set-reviewed-64hex-content-digest}
-    user: "10001:10001"
+    <<: [*service-hardening, *api-image]
     environment:
       PILOT_SITE_ID: ${PILOT_SITE_ID:?set-authoritative-site-id}
       PILOT_PUBLIC_ORIGIN: ${PILOT_PUBLIC_ORIGIN:?set-https-public-origin}
@@ -65,17 +170,13 @@ services:
       - totp_encryption_key
       - machine_token
       - evidence_link_secret
-    volumes:
-      - pilot_health:/run/kuzet/health
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     networks:
-      control:
-        ipv4_address: 172.30.0.20
+      control: {ipv4_address: 172.30.0.20}
       data: {}
     depends_on:
-      postgres:
-        condition: service_healthy
+      provision: {condition: service_completed_successfully}
     healthcheck:
       test:
         - CMD
@@ -91,9 +192,80 @@ services:
     pids_limit: 256
     deploy:
       resources:
-        limits:
-          cpus: "1.5"
-          memory: 1G
+        limits: {cpus: "1.5", memory: 1G}
+
+  notifications:
+    <<: [*service-hardening, *api-image]
+    entrypoint: ["python", "-m", "protector.pilot.notifications.service"]
+    command:
+      - --database-url-secret=/run/secrets/database_url
+      - --machine-token-secret=/run/secrets/machine_token
+      - --evidence-link-secret=/run/secrets/evidence_link_secret
+      - --telegram-bot-token-secret=/run/secrets/telegram_bot_token
+      - --telegram-chat-id-secret=/run/secrets/telegram_chat_id
+      - --site-id=${PILOT_SITE_ID:?set-authoritative-site-id}
+      - --public-origin=${PILOT_PUBLIC_ORIGIN:?set-https-public-origin}
+      - --control-plane-url=http://api:8000
+      - --customer-approved=${PILOT_TELEGRAM_CUSTOMER_APPROVED:?set-true-only-after-approval}
+      - --network-approved=${PILOT_TELEGRAM_NETWORK_APPROVED:?set-true-only-after-network-approval}
+    secrets:
+      - database_url
+      - machine_token
+      - evidence_link_secret
+      - telegram_bot_token
+      - telegram_chat_id
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - control
+      - data
+      - egress
+    depends_on:
+      api: {condition: service_healthy}
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 512M}
+
+  retention:
+    <<: [*service-hardening, *api-image]
+    entrypoint: ["python", "-m", "protector.pilot.retention_service"]
+    command:
+      - --database-url-secret=/run/secrets/retention_database_url
+      - --access-key-secret=/run/secrets/object_store_access_key
+      - --secret-key-secret=/run/secrets/object_store_secret_key
+      - --archive-age-recipient=/run/secrets/audit_archive_age_recipient
+      - --archive-signing-private-key=/run/secrets/audit_archive_signing_private_key
+      - --archive-signing-public-key=/run/secrets/audit_archive_signing_public_key
+      - --archive-signing-key-id=${PILOT_AUDIT_ARCHIVE_SIGNING_KEY_ID:?set-audit-signing-key-id}
+      - --archive-prefix=${PILOT_AUDIT_ARCHIVE_PREFIX:?set-separate-site-scoped-audit-prefix}
+      - --site-id=${PILOT_SITE_ID:?set-authoritative-site-id}
+      - --site-config=/run/config/site.yaml
+      - --site-config-sha256=${PILOT_SITE_CONFIG_SHA256:?set-reviewed-site-config-sha256}
+    secrets:
+      - retention_database_url
+      - object_store_access_key
+      - object_store_secret_key
+      - audit_archive_age_recipient
+      - audit_archive_signing_private_key
+      - audit_archive_signing_public_key
+    volumes:
+      - ${PILOT_SITE_CONFIG_PATH:?set-reviewed-site-config-path}:/run/config/site.yaml:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - data
+      - storage-egress
+    depends_on:
+      provision: {condition: service_completed_successfully}
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 512M}
 
   tls-proxy:
     <<: *service-hardening
@@ -111,11 +283,9 @@ services:
       - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m,uid=101,gid=101,mode=0700
       - /var/run:rw,noexec,nosuid,nodev,size=8m,uid=101,gid=101,mode=0700
     networks:
-      control:
-        ipv4_address: 172.30.0.10
+      control: {ipv4_address: 172.30.0.10}
     depends_on:
-      api:
-        condition: service_healthy
+      api: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "--no-check-certificate", "https://127.0.0.1:8443/proxy-live"]
       interval: 15s
@@ -126,9 +296,7 @@ services:
     pids_limit: 128
     deploy:
       resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
+        limits: {cpus: "0.5", memory: 256M}
 
   prometheus:
     <<: *service-hardening
@@ -151,8 +319,7 @@ services:
     networks:
       - control
     depends_on:
-      api:
-        condition: service_healthy
+      api: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "promtool", "check", "ready", "--url=http://127.0.0.1:9090"]
       interval: 15s
@@ -164,9 +331,7 @@ services:
     pids_limit: 256
     deploy:
       resources:
-        limits:
-          cpus: "1.0"
-          memory: 1G
+        limits: {cpus: "1.0", memory: 1G}
 
 networks:
   control:
@@ -176,26 +341,39 @@ networks:
         - subnet: 172.30.0.0/24
   data:
     internal: true
+  # These networks must be created and host-firewall-fenced before Compose.
+  # See deploy/pilot/NETWORK_POLICY.md. Compose deliberately cannot create an
+  # unrestricted egress bridge as a side effect.
+  egress:
+    external: true
+    name: ${PILOT_NOTIFICATION_EGRESS_NETWORK:?set-precreated-notification-egress-network}
+  storage-egress:
+    external: true
+    name: ${PILOT_STORAGE_EGRESS_NETWORK:?set-precreated-storage-egress-network}
 
 volumes:
   postgres_data: {}
   prometheus_data: {}
-  pilot_health: {}
 
 secrets:
-  postgres_password:
-    external: true
-  database_url:
-    external: true
-  session_secret:
-    external: true
-  totp_encryption_key:
-    external: true
-  machine_token:
-    external: true
-  evidence_link_secret:
-    external: true
-  tls_certificate:
-    external: true
-  tls_private_key:
-    external: true
+  postgres_admin_password: {external: true}
+  admin_database_url: {external: true}
+  migration_database_url: {external: true}
+  database_url: {external: true}
+  retention_database_url: {external: true}
+  migrator_database_password: {external: true}
+  api_database_password: {external: true}
+  retention_database_password: {external: true}
+  session_secret: {external: true}
+  totp_encryption_key: {external: true}
+  machine_token: {external: true}
+  evidence_link_secret: {external: true}
+  object_store_access_key: {external: true}
+  object_store_secret_key: {external: true}
+  audit_archive_age_recipient: {external: true}
+  audit_archive_signing_private_key: {external: true}
+  audit_archive_signing_public_key: {external: true}
+  telegram_bot_token: {external: true}
+  telegram_chat_id: {external: true}
+  tls_certificate: {external: true}
+  tls_private_key: {external: true}

@@ -87,6 +87,9 @@ class CameraHealthSampleModel(Base):
     camera_id: Mapped[str] = mapped_column(
         ForeignKey("cameras.camera_id", ondelete="CASCADE"), nullable=False
     )
+    runtime_session_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="legacy", server_default="legacy"
+    )
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     last_frame_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -415,9 +418,16 @@ class ReviewModel(Base):
 
 class AuditEntryModel(Base):
     __tablename__ = "audit_entries"
-    __table_args__ = (Index("ix_audit_entries_entity", "entity_type", "entity_id", "occurred_at"),)
+    __table_args__ = (
+        Index("ix_audit_entries_entity", "entity_type", "entity_id", "occurred_at"),
+        Index("ix_audit_entries_site_occurred", "site_id", "occurred_at", "audit_id"),
+    )
 
     audit_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    site_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     actor_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.user_id", ondelete="RESTRICT")
@@ -433,6 +443,63 @@ class AuditEntryModel(Base):
 @event.listens_for(AuditEntryModel, "before_delete")
 def reject_audit_mutation(*_: object) -> None:
     raise ValueError("audit entries are append-only")
+
+
+class AuditArchiveReceiptModel(Base):
+    __tablename__ = "audit_archive_receipts"
+    __table_args__ = (
+        CheckConstraint("length(archive_sha256) = 64", name="ck_audit_archive_sha256"),
+        CheckConstraint("row_count > 0", name="ck_audit_archive_row_count"),
+        UniqueConstraint("archive_object_key", name="uq_audit_archive_object_key"),
+    )
+
+    receipt_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), nullable=False
+    )
+    cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    archive_object_key: Mapped[str] = mapped_column(String(2048), nullable=False)
+    archive_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    detached_signature: Mapped[str] = mapped_column(Text, nullable=False)
+    signing_key_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    canonical_receipt: Mapped[str] = mapped_column(Text, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    pruned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AuditArchiveItemModel(Base):
+    __tablename__ = "audit_archive_items"
+    __table_args__ = (
+        UniqueConstraint("audit_id", name="uq_audit_archive_item_audit"),
+        Index("ix_audit_archive_items_receipt", "receipt_id", "audit_id"),
+    )
+
+    receipt_id: Mapped[str] = mapped_column(
+        ForeignKey("audit_archive_receipts.receipt_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    audit_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    row_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+@event.listens_for(AuditArchiveReceiptModel, "before_update")
+@event.listens_for(AuditArchiveReceiptModel, "before_delete")
+@event.listens_for(AuditArchiveItemModel, "before_update")
+@event.listens_for(AuditArchiveItemModel, "before_delete")
+def reject_audit_archive_receipt_mutation(*_: object) -> None:
+    raise ValueError("audit archive receipts and items are append-only")
+
+
+class AuditPruneAuthorizationModel(Base):
+    __tablename__ = "audit_prune_authorizations"
+
+    backend_pid: Mapped[int] = mapped_column(Integer, primary_key=True)
+    transaction_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    audit_id: Mapped[str] = mapped_column(String(36), primary_key=True)
 
 
 event.listen(

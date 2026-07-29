@@ -20,7 +20,7 @@ from protector.pilot.api.auth import (
     TotpService,
     machine_token_matches,
 )
-from protector.pilot.metrics import PilotHealthService, PilotMetrics
+from protector.pilot.metrics import PilotHealthService, PilotMetrics, PilotTelemetryState
 from protector.pilot.notifications.base import EvidenceLinkSigner
 from protector.pilot.storage.models import CameraModel, SiteModel, UserModel
 from protector.pilot.storage.repositories import PilotRepository
@@ -44,6 +44,7 @@ class ApiContext:
     evidence_link_now: Callable[[], datetime] = field(default=utc_now, repr=False)
     metrics: PilotMetrics | None = field(default=None, repr=False)
     metrics_refresh: Callable[[], None] | None = field(default=None, repr=False)
+    telemetry: PilotTelemetryState | None = field(default=None, repr=False)
     health: PilotHealthService | None = field(default=None, repr=False)
 
 

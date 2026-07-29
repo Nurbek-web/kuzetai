@@ -7,7 +7,12 @@ import pytest
 from pydantic import ValidationError
 
 from protector.pilot import config as pilot_config
-from protector.pilot.config import PilotSecrets, SiteConfig, load_site_config
+from protector.pilot.config import (
+    PilotSecrets,
+    SecretReference,
+    SiteConfig,
+    load_site_config,
+)
 
 
 def _feed(number: int) -> dict[str, object]:
@@ -325,6 +330,34 @@ queues:
 
     with pytest.raises(ValidationError):
         load_site_config(config_path)
+
+
+def test_stream_secret_reference_rejects_traversal_symlink_and_oversize(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(pilot_config, "DOCKER_SECRETS_DIR", tmp_path)
+    with pytest.raises(ValidationError):
+        SecretReference(docker_secret=tmp_path / ".." / "escaped")
+    with pytest.raises(ValidationError):
+        SecretReference(docker_secret=tmp_path / "nested" / "camera")
+
+    target = tmp_path / "target"
+    target.write_text("rtsp://camera.example/live")
+    linked = tmp_path / "camera-link"
+    linked.symlink_to(target)
+    reference = SecretReference(docker_secret=linked)
+    with pytest.raises(ValueError, match="unable to read"):
+        reference.resolve()
+
+    oversized = tmp_path / "camera-oversized"
+    oversized.write_bytes(b"x" * (pilot_config.MAX_SECRET_BYTES + 1))
+    with pytest.raises(ValueError, match="invalid"):
+        SecretReference(docker_secret=oversized).resolve()
+
+    monkeypatch.setenv("PILOT_CAMERA_RTSP", "x" * (pilot_config.MAX_SECRET_BYTES + 1))
+    with pytest.raises(ValueError, match="missing required"):
+        SecretReference(environment="PILOT_CAMERA_RTSP").resolve()
 
 
 def test_example_template_is_a_valid_nonsecret_site_configuration():

@@ -491,6 +491,9 @@ def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    scheduled: list[tuple[int, object]] = []
+    publications: list[tuple[object, str, str]] = []
+
     class Gst:
         class State:
             NULL = "NULL"
@@ -501,7 +504,8 @@ def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
 
     class Glib:
         @staticmethod
-        def timeout_add(*_: object) -> None:
+        def timeout_add(interval: int, callback: object) -> None:
+            scheduled.append((interval, callback))
             return None
 
     class Bus:
@@ -529,6 +533,20 @@ def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
             UUID("22222222-2222-2222-2222-222222222222"),
         )
     )
+
+    class Publisher:
+        def enqueue(
+            self,
+            health: object,
+            *,
+            analytics_state: str,
+            evidence_state: str,
+        ) -> None:
+            publications.append((health, analytics_state, evidence_state))
+
+        def close(self) -> None:
+            return None
+
     runtime = DeepStreamDataPlane(
         runtime_manifest=_manifest_with_files(tmp_path),
         runtime_info=lambda: ("8.9", "10.16.0.72"),
@@ -538,6 +556,7 @@ def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
             pyds=object(),
         ),
         runtime_session_seed_factory=lambda: next(seeds),
+        telemetry_publisher_factory=lambda _: Publisher(),
     )
     monkeypatch.setattr(
         runtime,
@@ -547,12 +566,17 @@ def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
 
     runtime.start(_site())
     first_epoch = runtime.health()[0].stream_epoch
+    assert [interval for interval, _ in scheduled] == [250, 1_000]
+    assert scheduled[1][1]() is True  # type: ignore[operator]
+    assert len(publications[0][0]) == 20  # type: ignore[arg-type]
+    assert publications[0][1:] == ("degraded", "failed")
     runtime.stop()
     runtime.start(_site())
     second_epoch = runtime.health()[0].stream_epoch
     runtime.stop()
 
     assert first_epoch != second_epoch
+    assert [interval for interval, _ in scheduled] == [250, 1_000, 250, 1_000]
 
 
 def test_rtsp_locations_are_resolved_only_at_startup_and_never_embedded_in_graph(
@@ -1603,6 +1627,75 @@ def test_stop_uses_gst_null_and_partial_start_cleanup_does_not_leave_a_pipeline(
     stop_pipeline(pipeline, Gst)
 
     assert pipeline.states == [State.NULL]
+
+
+def test_stop_cleans_gpu_pipeline_even_when_telemetry_close_fails() -> None:
+    class State:
+        NULL = object()
+
+    gst = type("Gst", (), {"State": State})
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.states: list[object] = []
+
+        def set_state(self, state: object) -> None:
+            self.states.append(state)
+
+    class Telemetry:
+        def close(self) -> None:
+            raise RuntimeError("bounded telemetry shutdown failed")
+
+    pipeline = Pipeline()
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+    )
+    runtime._pipeline = pipeline
+    runtime._bindings = deepstream_module._NvidiaBindings(
+        gst=gst,
+        glib=object(),
+        pyds=object(),
+    )
+    runtime._telemetry_publisher = Telemetry()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="bounded telemetry shutdown failed"):
+        runtime.stop()
+
+    assert pipeline.states == [State.NULL]
+    assert runtime._pipeline is None
+    assert runtime._bindings is None
+    assert runtime._telemetry_publisher is None
+
+
+def test_target_reviewed_files_are_bounded_regular_and_digest_matched(
+    tmp_path: Path,
+) -> None:
+    reviewed = tmp_path / "reviewed.yaml"
+    reviewed.write_bytes(b"site: reviewed\n")
+    digest = hashlib.sha256(reviewed.read_bytes()).hexdigest()
+    assert (
+        deepstream_module._read_reviewed_file(
+            reviewed,
+            expected_sha256=digest,
+            label="site configuration",
+        )
+        == reviewed.read_bytes()
+    )
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        deepstream_module._read_reviewed_file(
+            reviewed,
+            expected_sha256="0" * 64,
+            label="site configuration",
+        )
+    linked = tmp_path / "linked.yaml"
+    linked.symlink_to(reviewed)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        deepstream_module._read_reviewed_file(
+            linked,
+            expected_sha256=digest,
+            label="site configuration",
+        )
 
 
 def test_target_entrypoint_refuses_to_start_without_a_site_and_runtime_manifest() -> None:

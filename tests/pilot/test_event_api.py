@@ -19,6 +19,7 @@ from protector.pilot.storage.models import (
     AuditEntryModel,
     Base,
     CameraHealthSampleModel,
+    CameraModel,
     CandidateEventModel,
     DeliveryAttemptModel,
     NotificationOutboxModel,
@@ -722,10 +723,15 @@ def test_internal_health_ingestion_is_machine_authenticated(
     api_context: tuple[TestClient, PilotRepository, str],
 ) -> None:
     client, repository, _ = api_context
+    with repository.session_factory.begin() as session:
+        camera = session.get(CameraModel, "cam-01")
+        assert camera is not None
+        camera.state = "starting"
     health = {
         "camera_id": "cam-01",
         "observed_at": NOW.isoformat(),
-        "state": "degraded",
+        "runtime_session_id": "runtime-session-a",
+        "state": "online",
         "last_frame_at": (NOW - timedelta(seconds=2)).isoformat(),
         "reconnect_count": 2,
         "dropped_samples": 4,
@@ -744,3 +750,7 @@ def test_internal_health_ingestion_is_machine_authenticated(
         samples = list(session.scalars(select(CameraHealthSampleModel)))
         assert len(samples) == 1
         assert samples[0].camera_id == "cam-01"
+        assert samples[0].runtime_session_id == "runtime-session-a"
+        camera = session.get(CameraModel, "cam-01")
+        assert camera is not None
+        assert camera.state == "online"

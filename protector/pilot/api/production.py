@@ -12,7 +12,12 @@ from pathlib import Path
 from sqlalchemy import select
 
 from protector.pilot.api.app import create_app
-from protector.pilot.metrics import HealthProbeSnapshot, PilotHealthService, PilotMetrics
+from protector.pilot.metrics import (
+    HealthProbeSnapshot,
+    PilotHealthService,
+    PilotMetrics,
+    PilotTelemetryState,
+)
 from protector.pilot.notifications.base import EvidenceLinkSigner
 from protector.pilot.storage.db import SessionFactory, create_engine, create_session_factory
 from protector.pilot.storage.models import (
@@ -153,6 +158,9 @@ def refresh_camera_metrics(
             available=state == "online",
             last_frame_age_seconds=frame_age,
             reconnects_total=sample.reconnect_count if sample is not None else 0,
+            runtime_session_id=(
+                sample.runtime_session_id if sample is not None else "no-runtime-sample"
+            ),
         )
 
 
@@ -212,6 +220,15 @@ def create_production_app() -> object:
         artifact_ids = tuple(
             session.scalars(select(ModelArtifactModel.artifact_id).order_by(ModelArtifactModel.artifact_id))
         )
+    if len(camera_ids) != 20 or len(set(camera_ids)) != 20:
+        raise RuntimeError("controlled pilot requires exactly 20 provisioned cameras")
+    if not artifact_ids:
+        raise RuntimeError("controlled pilot requires a reviewed shared model artifact")
+
+    telemetry = PilotTelemetryState(
+        site_id=site_id,
+        stale_after_seconds=stale_after_seconds,
+    )
 
     def probe() -> HealthProbeSnapshot:
         try:
@@ -263,9 +280,7 @@ def create_production_app() -> object:
             camera_states=camera_states,  # type: ignore[arg-type]
             control_plane="healthy",
             database=database,  # type: ignore[arg-type]
-            analytics=read_component_state(_HEALTH_ROOT / "analytics"),
-            evidence=read_component_state(_HEALTH_ROOT / "evidence"),
-            notifications=read_component_state(_HEALTH_ROOT / "notifications"),
+            **telemetry.component_states(),
         )
 
     metrics = PilotMetrics(
@@ -299,6 +314,7 @@ def create_production_app() -> object:
         evidence_link_now=lambda: datetime.now(UTC),
         metrics=metrics,
         metrics_refresh=refresh_metrics,
+        telemetry=telemetry,
         health=PilotHealthService(
             site_id=site_id,
             camera_ids=camera_ids,

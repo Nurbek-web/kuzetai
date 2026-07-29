@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Select, and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from protector.pilot.domain import (
     CandidateEventV1,
@@ -24,6 +25,7 @@ from protector.pilot.storage.models import (
     AuditEntryModel,
     CameraModel,
     CandidateEventModel,
+    DeliveryAttemptModel,
     EvidenceModel,
     ModelArtifactModel,
     NotificationOutboxModel,
@@ -46,6 +48,77 @@ class StaleStateError(ValueError):
         self.expected = expected
         self.actual = actual
         super().__init__(f"expected {expected}, found {actual}")
+
+
+def _audit_site_id(session: Session, entity_type: str, entity_id: str) -> str | None:
+    if entity_type == "site":
+        return session.scalar(
+            select(SiteModel.site_id).where(SiteModel.site_id == entity_id)
+        )
+    if entity_type == "camera":
+        return session.scalar(
+            select(CameraModel.site_id).where(CameraModel.camera_id == entity_id)
+        )
+    if entity_type == "candidate_event":
+        return session.scalar(
+            select(CameraModel.site_id)
+            .join(
+                CandidateEventModel,
+                CandidateEventModel.camera_id == CameraModel.camera_id,
+            )
+            .where(CandidateEventModel.event_id == entity_id)
+        )
+    if entity_type == "evidence":
+        return session.scalar(
+            select(CameraModel.site_id)
+            .join(
+                CandidateEventModel,
+                CandidateEventModel.camera_id == CameraModel.camera_id,
+            )
+            .join(EvidenceModel, EvidenceModel.event_id == CandidateEventModel.event_id)
+            .where(EvidenceModel.evidence_id == entity_id)
+        )
+    if entity_type == "review":
+        return session.scalar(
+            select(CameraModel.site_id)
+            .join(
+                CandidateEventModel,
+                CandidateEventModel.camera_id == CameraModel.camera_id,
+            )
+            .join(ReviewModel, ReviewModel.event_id == CandidateEventModel.event_id)
+            .where(ReviewModel.review_id == entity_id)
+        )
+    if entity_type == "notification_outbox":
+        return session.scalar(
+            select(CameraModel.site_id)
+            .join(
+                CandidateEventModel,
+                CandidateEventModel.camera_id == CameraModel.camera_id,
+            )
+            .join(
+                NotificationOutboxModel,
+                NotificationOutboxModel.event_id == CandidateEventModel.event_id,
+            )
+            .where(NotificationOutboxModel.outbox_id == entity_id)
+        )
+    if entity_type == "delivery_attempt":
+        return session.scalar(
+            select(CameraModel.site_id)
+            .join(
+                CandidateEventModel,
+                CandidateEventModel.camera_id == CameraModel.camera_id,
+            )
+            .join(
+                NotificationOutboxModel,
+                NotificationOutboxModel.event_id == CandidateEventModel.event_id,
+            )
+            .join(
+                DeliveryAttemptModel,
+                DeliveryAttemptModel.outbox_id == NotificationOutboxModel.outbox_id,
+            )
+            .where(DeliveryAttemptModel.delivery_attempt_id == entity_id)
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -581,6 +654,7 @@ class PilotRepository:
                     return existing
             row = AuditEntryModel(
                 audit_id=str(uuid4()),
+                site_id=_audit_site_id(session, entry.entity_type, entry.entity_id),
                 occurred_at=entry.occurred_at,
                 actor_user_id=entry.actor_user_id,
                 action=entry.action,
@@ -662,9 +736,13 @@ class PilotRepository:
                 reviewed_at=reviewed_at,
             )
             session.add(review)
+            audit_site_id = session.scalar(
+                select(CameraModel.site_id).where(CameraModel.camera_id == row.camera_id)
+            )
             session.add(
                 AuditEntryModel(
                     audit_id=str(uuid4()),
+                    site_id=audit_site_id,
                     occurred_at=reviewed_at,
                     actor_user_id=reviewer_id,
                     action=f"event.{target_status}",
@@ -798,9 +876,15 @@ class PilotRepository:
                 reviewed_at=reviewed_at,
             )
             session.add(review)
+            audit_site_id = expected_site_id or session.scalar(
+                select(CameraModel.site_id).where(
+                    CameraModel.camera_id == event_row.camera_id
+                )
+            )
             session.add(
                 AuditEntryModel(
                     audit_id=str(uuid4()),
+                    site_id=audit_site_id,
                     occurred_at=reviewed_at,
                     actor_user_id=reviewer_id,
                     action=f"event.{target_status}",

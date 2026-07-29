@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shutil
 import subprocess
@@ -11,13 +12,22 @@ from uuid import UUID, uuid4
 
 import pytest
 import yaml
-from sqlalchemy import select
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import select, update
 
+from protector.pilot.audit_archive import EncryptedAuditArchiveStore
 from protector.pilot.domain import CandidateEventV1
 from protector.pilot.gates import CommercialRightsRecordV1, ModelArtifactV1
-from protector.pilot.retention import EvidenceRetentionCoordinator
+from protector.pilot.retention import (
+    AuditArchiveCoordinator,
+    EvidenceRetentionCoordinator,
+    PublishedAuditArchive,
+)
 from protector.pilot.storage.db import create_engine, create_session_factory
 from protector.pilot.storage.models import (
+    AuditArchiveItemModel,
+    AuditArchiveReceiptModel,
     AuditEntryModel,
     Base,
     CandidateEventModel,
@@ -39,6 +49,30 @@ class RecordingStore:
         if key in self.fail_keys:
             raise ObjectPublishError("generic retention failure")
         self.deleted.append(key)
+
+
+class RecordingAuditArchiveStore:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.published: list[tuple[str, bytes]] = []
+
+    def publish(self, *, object_key: str, plaintext: bytes) -> PublishedAuditArchive:
+        if self.fail:
+            raise ObjectPublishError("archive publish failed")
+        self.published.append((object_key, plaintext))
+        encrypted_sha256 = hashlib.sha256(b"encrypted:" + plaintext).hexdigest()
+        return PublishedAuditArchive(
+            object_key=object_key,
+            encrypted_sha256=encrypted_sha256,
+            detached_signature="signed-archive",
+            signing_key_id="audit-signing-key-1",
+            canonical_receipt=(
+                "schema=kuzet-audit-archive-receipt.v1\n"
+                f"object_key={object_key}\n"
+                f"encrypted_sha256={encrypted_sha256}\n"
+                "signing_key_id=audit-signing-key-1\n"
+            ),
+        )
 
 
 def _repository(tmp_path: Path) -> PilotRepository:
@@ -244,6 +278,227 @@ def test_retention_partial_failure_fails_closed_and_never_mutates_audit(
         ) is None
 
 
+def test_audit_archive_commits_exact_receipt_before_narrow_idempotent_prune(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    old_ids = [
+        repository.append_audit(
+            AuditEntryInput(
+                actor_user_id=None,
+                action="retention.audit",
+                entity_type="site",
+                entity_id="site-1",
+                payload={"index": index},
+                idempotency_key=f"audit-old-{index}",
+                occurred_at=NOW - timedelta(days=100, seconds=index),
+            )
+        ).audit_id
+        for index in range(3)
+    ]
+    foreign = repository.append_audit(
+        AuditEntryInput(
+            actor_user_id=None,
+            action="retention.foreign",
+            entity_type="site",
+            entity_id="site-2",
+            payload={},
+            idempotency_key="audit-foreign",
+            occurred_at=NOW - timedelta(days=200),
+        )
+    ).audit_id
+    store = RecordingAuditArchiveStore()
+    pruned: list[tuple[str, tuple[str, ...]]] = []
+
+    def prune(receipt_id: str, audit_ids: tuple[str, ...]) -> int:
+        with repository.session_factory() as session:
+            receipt = session.get(AuditArchiveReceiptModel, receipt_id)
+            items = tuple(
+                session.scalars(
+                    select(AuditArchiveItemModel.audit_id)
+                    .where(AuditArchiveItemModel.receipt_id == receipt_id)
+                    .order_by(AuditArchiveItemModel.audit_id)
+                )
+            )
+        assert receipt is not None
+        assert receipt.archive_sha256
+        assert receipt.canonical_receipt.startswith(
+            "schema=kuzet-audit-archive-receipt.v1\n"
+        )
+        assert f"object_key={receipt.archive_object_key}\n" in receipt.canonical_receipt
+        assert items == tuple(sorted(audit_ids))
+        with repository.session_factory.begin() as session:
+            session.execute(
+                update(AuditArchiveReceiptModel)
+                .where(AuditArchiveReceiptModel.receipt_id == receipt_id)
+                .values(pruned_at=NOW)
+            )
+        pruned.append((receipt_id, audit_ids))
+        return len(audit_ids)
+
+    coordinator = AuditArchiveCoordinator(
+        session_factory=repository.session_factory,
+        archive_store=store,
+        pruner=prune,
+        pilot_site_id="site-1",
+        retention_days=90,
+        batch_size=2,
+        clock=lambda: NOW,
+    )
+
+    first = coordinator.run_once()
+    second = coordinator.run_once()
+    third = coordinator.run_once()
+
+    assert (first.archived, second.archived, third.archived) == (2, 1, 0)
+    assert (first.pruned, second.pruned, third.pruned) == (2, 1, 0)
+    assert len(store.published) == 2
+    assert set(pruned[0][1] + pruned[1][1]) == set(old_ids)
+    assert foreign not in set(pruned[0][1] + pruned[1][1])
+    assert all(b'"site_id":"site-1"' in payload for _, payload in store.published)
+
+
+def test_audit_archive_publish_failure_creates_no_receipt_and_never_prunes(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    repository.append_audit(
+        AuditEntryInput(
+            actor_user_id=None,
+            action="retention.audit",
+            entity_type="site",
+            entity_id="site-1",
+            payload={},
+            idempotency_key="audit-failed-publish",
+            occurred_at=NOW - timedelta(days=100),
+        )
+    )
+    pruned: list[str] = []
+    result = AuditArchiveCoordinator(
+        session_factory=repository.session_factory,
+        archive_store=RecordingAuditArchiveStore(fail=True),
+        pruner=lambda receipt_id, _ids: pruned.append(receipt_id) or 0,
+        pilot_site_id="site-1",
+        retention_days=90,
+        batch_size=10,
+        clock=lambda: NOW,
+    ).run_once()
+
+    assert result.failed == 1
+    assert result.archived == result.pruned == 0
+    assert pruned == []
+    with repository.session_factory() as session:
+        assert list(session.scalars(select(AuditArchiveReceiptModel))) == []
+
+
+def test_operational_migration_uses_receipt_bound_postgres_prune_without_general_flag() -> None:
+    from io import StringIO
+
+    output = StringIO()
+    config = Config("alembic.ini", output_buffer=output)
+    config.set_main_option(
+        "sqlalchemy.url",
+        "postgresql+psycopg://localhost/kuzet_pilot_test",
+    )
+
+    command.upgrade(config, "head", sql=True)
+
+    sql = output.getvalue()
+    assert "runtime_session_id" in sql
+    assert "audit_archive_receipts" in sql
+    assert "audit_archive_items" in sql
+    assert "pilot_prune_archived_audit" in sql
+    assert "SECURITY DEFINER" in sql
+    assert "audit_prune_authorizations" in sql
+    assert "pg_backend_pid()" in sql and "txid_current()" in sql
+    assert "audit.occurred_at IS DISTINCT FROM item.occurred_at" in sql
+    assert "audit.occurred_at >= receipt_cutoff" in sql
+    assert "site_count = 1" in sql
+    assert "pilot_reject_audit_archive_receipt_mutation" in sql
+    assert sql.index("receipt.pruned_at IS NOT NULL") < sql.index(
+        "audit archive receipt item count is inconsistent"
+    )
+    assert "REVOKE ALL ON FUNCTION pilot_prune_archived_audit(text) FROM PUBLIC" in sql
+    assert "TO kuzet_retention" in sql
+    assert "TO kuzet;" not in sql
+    assert "session_replication_role" not in sql
+    assert "DISABLE TRIGGER" not in sql
+
+
+def test_audit_archive_caps_bytes_and_fails_closed_on_multisite_unattributed_rows(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    repository.append_audit(
+        AuditEntryInput(
+            actor_user_id=None,
+            action="retention.attributed",
+            entity_type="site",
+            entity_id="site-1",
+            payload={},
+            idempotency_key="audit-attributed",
+            occurred_at=NOW - timedelta(days=100),
+        )
+    )
+    with repository.session_factory.begin() as session:
+        session.add(
+            AuditEntryModel(
+                audit_id=str(uuid4()),
+                site_id=None,
+                occurred_at=NOW - timedelta(days=100),
+                actor_user_id=None,
+                action="legacy.unknown",
+                entity_type="unknown",
+                entity_id="unknown",
+                payload={},
+                idempotency_key="legacy-unknown",
+            )
+        )
+    store = RecordingAuditArchiveStore()
+    coordinator = AuditArchiveCoordinator(
+        session_factory=repository.session_factory,
+        archive_store=store,
+        pruner=lambda _receipt_id, audit_ids: len(audit_ids),
+        pilot_site_id="site-1",
+        retention_days=90,
+        batch_size=10,
+        max_archive_bytes=1_024,
+        clock=lambda: NOW,
+    )
+
+    unattributed = coordinator.run_once()
+    assert unattributed.failure_reasons == ("unattributed_audit_rows",)
+
+    oversized_root = tmp_path / "oversized"
+    oversized_root.mkdir()
+    oversized_repository = _repository(oversized_root)
+    attributed = oversized_repository.append_audit(
+        AuditEntryInput(
+            actor_user_id=None,
+            action="retention.large",
+            entity_type="site",
+            entity_id="site-1",
+            payload={"bounded": "x" * 2_000},
+            idempotency_key="audit-large",
+            occurred_at=NOW - timedelta(days=100),
+        )
+    )
+    oversized = AuditArchiveCoordinator(
+        session_factory=oversized_repository.session_factory,
+        archive_store=store,
+        pruner=lambda _receipt_id, audit_ids: len(audit_ids),
+        pilot_site_id="site-1",
+        retention_days=90,
+        batch_size=10,
+        max_archive_bytes=1_024,
+        clock=lambda: NOW,
+    ).run_once()
+
+    assert attributed.site_id == "site-1"
+    assert oversized.failure_reasons == ("audit_row_exceeds_archive_bound",)
+    assert store.published == []
+
+
 def test_failed_tombstone_retry_cannot_starve_newer_ready_expiry(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     oldest = _add_evidence(
@@ -392,8 +647,11 @@ def test_fake_tools_prove_backup_pending_then_fresh_restore_receipt(tmp_path: Pa
         "backup_age_identity": "AGE-SECRET-KEY-FIXTURE\n",
         "backup_signing_private_key": "fixture-private-signing-key\n",
         "backup_signing_public_key": "fixture-public-signing-key\n",
+        "restore_receipt_signing_private_key": "fixture-restore-private-key\n",
+        "restore_receipt_signing_public_key": "fixture-restore-public-key\n",
         "aws_credentials": "[default]\nfixture=yes\n",
         "kz_storage_attestation_public_key": "fixture-public-key\n",
+        "kz_storage_verifier_record": "fixture-volume-verifier-record\n",
     }.items():
         (secret_root / name).write_text(value)
 
@@ -455,12 +713,15 @@ while (($#)); do
 done
 case "$mode" in
   sign)
-    [[ "$key" = */backup_signing_private_key ]]
+    case "$key" in
+      */backup_signing_private_key|*/restore_receipt_signing_private_key) : ;;
+      *) exit 3 ;;
+    esac
     sha256sum "$input" | awk '{print $1}' > "$output"
     ;;
   verify)
     case "$key" in
-      */backup_signing_public_key)
+      */backup_signing_public_key|*/restore_receipt_signing_public_key)
         expected=$(sha256sum "$input" | awk '{print $1}')
         actual=$(cat "$signature")
         [[ "$actual" = "$expected" ]]
@@ -470,6 +731,21 @@ case "$mode" in
     ;;
   *) exit 2 ;;
 esac
+""",
+    )
+    tool(
+        "findmnt",
+        """#!/bin/bash
+set -eu
+target=
+while (($#)); do
+  case "$1" in
+    -T) target=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -n "$target" ]]
+printf '%s fixture-volume-uuid\n' "$target"
 """,
     )
     tool(
@@ -493,6 +769,40 @@ fi
 """,
     )
     tool(
+        "backup-snapshot",
+        """#!/usr/bin/env python3
+import argparse
+import hashlib
+import os
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--dump", required=True)
+parser.add_argument("--metadata", required=True)
+parser.add_argument("--evidence-manifest", required=True)
+parser.add_argument("--service")
+parser.add_argument("--site-id")
+parser.add_argument("--max-database-bytes")
+parser.add_argument("--max-evidence-objects")
+parser.add_argument("--max-manifest-bytes")
+arguments = parser.parse_args()
+dump_bytes = int(os.environ.get("FAKE_DUMP_BYTES", "0"))
+with open(arguments.dump, "wb") as output:
+    if dump_bytes:
+        output.truncate(dump_bytes)
+    else:
+        output.write(b"FAKE_DATABASE_DUMP")
+database_bytes = os.environ.get("FAKE_DATABASE_BYTES", "18")
+with open(arguments.metadata, "w", encoding="utf-8") as output:
+    output.write(
+        "source_database=source_db\\n"
+        "schema_revision=0004_operational_retention\\n"
+        f"database_bytes={database_bytes}\\n"
+    )
+with open(arguments.evidence_manifest, "w", encoding="utf-8") as output:
+    output.write(f"{hashlib.sha256(b'video').hexdigest()}\\tevent.mp4\\n")
+""",
+    )
+    tool(
         "psql",
         """#!/bin/bash
 set -eu
@@ -503,8 +813,9 @@ arguments="$*"
 case "$arguments" in
   *pg_database_size*) printf '%s\n' "${FAKE_DATABASE_BYTES:-18}" ;;
   *current_database*) printf '%s\n' "${FAKE_TARGET_DB:-source_db}" ;;
-  *information_schema.tables*) printf '0\n' ;;
-  *version_num*) printf '0003_notification_delivery\n' ;;
+  *fresh_database_gate*) printf '%s\n' "${FAKE_DATABASE_OBJECT_COUNT:-0}" ;;
+  *restored_evidence_manifest*) printf '%s\tevent.mp4\n' "$(printf video | sha256sum | awk '{print $1}')" ;;
+  *version_num*) printf '0004_operational_retention\n' ;;
   *"SELECT site_id"*) printf 'site-1\n' ;;
   *) exit 2 ;;
 esac
@@ -514,10 +825,15 @@ esac
         "pg_restore",
         """#!/bin/bash
 set -eu
-if [[ -n ${FAKE_TOOL_TRACE:-} ]]; then
-  printf 'pg_restore\n' >> "$FAKE_TOOL_TRACE"
-fi
-case " $* " in *" --list "*) printf 'fixture archive\n' ;; *) : ;; esac
+case " $* " in
+  *" --list "*)
+    if [[ -n ${FAKE_TOOL_TRACE:-} ]]; then printf 'pg_restore-list\n' >> "$FAKE_TOOL_TRACE"; fi
+    printf 'fixture archive\n'
+    ;;
+  *)
+    if [[ -n ${FAKE_TOOL_TRACE:-} ]]; then printf 'pg_restore-apply\n' >> "$FAKE_TOOL_TRACE"; fi
+    ;;
+esac
 """,
     )
     tool(
@@ -531,14 +847,33 @@ import sys
 arguments = sys.argv[1:]
 if "list-objects-v2" in arguments:
     assert arguments[arguments.index("--prefix") + 1] == "pilot-evidence/site-1/"
+    assert "--max-items" in arguments
     key = os.environ.get("FAKE_INVENTORY_KEY", "event.mp4")
-    print(json.dumps({"Contents": [{"Key": f"pilot-evidence/site-1/{key}", "Size": 5}]}))
-elif "sync" in arguments:
-    index = arguments.index("sync")
-    assert arguments[index + 1] == "s3://pilot-evidence/pilot-evidence/site-1/"
-    destination = pathlib.Path(arguments[index + 2])
-    destination.mkdir(parents=True, exist_ok=True)
-    (destination / "event.mp4").write_bytes(b"video")
+    contents = [{
+        "Key": f"pilot-evidence/site-1/{key}",
+        "Size": 5,
+        "ETag": '"0123456789abcdef0123456789abcdef"',
+    }]
+    if os.environ.get("FAKE_INVENTORY_OVER_LIMIT"):
+        contents.append(
+            {
+                "Key": "pilot-evidence/site-1/second.mp4",
+                "Size": 5,
+                "ETag": '"fedcba9876543210fedcba9876543210"',
+            }
+        )
+    print(json.dumps({"Contents": contents}))
+elif "get-object" in arguments:
+    key = arguments[arguments.index("--key") + 1]
+    assert key.startswith("pilot-evidence/site-1/")
+    assert arguments[arguments.index("--if-match") + 1] == '"0123456789abcdef0123456789abcdef"'
+    assert arguments[arguments.index("--range") + 1] == "bytes=0-5"
+    destination = pathlib.Path(arguments[-1])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(
+        b"growth" if os.environ.get("FAKE_OBJECT_GROWS_AFTER_LIST") else b"video"
+    )
+    print(json.dumps({"ChecksumSHA256": "fixture"}))
 else:
     raise SystemExit(2)
 """,
@@ -552,15 +887,33 @@ else:
         fixture.write_text(source.read_text().replace("/run/secrets", str(secret_root)))
         fixture.chmod(0o700)
 
+    def write_storage_marker(directory: Path, filename: str, schema: str) -> None:
+        now_epoch = int(datetime.now(UTC).timestamp())
+        verifier_digest = hashlib.sha256(
+            (secret_root / "kz_storage_verifier_record").read_bytes()
+        ).hexdigest()
+        marker = directory / filename
+        marker.write_text(
+            f"schema={schema}\n"
+            "site_id=site-1\n"
+            "country=KZ\n"
+            f"target_path={directory}\n"
+            f"mount_path={directory}\n"
+            "volume_uuid=fixture-volume-uuid\n"
+            "encryption=luks2\n"
+            f"verifier_record_sha256={verifier_digest}\n"
+            f"attested_at_epoch={now_epoch - 60}\n"
+            f"valid_until_epoch={now_epoch + 3600}\n"
+        )
+        marker.with_name(f"{marker.name}.sig").write_text("fixture-signature\n")
+
     backup_target = tmp_path / "encrypted-backups"
     backup_target.mkdir()
-    (backup_target / ".kuzet-pilot-backup-target.v1").write_text(
-        "schema=kuzet-pilot-backup-target.v1\n"
-        "site_id=site-1\n"
-        "country=KZ\n"
-        "encrypted=true\n"
+    write_storage_marker(
+        backup_target,
+        ".kuzet-pilot-backup-target.v1",
+        "kuzet-pilot-backup-target.v1",
     )
-    (backup_target / ".kuzet-pilot-backup-target.v1.sig").write_text("fixture-signature\n")
     config = tmp_path / "site.yaml"
     model = tmp_path / "model-register.json"
     config.write_text("site: site-1\n")
@@ -572,20 +925,41 @@ else:
         "PILOT_BACKUP_TARGET": str(backup_target),
         "PILOT_KZ_OBJECT_ENDPOINT": "https://objects.example.kz",
         "PILOT_EVIDENCE_BUCKET": "pilot-evidence",
-        "PILOT_EVIDENCE_PREFIX": "pilot-evidence",
+        "PILOT_EVIDENCE_PREFIX": "pilot-evidence/site-1",
         "PILOT_CONFIG_MANIFEST": str(config),
         "PILOT_MODEL_MANIFEST": str(model),
+        "PILOT_BACKUP_SNAPSHOT_HELPER": str(fake_bin / "backup-snapshot"),
     }
+    replay_target = tmp_path / "replayed-marker-backups"
+    replay_target.mkdir()
+    original_marker = backup_target / ".kuzet-pilot-backup-target.v1"
+    shutil.copy2(original_marker, replay_target / original_marker.name)
+    shutil.copy2(
+        original_marker.with_name(f"{original_marker.name}.sig"),
+        replay_target / f"{original_marker.name}.sig",
+    )
+    replay_trace = tmp_path / "replayed-marker-tools.log"
+    replay = subprocess.run(
+        [str(fixture_scripts / "backup.sh")],
+        env={
+            **environment,
+            "PILOT_BACKUP_TARGET": str(replay_target),
+            "FAKE_TOOL_TRACE": str(replay_trace),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert replay.returncode != 0
+    assert "attestation" in replay.stderr
+    assert not replay_trace.exists()
+    assert not list(replay_target.glob("backup-*"))
     mismatch_target = tmp_path / "mismatch-backups"
     mismatch_target.mkdir()
-    (mismatch_target / ".kuzet-pilot-backup-target.v1").write_text(
-        "schema=kuzet-pilot-backup-target.v1\n"
-        "site_id=site-1\n"
-        "country=KZ\n"
-        "encrypted=true\n"
-    )
-    (mismatch_target / ".kuzet-pilot-backup-target.v1.sig").write_text(
-        "fixture-signature\n"
+    write_storage_marker(
+        mismatch_target,
+        ".kuzet-pilot-backup-target.v1",
+        "kuzet-pilot-backup-target.v1",
     )
     mismatch = subprocess.run(
         [str(fixture_scripts / "backup.sh")],
@@ -599,19 +973,15 @@ else:
         check=False,
     )
     assert mismatch.returncode != 0
-    assert "does not match inventory" in mismatch.stderr
+    assert "database evidence manifest" in mismatch.stderr
     assert not list(mismatch_target.glob("backup-*"))
 
     reserved_target = tmp_path / "reserved-key-backups"
     reserved_target.mkdir()
-    (reserved_target / ".kuzet-pilot-backup-target.v1").write_text(
-        "schema=kuzet-pilot-backup-target.v1\n"
-        "site_id=site-1\n"
-        "country=KZ\n"
-        "encrypted=true\n"
-    )
-    (reserved_target / ".kuzet-pilot-backup-target.v1.sig").write_text(
-        "fixture-signature\n"
+    write_storage_marker(
+        reserved_target,
+        ".kuzet-pilot-backup-target.v1",
+        "kuzet-pilot-backup-target.v1",
     )
     reserved = subprocess.run(
         [str(fixture_scripts / "backup.sh")],
@@ -627,16 +997,57 @@ else:
     assert reserved.returncode != 0
     assert "reserved" in reserved.stderr
 
+    bounded_listing_target = tmp_path / "bounded-listing-backups"
+    bounded_listing_target.mkdir()
+    write_storage_marker(
+        bounded_listing_target,
+        ".kuzet-pilot-backup-target.v1",
+        "kuzet-pilot-backup-target.v1",
+    )
+    bounded_listing = subprocess.run(
+        [str(fixture_scripts / "backup.sh")],
+        env={
+            **environment,
+            "PILOT_BACKUP_TARGET": str(bounded_listing_target),
+            "PILOT_BACKUP_MAX_EVIDENCE_OBJECTS": "1",
+            "FAKE_INVENTORY_OVER_LIMIT": "1",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert bounded_listing.returncode != 0
+    assert "object inventory" in bounded_listing.stderr
+    assert not list(bounded_listing_target.glob("backup-*"))
+
+    growth_target = tmp_path / "post-inventory-growth-backups"
+    growth_target.mkdir()
+    write_storage_marker(
+        growth_target,
+        ".kuzet-pilot-backup-target.v1",
+        "kuzet-pilot-backup-target.v1",
+    )
+    growth = subprocess.run(
+        [str(fixture_scripts / "backup.sh")],
+        env={
+            **environment,
+            "PILOT_BACKUP_TARGET": str(growth_target),
+            "FAKE_OBJECT_GROWS_AFTER_LIST": "1",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert growth.returncode != 0
+    assert "size changed after inventory" in growth.stderr
+    assert not list(growth_target.glob("backup-*"))
+
     oversized_database_target = tmp_path / "oversized-database-backups"
     oversized_database_target.mkdir()
-    (oversized_database_target / ".kuzet-pilot-backup-target.v1").write_text(
-        "schema=kuzet-pilot-backup-target.v1\n"
-        "site_id=site-1\n"
-        "country=KZ\n"
-        "encrypted=true\n"
-    )
-    (oversized_database_target / ".kuzet-pilot-backup-target.v1.sig").write_text(
-        "fixture-signature\n"
+    write_storage_marker(
+        oversized_database_target,
+        ".kuzet-pilot-backup-target.v1",
+        "kuzet-pilot-backup-target.v1",
     )
     oversized_database = subprocess.run(
         [str(fixture_scripts / "backup.sh")],
@@ -655,14 +1066,10 @@ else:
 
     oversized_dump_target = tmp_path / "oversized-dump-backups"
     oversized_dump_target.mkdir()
-    (oversized_dump_target / ".kuzet-pilot-backup-target.v1").write_text(
-        "schema=kuzet-pilot-backup-target.v1\n"
-        "site_id=site-1\n"
-        "country=KZ\n"
-        "encrypted=true\n"
-    )
-    (oversized_dump_target / ".kuzet-pilot-backup-target.v1.sig").write_text(
-        "fixture-signature\n"
+    write_storage_marker(
+        oversized_dump_target,
+        ".kuzet-pilot-backup-target.v1",
+        "kuzet-pilot-backup-target.v1",
     )
     oversized_dump = subprocess.run(
         [str(fixture_scripts / "backup.sh")],
@@ -683,7 +1090,7 @@ else:
 
     backup = subprocess.run(
         [str(fixture_scripts / "backup.sh")],
-        env=environment,
+        env={**environment, "FAKE_POST_INVENTORY_EXTRA_OBJECT": "1"},
         text=True,
         capture_output=True,
         check=False,
@@ -698,6 +1105,7 @@ else:
         "checksums.sha256.sig",
         "config-manifest.age",
         "database.dump.age",
+        "database-evidence.tsv.age",
         "evidence.tar.age",
         "manifest.txt.age",
         "model-manifest.age",
@@ -708,19 +1116,18 @@ else:
 
     volume = tmp_path / "encrypted-volume"
     volume.mkdir()
-    (volume / ".kuzet-pilot-encrypted-volume.v1").write_text(
-        "schema=kuzet-pilot-encrypted-volume.v1\n"
-        "site_id=site-1\n"
-        "country=KZ\n"
-        "encrypted=true\n"
+    write_storage_marker(
+        volume,
+        ".kuzet-pilot-encrypted-volume.v1",
+        "kuzet-pilot-encrypted-volume.v1",
     )
-    (volume / ".kuzet-pilot-encrypted-volume.v1.sig").write_text("fixture-signature\n")
     receipts = tmp_path / "restore-receipts"
     receipts.mkdir()
-    (receipts / ".kuzet-pilot-restore-receipts.v1").write_text(
-        "schema=kuzet-pilot-restore-receipts.v1\nsite_id=site-1\n"
+    write_storage_marker(
+        receipts,
+        ".kuzet-pilot-restore-receipts.v1",
+        "kuzet-pilot-restore-receipts.v1",
     )
-    (receipts / ".kuzet-pilot-restore-receipts.v1.sig").write_text("fixture-signature\n")
     restore_environment = {
         **environment,
         "FAKE_TARGET_DB": "fresh_restore",
@@ -728,7 +1135,7 @@ else:
         "PILOT_RESTORE_DATABASE_NAME": "fresh_restore",
         "PILOT_RESTORE_EVIDENCE_TARGET": str(volume / "restored-site-1"),
         "PILOT_RESTORE_RECEIPT_TARGET": str(receipts),
-        "PILOT_EXPECTED_SCHEMA_REVISION": "0003_notification_delivery",
+        "PILOT_EXPECTED_SCHEMA_REVISION": "0004_operational_retention",
         "PILOT_EXPECTED_CONFIG_SHA256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "PILOT_EXPECTED_MODEL_SHA256": hashlib.sha256(model.read_bytes()).hexdigest(),
     }
@@ -737,6 +1144,7 @@ else:
     shutil.copytree(backup_runs[0], forged_backup)
     canonical_artifacts = (
         "database.dump.age",
+        "database-evidence.tsv.age",
         "evidence.tar.age",
         "manifest.txt.age",
         "backup-receipt.txt.age",
@@ -938,6 +1346,26 @@ else:
     assert "member bound" in member_bomb_result.stderr
     assert not (volume / "rejected-member-bomb").exists()
 
+    nonempty_database_trace = tmp_path / "nonempty-database-tools.log"
+    nonempty_database = subprocess.run(
+        [str(fixture_scripts / "restore.sh")],
+        env={
+            **restore_environment,
+            "FAKE_DATABASE_OBJECT_COUNT": "1",
+            "FAKE_TOOL_TRACE": str(nonempty_database_trace),
+            "PILOT_RESTORE_EVIDENCE_TARGET": str(
+                volume / "rejected-nonempty-database"
+            ),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert nonempty_database.returncode != 0
+    assert "non-baseline" in nonempty_database.stderr
+    assert "pg_restore-apply" not in nonempty_database_trace.read_text()
+    assert not (volume / "rejected-nonempty-database").exists()
+
     restore = subprocess.run(
         [str(fixture_scripts / "restore.sh")],
         env=restore_environment,
@@ -950,7 +1378,182 @@ else:
     restore_receipts = list(receipts.glob("restore-drill-*/restore-drill-receipt.age"))
     assert len(restore_receipts) == 1
     assert "status=verified_fresh_target_restore" in restore_receipts[0].read_text()
+    assert "source_database_dump_sha256=" in restore_receipts[0].read_text()
+    assert "restored_state_sha256=" in restore_receipts[0].read_text()
+    assert "restored_database_sha256=" not in restore_receipts[0].read_text()
+    assert restore_receipts[0].with_suffix(".age.sig").exists()
     assert restore_receipts[0].with_suffix(".age.sha256").exists()
+
+
+def test_audit_archive_is_client_encrypted_immutable_and_retry_idempotent(
+    tmp_path: Path,
+) -> None:
+    class Missing(Exception):
+        response = {"ResponseMetadata": {"HTTPStatusCode": 404}}
+
+    class Client:
+        def __init__(self) -> None:
+            self.objects: dict[str, dict[str, object]] = {}
+
+        def head_object(
+            self,
+            *,
+            Bucket: str,
+            Key: str,
+            ChecksumMode: str,
+        ) -> dict[str, object]:
+            assert Bucket == "audit-bucket"
+            assert ChecksumMode == "ENABLED"
+            try:
+                stored = self.objects[Key]
+            except KeyError as exc:
+                raise Missing from exc
+            return {
+                "Metadata": stored["Metadata"],
+                "ContentLength": len(stored["Body"]),
+                "ChecksumSHA256": stored["ChecksumSHA256"],
+                "ServerSideEncryption": stored["ServerSideEncryption"],
+                "SSEKMSKeyId": stored.get("SSEKMSKeyId"),
+            }
+
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
+            assert Bucket == "audit-bucket"
+            return {"Body": io.BytesIO(self.objects[Key]["Body"])}
+
+        def put_object(self, **arguments: object) -> None:
+            key = str(arguments["Key"])
+            assert arguments["IfNoneMatch"] == "*"
+            assert arguments["ServerSideEncryption"] == "AES256"
+            if key in self.objects:
+                raise RuntimeError("precondition failed")
+            self.objects[key] = {
+                "Metadata": arguments["Metadata"],
+                "Body": arguments["Body"],
+                "ChecksumSHA256": arguments["ChecksumSHA256"],
+                "ServerSideEncryption": arguments["ServerSideEncryption"],
+                "SSEKMSKeyId": arguments.get("SSEKMSKeyId"),
+            }
+
+    class AgeResult:
+        stdout = b"age-encryption.org/v1\nclient-encrypted-audit"
+
+    recipient = tmp_path / "archive-age-recipient"
+    private_key = tmp_path / "archive-signing-private.pem"
+    public_key = tmp_path / "archive-signing-public.pem"
+    wrong_private_key = tmp_path / "wrong-private.pem"
+    wrong_public_key = tmp_path / "wrong-public.pem"
+    recipient.write_text("age1fixture-recipient-for-tests\n")
+    subprocess.run(
+        [
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            str(private_key),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "pkey",
+            "-in",
+            str(private_key),
+            "-pubout",
+            "-out",
+            str(public_key),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            str(wrong_private_key),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "pkey",
+            "-in",
+            str(wrong_private_key),
+            "-pubout",
+            "-out",
+            str(wrong_public_key),
+        ],
+        check=True,
+    )
+    client = Client()
+    encryptions = 0
+
+    def commands(arguments: list[str], **kwargs: object) -> object:
+        nonlocal encryptions
+        if arguments[0] == "age":
+            encryptions += 1
+            return AgeResult()
+        return subprocess.run(arguments, **kwargs)
+
+    store = EncryptedAuditArchiveStore(
+        client=client,
+        bucket="audit-bucket",
+        archive_prefix="audit-archive/site-1",
+        site_id="site-1",
+        age_recipient_file=recipient,
+        signing_private_key_file=private_key,
+        signing_public_key_file=public_key,
+        signing_key_id="audit-ed25519-2026",
+        server_side_encryption="AES256",
+        command_runner=commands,
+    )
+    plaintext = b'{"audit":"bounded"}\n'
+    digest = hashlib.sha256(plaintext).hexdigest()
+    object_key = f"audit/site-1/{digest}.jsonl.age"
+
+    first = store.publish(object_key=object_key, plaintext=plaintext)
+    retry = store.publish(object_key=object_key, plaintext=plaintext)
+
+    assert first == retry
+    assert encryptions == 1
+    stored = client.objects[f"audit-archive/site-1/{object_key}"]
+    assert stored["Body"] != plaintext
+    assert first.object_key == object_key
+    assert first.detached_signature
+
+    metadata = dict(stored["Metadata"])
+    stored["Metadata"]["encrypted-sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="identity"):
+        store.publish(object_key=object_key, plaintext=plaintext)
+    stored["Metadata"] = metadata
+    original_body = stored["Body"]
+    stored["Body"] = b"x" * len(original_body)
+    with pytest.raises(RuntimeError, match="ciphertext integrity"):
+        store.publish(object_key=object_key, plaintext=plaintext)
+    stored["Body"] = original_body
+
+    wrong_verifier = EncryptedAuditArchiveStore(
+        client=client,
+        bucket="audit-bucket",
+        archive_prefix="audit-archive/site-1",
+        site_id="site-1",
+        age_recipient_file=recipient,
+        signing_private_key_file=private_key,
+        signing_public_key_file=wrong_public_key,
+        signing_key_id="audit-ed25519-2026",
+        server_side_encryption="AES256",
+        command_runner=commands,
+    )
+    with pytest.raises(RuntimeError, match="sender signature verification"):
+        wrong_verifier.publish(object_key=object_key, plaintext=plaintext)
 
 
 def test_deployment_and_backup_artifacts_are_hardened_and_secret_free() -> None:
@@ -958,9 +1561,13 @@ def test_deployment_and_backup_artifacts_are_hardened_and_secret_free() -> None:
     dockerfile = (REPO_ROOT / "deploy/pilot/Dockerfile.api").read_text()
     prometheus = (REPO_ROOT / "deploy/pilot/prometheus.yml").read_text()
     backup = (REPO_ROOT / "scripts/pilot/backup.sh").read_text()
+    backup_snapshot = (
+        REPO_ROOT / "scripts/pilot/backup_snapshot.py"
+    ).read_text()
     restore = (REPO_ROOT / "scripts/pilot/restore.sh").read_text()
     nginx = (REPO_ROOT / "deploy/pilot/nginx.conf").read_text()
     api_lock = (REPO_ROOT / "deploy/pilot/api-requirements.lock").read_text()
+    dockerignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
     parsed = yaml.safe_load(compose)
 
     assert "network_mode: host" not in compose
@@ -982,29 +1589,71 @@ def test_deployment_and_backup_artifacts_are_hardened_and_secret_free() -> None:
     assert "retention" in prometheus
     assert "credentials_file" in prometheus
     assert parsed["services"]["tls-proxy"]["ports"]
-    assert set(parsed["services"]) == {"postgres", "api", "tls-proxy", "prometheus"}
+    assert set(parsed["services"]) == {
+        "postgres",
+        "role-bootstrap",
+        "migrate",
+        "role-grants",
+        "provision",
+        "api",
+        "notifications",
+        "retention",
+        "tls-proxy",
+        "prometheus",
+    }
     assert all(
         service.get("pids_limit", 0) > 0 for service in parsed["services"].values()
     )
     assert "TLSv1.2 TLSv1.3" in nginx
     assert "location ^~ /internal/" in nginx
+    assert "location ^~ /api/internal/" in nginx
+    assert nginx.index("location ^~ /api/internal/") < nginx.index("location / {")
     assert "X-Forwarded-Proto https" in nginx
     assert "torch==" not in api_lock
     assert "opencv" not in api_lock
     assert "gradio" not in api_lock
-    assert "pg_dump" in backup and "--format=custom" in backup
+    assert "backup_snapshot.py" in backup
+    assert "pg_dump" in backup_snapshot and "--format=custom" in backup_snapshot
     assert "--page-size 1000" in backup
-    assert "--query" in backup
+    assert "--max-items" in backup
+    assert "s3api get-object" in backup and "s3 sync" not in backup
     assert "age" in backup and "sha256sum" in backup
     assert "openssl dgst -sha256 -verify" in backup
     assert "pg_restore" in restore and "--exit-on-error" in restore
     assert "openssl dgst -sha256 -verify" in restore
     assert "--single-transaction" in restore
     assert "restore-drill-receipt" in restore
+    assert "pilot_health" not in compose
+    assert "kuzet_owner" in (
+        REPO_ROOT / "scripts/pilot/bootstrap_roles.py"
+    ).read_text()
+    role_bootstrap = (REPO_ROOT / "scripts/pilot/bootstrap_roles.py").read_text()
+    assert "ALTER DATABASE" in role_bootstrap and "ALTER SCHEMA public OWNER" in role_bootstrap
+    assert "REVOKE CONNECT" in role_bootstrap
+    assert "INSERT, UPDATE, DELETE ON ALL TABLES" not in role_bootstrap
+    assert "ALTER DEFAULT PRIVILEGES" not in role_bootstrap
+    assert "PILOT_MEASURED_CAPACITY_SHA256" in compose
+    assert "service_completed_successfully" in compose
+    assert parsed["networks"]["storage-egress"]["external"] is True
+    network_policy = (REPO_ROOT / "deploy/pilot/NETWORK_POLICY.md").read_text()
+    assert "DOCKER-USER" in network_policy
+    assert "0.0.0.0/0" in network_policy and "Never substitute" in network_policy
+    assert dockerignore[0] == "**"
+    assert "!protector/**" in dockerignore
+    assert "!deploy/pilot/**" in dockerignore
+    assert not any(
+        rule.startswith("!demos")
+        or rule.startswith("!data")
+        or rule.startswith("!.git")
+        or rule.startswith("!.env")
+        for rule in dockerignore
+    )
     assert 'runtime_lock_path="/tmp/kuzet-api.lock"' in (
         REPO_ROOT / "protector/pilot/api/production.py"
     ).read_text()
-    combined = "\n".join((compose, dockerfile, prometheus, backup, restore))
+    combined = "\n".join(
+        (compose, dockerfile, prometheus, backup, backup_snapshot, restore)
+    )
     assert "POSTGRES_PASSWORD=" not in combined
     assert "PILOT_SESSION_SECRET=" not in combined
     assert "AKIA" not in combined

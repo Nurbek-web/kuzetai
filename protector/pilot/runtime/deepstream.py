@@ -13,6 +13,8 @@ import argparse
 import hashlib
 import importlib
 import math
+import os
+import stat
 import subprocess
 import sys
 import time
@@ -20,14 +22,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 from pydantic import Field, field_validator
 
-from protector.pilot.config import FrozenModel, SiteConfig, load_site_config
+from protector.pilot.capacity_acceptance import require_measured_primary_capacity
+from protector.pilot.config import FrozenModel, SiteConfig
 from protector.pilot.gates import (
     CapacityReportV1,
+    MeasuredCapacityReportV1,
     ModelArtifactV1,
     ModelGate,
     ShadowStageReportV1,
@@ -40,6 +44,13 @@ from protector.pilot.runtime.evidence import (
     SplitMuxEvidenceSinkFactory,
 )
 from protector.pilot.runtime.supervisor import CameraHealth, CameraSupervisor
+from protector.pilot.telemetry import (
+    AsyncRuntimeTelemetryPublisher,
+    AuthenticatedTelemetryClient,
+    RuntimeTelemetryPublisher,
+    TargetResourceMetricsProvider,
+    read_machine_token,
+)
 
 DEEPSTREAM_IMAGE = (
     "nvcr.io/nvidia/deepstream:9.1-samples-multiarch"
@@ -625,6 +636,18 @@ BindingLoader = Callable[[], object]
 EvidenceSinkFactory = Callable[[Any, SourcePlan], Any | None]
 
 
+class RuntimeTelemetrySink(Protocol):
+    def enqueue(
+        self,
+        health: list[CameraHealth],
+        *,
+        analytics_state: str,
+        evidence_state: str,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class DeepStreamDataPlane:
     """Target-only adapter that turns the validated specification into one GStreamer graph."""
 
@@ -637,6 +660,7 @@ class DeepStreamDataPlane:
         fatal_callback: Callable[[], None] | None = None,
         evidence_sink_factory: EvidenceSinkFactory | None = None,
         runtime_session_seed_factory: Callable[[], UUID | str] = uuid4,
+        telemetry_publisher_factory: Callable[[str], RuntimeTelemetrySink] | None = None,
     ) -> None:
         self._manifest = runtime_manifest
         self._runtime_info = runtime_info
@@ -644,6 +668,8 @@ class DeepStreamDataPlane:
         self._fatal_callback = fatal_callback or (lambda: None)
         self._evidence_sink_factory = evidence_sink_factory
         self._runtime_session_seed_factory = runtime_session_seed_factory
+        self._telemetry_publisher_factory = telemetry_publisher_factory
+        self._telemetry_publisher: RuntimeTelemetrySink | None = None
         self._graph: DeepStreamGraphSpec | None = None
         self._pipeline: Any | None = None
         self._supervisor: CameraSupervisor | None = None
@@ -654,6 +680,7 @@ class DeepStreamDataPlane:
         self._failed_reason: str | None = None
         self._invalid_metadata_count = 0
         self._evidence_attachment_failures = 0
+        self._telemetry_failures = 0
         self._started_monotonic: float | None = None
         self._awaiting_frame_since: dict[str, float] = {}
         self._source_time_mapper = SourceTimeMapper()
@@ -692,6 +719,11 @@ class DeepStreamDataPlane:
             wall_clock=lambda: datetime.now(UTC),
             runtime_session_seed=self._runtime_session_seed_factory(),
         )
+        self._telemetry_publisher = (
+            self._telemetry_publisher_factory(self._supervisor.runtime_session_id)
+            if self._telemetry_publisher_factory is not None
+            else None
+        )
         self._recovery = SourceRecoveryCoordinator(
             supervisor=self._supervisor,
             source_ids={source.camera_id: source.source_id for source in graph.sources},
@@ -707,6 +739,8 @@ class DeepStreamDataPlane:
             bus.add_signal_watch()
             bus.connect("message", self._on_bus_message)
             bindings.glib.timeout_add(250, self._advance_recovery)
+            if self._telemetry_publisher is not None:
+                bindings.glib.timeout_add(1_000, self._publish_telemetry)
             state_result = self._pipeline.set_state(bindings.gst.State.PLAYING)
             if state_result == bindings.gst.StateChangeReturn.FAILURE:
                 raise RuntimeError("DeepStream pipeline failed to enter PLAYING")
@@ -715,23 +749,42 @@ class DeepStreamDataPlane:
             raise
 
     def stop(self) -> None:
+        cleanup_error: BaseException | None = None
+
+        def cleanup(action: Callable[[], None]) -> None:
+            nonlocal cleanup_error
+            try:
+                action()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+
+        if self._telemetry_publisher is not None:
+            cleanup(self._telemetry_publisher.close)
         if self._pipeline is not None and self._bindings is not None:
-            stop_pipeline(self._pipeline, self._bindings.gst)
+            cleanup(lambda: stop_pipeline(self._pipeline, self._bindings.gst))
         if self._graph is not None and hasattr(self._evidence_sink_factory, "disable"):
             for source in self._graph.sources:
-                self._evidence_sink_factory.disable(source.camera_id)  # type: ignore[attr-defined]
+                cleanup(
+                    lambda camera_id=source.camera_id: self._evidence_sink_factory.disable(  # type: ignore[union-attr]
+                        camera_id
+                    )
+                )
+        if self._supervisor is not None:
+            cleanup(self._supervisor.clear_observations)
         self._pipeline = None
         self._graph = None
         self._bindings = None
         self._recovery = None
         self._locations = {}
         self._metadata_publisher = None
+        self._telemetry_publisher = None
         self._started_monotonic = None
         self._awaiting_frame_since = {}
         self._source_time_mapper = SourceTimeMapper()
-        if self._supervisor is not None:
-            self._supervisor.clear_observations()
         self._supervisor = None
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def health(self) -> list[CameraHealth]:
         return [] if self._supervisor is None else self._supervisor.health()
@@ -750,6 +803,11 @@ class DeepStreamDataPlane:
     def evidence_attachment_failures(self) -> int:
         """Count camera writers that safely fell back to encoded-data discard."""
         return self._evidence_attachment_failures
+
+    @property
+    def telemetry_failures(self) -> int:
+        """Count failed control-plane publications without leaking provider details."""
+        return self._telemetry_failures
 
     def drain_observations(self) -> list[Any]:
         """Deliver bounded metadata observations; decoded GPU surfaces never leave the graph."""
@@ -786,6 +844,28 @@ class DeepStreamDataPlane:
                     self._recovery.handle_camera_failure(health.camera_id, "source_frame_timeout", force=True)
                     self._awaiting_frame_since[health.camera_id] = now
             self._recovery.advance()
+        return self._pipeline is not None and self._failed_reason is None
+
+    def _publish_telemetry(self) -> bool:
+        publisher = self._telemetry_publisher
+        if publisher is not None:
+            try:
+                publisher.enqueue(
+                    self.health(),
+                    analytics_state=(
+                        "failed" if self._failed_reason is not None else "degraded"
+                    ),
+                    evidence_state=(
+                        "degraded"
+                        if self._evidence_sink_factory is not None
+                        and self._evidence_attachment_failures == 0
+                        else "failed"
+                    ),
+                )
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                self._telemetry_failures += 1
         return self._pipeline is not None and self._failed_reason is None
 
     def _build_pipeline(
@@ -1290,26 +1370,108 @@ def build_evidence_sink_factory(site: SiteConfig) -> SplitMuxEvidenceSinkFactory
     )
 
 
+def _read_reviewed_file(
+    path: Path,
+    *,
+    expected_sha256: str,
+    label: str,
+    max_bytes: int = 8 * 1024 * 1024,
+) -> bytes:
+    if (
+        not path.is_absolute()
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+        or not 1 <= max_bytes <= 64 * 1024 * 1024
+    ):
+        raise RuntimeError(f"reviewed {label} is unavailable")
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= max_bytes:
+            raise RuntimeError(f"reviewed {label} exceeds finite bound")
+        payload = os.read(descriptor, max_bytes + 1)
+    except OSError as exc:
+        raise RuntimeError(f"reviewed {label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        len(payload) > max_bytes
+        or hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise RuntimeError(f"reviewed {label} digest mismatch")
+    return payload
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run only with signed target inputs; bare image invocation exits non-zero."""
     parser = argparse.ArgumentParser(description="Run the Kuzet shared DeepStream data plane")
     parser.add_argument("--site-config", type=Path, required=True)
+    parser.add_argument("--site-config-sha256", required=True)
     parser.add_argument("--runtime-manifest", type=Path, required=True)
+    parser.add_argument("--runtime-manifest-sha256", required=True)
+    parser.add_argument("--measured-capacity-report", type=Path, required=True)
+    parser.add_argument("--measured-capacity-sha256", required=True)
+    parser.add_argument("--control-plane-url", required=True)
+    parser.add_argument("--machine-token-file", type=Path, required=True)
     arguments = parser.parse_args(argv)
     try:
         import yaml
 
-        site = load_site_config(arguments.site_config)
+        site_payload = _read_reviewed_file(
+            arguments.site_config,
+            expected_sha256=arguments.site_config_sha256,
+            label="site configuration",
+        )
+        runtime_payload = _read_reviewed_file(
+            arguments.runtime_manifest,
+            expected_sha256=arguments.runtime_manifest_sha256,
+            label="runtime manifest",
+        )
+        capacity_payload = _read_reviewed_file(
+            arguments.measured_capacity_report,
+            expected_sha256=arguments.measured_capacity_sha256,
+            label="measured capacity report",
+        )
+        site = SiteConfig.model_validate(yaml.safe_load(site_payload))
         runtime_manifest = RuntimeModelManifestV1.model_validate(
-            yaml.safe_load(arguments.runtime_manifest.read_text(encoding="utf-8"))
+            yaml.safe_load(runtime_payload)
+        )
+        measured_capacity = MeasuredCapacityReportV1.model_validate(
+            yaml.safe_load(capacity_payload)
+        )
+        require_measured_primary_capacity(
+            site_config=site,
+            runtime_manifest=runtime_manifest,
+            report=measured_capacity,
+        )
+        telemetry_client = AuthenticatedTelemetryClient(
+            base_url=arguments.control_plane_url,
+            machine_token=read_machine_token(arguments.machine_token_file),
         )
         runtime = DeepStreamDataPlane(
             runtime_manifest=runtime_manifest,
             runtime_info=_target_runtime_info,
             evidence_sink_factory=build_evidence_sink_factory(site),
+            telemetry_publisher_factory=lambda runtime_session_id: AsyncRuntimeTelemetryPublisher(
+                publisher=RuntimeTelemetryPublisher(
+                    client=telemetry_client,
+                    runtime_session_id=runtime_session_id,
+                ),
+                extra_metrics_provider=TargetResourceMetricsProvider(
+                    spool_root=site.storage.retention.encoded_spool_root,
+                ),
+            ),
         )
         runtime.start(site)
-    except (GraphContractError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+    except (
+        GraphContractError,
+        OSError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+        ValueError,
+    ) as exc:
         parser.error(str(exc))
     try:
         assert runtime._bindings is not None

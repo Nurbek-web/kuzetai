@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -30,6 +32,8 @@ EvidenceRetentionDays = Annotated[int, Field(ge=1, le=90)]
 MetadataRetentionDays = Annotated[int, Field(ge=1, le=365)]
 FiniteStorageBytes = Annotated[int, Field(gt=0, le=1_000_000_000_000)]
 DOCKER_SECRETS_DIR = Path("/run/secrets")
+MAX_SECRET_BYTES = 16 * 1024
+_SECRET_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class FrozenModel(BaseModel):
@@ -53,21 +57,46 @@ class SecretReference(FrozenModel):
     def exactly_one_source(self) -> SecretReference:
         if (self.environment is None) == (self.docker_secret is None):
             raise ValueError("provide exactly one of environment or docker_secret")
-        if self.docker_secret is not None and not self.docker_secret.is_relative_to("/run/secrets"):
-            raise ValueError("docker_secret must be under /run/secrets")
+        if self.docker_secret is not None:
+            expected_parent = DOCKER_SECRETS_DIR
+            if (
+                not self.docker_secret.is_absolute()
+                or self.docker_secret.parent != expected_parent
+                or _SECRET_FILE_NAME.fullmatch(self.docker_secret.name) is None
+                or self.docker_secret != expected_parent / self.docker_secret.name
+            ):
+                raise ValueError("docker_secret must be one canonical direct secret file")
         return self
 
     def resolve(self) -> SecretStr:
         if self.environment is not None:
             value = os.environ.get(self.environment)
-            if not value:
+            if not value or len(value.encode("utf-8")) > MAX_SECRET_BYTES:
                 raise ValueError(f"missing required environment secret: {self.environment}")
             return SecretStr(value)
         assert self.docker_secret is not None
+        descriptor = -1
         try:
-            value = self.docker_secret.read_text(encoding="utf-8").strip()
+            descriptor = os.open(
+                self.docker_secret,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or not 0 < metadata.st_size <= MAX_SECRET_BYTES
+            ):
+                raise ValueError("Docker secret is invalid")
+            payload = os.read(descriptor, MAX_SECRET_BYTES + 1)
         except OSError as exc:
             raise ValueError(f"unable to read Docker secret: {self.docker_secret}") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        try:
+            value = payload.decode("utf-8").strip()
+        except UnicodeError as exc:
+            raise ValueError("Docker secret is invalid") from exc
         if not value:
             raise ValueError(f"Docker secret is empty: {self.docker_secret}")
         return SecretStr(value)

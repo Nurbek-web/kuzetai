@@ -33,7 +33,7 @@ from protector.pilot.api.web import (
 from protector.pilot.api.web import (
     router as web_router,
 )
-from protector.pilot.metrics import PilotHealthService, PilotMetrics
+from protector.pilot.metrics import PilotHealthService, PilotMetrics, PilotTelemetryState
 from protector.pilot.notifications.base import EvidenceLinkSigner
 from protector.pilot.storage.repositories import PilotRepository
 
@@ -238,6 +238,7 @@ def create_app(
     evidence_link_now: Callable[[], datetime] | None = None,
     metrics: PilotMetrics | None = None,
     metrics_refresh: Callable[[], None] | None = None,
+    telemetry: PilotTelemetryState | None = None,
     health: PilotHealthService | None = None,
 ) -> FastAPI:
     """Construct an explicitly configured app; secrets have no committed defaults."""
@@ -254,6 +255,8 @@ def create_app(
         raise ValueError("evidence link clock must be callable")
     if metrics_refresh is not None and (metrics is None or not callable(metrics_refresh)):
         raise ValueError("metrics refresh requires metrics and must be callable")
+    if telemetry is not None and metrics is None:
+        raise ValueError("telemetry ingestion requires metrics")
     if pilot_site_id is not None:
         pilot_site_id = pilot_site_id.strip()
         if not pilot_site_id or len(pilot_site_id) > MAX_PILOT_SITE_ID_LENGTH:
@@ -292,6 +295,7 @@ def create_app(
         evidence_link_now=evidence_link_now if evidence_link_now is not None else utc_now,
         metrics=metrics,
         metrics_refresh=metrics_refresh,
+        telemetry=telemetry,
         health=health,
     )
     app.add_middleware(PilotWebSecurityHeadersMiddleware)

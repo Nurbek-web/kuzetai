@@ -7,6 +7,7 @@ import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
@@ -37,6 +38,10 @@ _NOTIFICATION_RESULTS = frozenset({"attempted", "delivered", "failed", "dead_let
 _CAMERA_STATES = frozenset({"starting", "online", "degraded", "offline", "reconnecting"})
 _COMPONENT_STATES = frozenset({"healthy", "degraded", "failed"})
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_PUBLISHER_COMPONENTS: Mapping[str, frozenset[str]] = {
+    "runtime": frozenset({"analytics", "evidence"}),
+    "notifications": frozenset({"notifications"}),
+}
 
 
 def _identifier(value: str, *, name: str) -> str:
@@ -87,7 +92,7 @@ class PilotMetrics:
         self.camera_ids = frozenset(configured_cameras)
         self.model_artifact_ids = frozenset(configured_artifacts)
         self.registry = registry or CollectorRegistry(auto_describe=True)
-        self._snapshots: dict[tuple[str, ...], int] = {}
+        self._snapshots: dict[tuple[str, ...], tuple[str, int]] = {}
         self._snapshot_lock = threading.Lock()
 
         constant = ("site_id",)
@@ -181,12 +186,17 @@ class PilotMetrics:
         available: bool,
         last_frame_age_seconds: float,
         reconnects_total: int,
+        runtime_session_id: str = "legacy",
     ) -> None:
         self._camera(camera_id)
         if not isinstance(available, bool):
             raise ValueError("available must be a boolean")
         age = _finite_nonnegative(last_frame_age_seconds, name="last frame age")
         reconnects = _counter_value(reconnects_total, name="reconnect total")
+        runtime_session_id = _identifier(
+            runtime_session_id,
+            name="runtime_session_id",
+        )
         labels = (self.site_id, camera_id)
         self._camera_available.labels(*labels).set(1 if available else 0)
         self._last_frame_age.labels(*labels).set(age)
@@ -194,6 +204,7 @@ class PilotMetrics:
             ("reconnect", camera_id),
             reconnects,
             lambda delta: self._reconnects.labels(*labels).inc(delta),
+            runtime_session_id=runtime_session_id,
         )
 
     def update_samples(
@@ -204,6 +215,7 @@ class PilotMetrics:
         scheduled_total: int,
         processed_total: int,
         dropped_total: int,
+        runtime_session_id: str = "legacy",
     ) -> None:
         self._camera(camera_id)
         module = self._module(module)
@@ -214,6 +226,10 @@ class PilotMetrics:
         }
         if totals["processed"] + totals["dropped"] > totals["scheduled"]:
             raise ValueError("processed and dropped samples cannot exceed scheduled samples")
+        runtime_session_id = _identifier(
+            runtime_session_id,
+            name="runtime_session_id",
+        )
         self._apply_snapshots(
             [
                 (
@@ -224,7 +240,8 @@ class PilotMetrics:
                     ).inc(delta),
                 )
                 for result, total in totals.items()
-            ]
+            ],
+            runtime_session_id=runtime_session_id,
         )
 
     def set_queue_age(self, *, queue: str, age_seconds: float) -> None:
@@ -251,14 +268,54 @@ class PilotMetrics:
     def record_candidate(self, *, module: str) -> None:
         self._candidates.labels(self.site_id, self._module(module)).inc()
 
+    def update_candidate_total(
+        self,
+        *,
+        module: str,
+        total: int,
+        runtime_session_id: str,
+    ) -> None:
+        module = self._module(module)
+        self._apply_snapshot(
+            ("candidate", module),
+            _counter_value(total, name="candidate total"),
+            lambda delta: self._candidates.labels(self.site_id, module).inc(delta),
+            runtime_session_id=_identifier(
+                runtime_session_id,
+                name="runtime_session_id",
+            ),
+        )
+
     def record_evidence(self, *, result: str, latency_seconds: float | None = None) -> None:
         if result not in _EVIDENCE_RESULTS:
             raise ValueError("evidence result is not a finite state")
         if latency_seconds is not None:
-            self._evidence_latency.labels(self.site_id).observe(
-                _finite_nonnegative(latency_seconds, name="evidence latency")
-            )
+            self.observe_evidence_latency(latency_seconds)
         self._evidence_results.labels(self.site_id, result).inc()
+
+    def observe_evidence_latency(self, latency_seconds: float) -> None:
+        self._evidence_latency.labels(self.site_id).observe(
+            _finite_nonnegative(latency_seconds, name="evidence latency")
+        )
+
+    def update_evidence_total(
+        self,
+        *,
+        result: str,
+        total: int,
+        runtime_session_id: str,
+    ) -> None:
+        if result not in _EVIDENCE_RESULTS:
+            raise ValueError("evidence result is not a finite state")
+        self._apply_snapshot(
+            ("evidence", result),
+            _counter_value(total, name="evidence total"),
+            lambda delta: self._evidence_results.labels(self.site_id, result).inc(delta),
+            runtime_session_id=_identifier(
+                runtime_session_id,
+                name="runtime_session_id",
+            ),
+        )
 
     def set_gpu(
         self,
@@ -291,30 +348,93 @@ class PilotMetrics:
             raise ValueError("notification result is not a finite state")
         self._notification_results.labels(self.site_id, result).inc()
 
+    def update_notification_total(
+        self,
+        *,
+        result: str,
+        total: int,
+        runtime_session_id: str,
+    ) -> None:
+        if result not in _NOTIFICATION_RESULTS:
+            raise ValueError("notification result is not a finite state")
+        self._apply_snapshot(
+            ("notification", result),
+            _counter_value(total, name="notification total"),
+            lambda delta: self._notification_results.labels(self.site_id, result).inc(delta),
+            runtime_session_id=_identifier(
+                runtime_session_id,
+                name="runtime_session_id",
+            ),
+        )
+
     def render(self) -> bytes:
         return generate_latest(self.registry)
+
+    def validate_snapshot_values(
+        self,
+        updates: Sequence[tuple[tuple[str, ...], int]],
+        *,
+        runtime_session_id: str,
+    ) -> None:
+        runtime_session_id = _identifier(
+            runtime_session_id,
+            name="runtime_session_id",
+        )
+        normalized = [
+            (key, _counter_value(value, name="metric snapshot"))
+            for key, value in updates
+        ]
+        if len({key for key, _ in normalized}) != len(normalized):
+            raise ValueError("metric snapshot keys must be unique")
+        with self._snapshot_lock:
+            self._validate_snapshots_locked(normalized, runtime_session_id)
 
     def _apply_snapshot(
         self,
         key: tuple[str, ...],
         value: int,
         increment: Callable[[int], None],
+        *,
+        runtime_session_id: str = "legacy",
     ) -> None:
-        self._apply_snapshots([(key, value, increment)])
+        self._apply_snapshots(
+            [(key, value, increment)],
+            runtime_session_id=runtime_session_id,
+        )
 
     def _apply_snapshots(
         self,
         updates: list[tuple[tuple[str, ...], int, Callable[[int], None]]],
+        *,
+        runtime_session_id: str = "legacy",
     ) -> None:
         with self._snapshot_lock:
-            for key, value, _ in updates:
-                if value < self._snapshots.get(key, 0):
-                    raise ValueError("cumulative metric snapshot regressed")
+            self._validate_snapshots_locked(
+                [(key, value) for key, value, _ in updates],
+                runtime_session_id,
+            )
             for key, value, increment in updates:
-                previous = self._snapshots.get(key, 0)
-                if value > previous:
-                    increment(value - previous)
-                self._snapshots[key] = value
+                previous_session, previous_value = self._snapshots.get(
+                    key,
+                    (runtime_session_id, 0),
+                )
+                delta = value if previous_session != runtime_session_id else value - previous_value
+                if delta:
+                    increment(delta)
+                self._snapshots[key] = (runtime_session_id, value)
+
+    def _validate_snapshots_locked(
+        self,
+        updates: Sequence[tuple[tuple[str, ...], int]],
+        runtime_session_id: str,
+    ) -> None:
+        for key, value in updates:
+            previous_session, previous_value = self._snapshots.get(
+                key,
+                (runtime_session_id, 0),
+            )
+            if previous_session == runtime_session_id and value < previous_value:
+                raise ValueError("cumulative metric snapshot regressed")
 
     def _camera(self, camera_id: str) -> None:
         if camera_id not in self.camera_ids:
@@ -325,6 +445,120 @@ class PilotMetrics:
         if module not in _MODULES:
             raise ValueError("module is not a finite configured dimension")
         return module
+
+
+class PilotTelemetryState:
+    """Own fresh component states and serialize idempotent publisher updates."""
+
+    def __init__(
+        self,
+        *,
+        site_id: str,
+        stale_after_seconds: int,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.site_id = _identifier(site_id, name="site_id")
+        if (
+            not isinstance(stale_after_seconds, int)
+            or isinstance(stale_after_seconds, bool)
+            or not 1 <= stale_after_seconds <= 300
+        ):
+            raise ValueError("telemetry stale threshold must be between 1 and 300 seconds")
+        if clock is not None and not callable(clock):
+            raise ValueError("telemetry clock must be callable")
+        self._stale_after = timedelta(seconds=stale_after_seconds)
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._publisher_positions: dict[str, tuple[str, int, datetime, str]] = {}
+        self._components: dict[str, tuple[ComponentState, datetime]] = {}
+        self._lock = threading.Lock()
+
+    def apply(
+        self,
+        *,
+        publisher: str,
+        runtime_session_id: str,
+        sequence: int,
+        observed_at: datetime,
+        components: Mapping[str, ComponentState],
+        payload_digest: str,
+        update: Callable[[], None],
+    ) -> bool:
+        required_components = _PUBLISHER_COMPONENTS.get(publisher)
+        if required_components is None:
+            raise ValueError("telemetry publisher is not configured")
+        runtime_session_id = _identifier(
+            runtime_session_id,
+            name="runtime_session_id",
+        )
+        sequence = _counter_value(sequence, name="telemetry sequence")
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("telemetry timestamp must be UTC-aware")
+        observed_at = observed_at.astimezone(UTC)
+        current = self._clock()
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("telemetry clock must be UTC-aware")
+        current = current.astimezone(UTC)
+        age = current - observed_at
+        if age < timedelta(0) or age > self._stale_after:
+            raise ValueError("telemetry sample is outside the freshness window")
+        if set(components) != required_components:
+            raise ValueError("publisher must report its exact owned component set")
+        if any(state not in _COMPONENT_STATES for state in components.values()):
+            raise ValueError("component state is not finite")
+        if not callable(update):
+            raise ValueError("telemetry update must be callable")
+        if len(payload_digest) != 64 or any(
+            character not in "0123456789abcdef" for character in payload_digest
+        ):
+            raise ValueError("telemetry payload digest must be hexadecimal SHA-256")
+
+        with self._lock:
+            previous = self._publisher_positions.get(publisher)
+            if previous is not None:
+                (
+                    previous_session,
+                    previous_sequence,
+                    previous_observed_at,
+                    previous_digest,
+                ) = previous
+                if previous_session == runtime_session_id:
+                    if sequence == previous_sequence:
+                        if payload_digest != previous_digest:
+                            raise ValueError("telemetry sequence was replayed with a different body")
+                        return False
+                    if sequence < previous_sequence or observed_at < previous_observed_at:
+                        raise ValueError("telemetry sequence regressed")
+                elif observed_at < previous_observed_at:
+                    raise ValueError("telemetry session timestamp regressed")
+            update()
+            self._publisher_positions[publisher] = (
+                runtime_session_id,
+                sequence,
+                observed_at,
+                payload_digest,
+            )
+            for name, state in components.items():
+                self._components[name] = (state, observed_at)
+        return True
+
+    def component_states(self) -> dict[str, ComponentState]:
+        current = self._clock()
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("telemetry clock must be UTC-aware")
+        current = current.astimezone(UTC)
+        with self._lock:
+            result: dict[str, ComponentState] = {}
+            for name in ("analytics", "evidence", "notifications"):
+                sample = self._components.get(name)
+                if sample is None:
+                    result[name] = "failed"
+                    continue
+                state, observed_at = sample
+                age = current - observed_at
+                result[name] = (
+                    state if timedelta(0) <= age <= self._stale_after else "failed"
+                )
+            return result
 
 
 @dataclass(frozen=True, slots=True)

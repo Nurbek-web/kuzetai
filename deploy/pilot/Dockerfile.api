@@ -4,6 +4,12 @@ FROM --platform=linux/amd64 python:3.12.11-slim-bookworm@sha256:519591d6871b7bc4
 
 ARG TARGETARCH
 RUN test "$TARGETARCH" = "amd64"
+ADD --checksum=sha256:bdc69c09cbdd6cf8b1f333d372a1f58247b3a33146406333e30c0f26e8f51377 \
+    https://github.com/FiloSottile/age/releases/download/v1.3.1/age-v1.3.1-linux-amd64.tar.gz \
+    /tmp/age.tar.gz
+RUN tar -C /tmp -xzf /tmp/age.tar.gz \
+    && install -m 0755 /tmp/age/age /usr/local/bin/age \
+    && rm -rf /tmp/age /tmp/age.tar.gz
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -18,6 +24,8 @@ RUN uv pip sync --system --require-hashes /tmp/api-requirements.lock \
 COPY alembic.ini /app/alembic.ini
 COPY migrations /app/migrations
 COPY protector /app/protector
+COPY scripts/pilot /app/scripts/pilot
+RUN command -v age >/dev/null && command -v openssl >/dev/null
 
 RUN groupadd --gid 10001 kuzet \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent kuzet \

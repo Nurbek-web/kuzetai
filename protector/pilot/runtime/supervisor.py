@@ -119,6 +119,10 @@ class CameraSupervisor:
             ),
         )
 
+    @property
+    def runtime_session_id(self) -> str:
+        return self._runtime_session_seed
+
     def _state_for(self, camera_id: str) -> _CameraState:
         try:
             return self._states[camera_id]

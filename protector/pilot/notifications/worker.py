@@ -633,8 +633,8 @@ class NotificationWorker:
             idempotency_key=f"notification:{outbox.outbox_id}:dead_letter",
         )
 
-    @staticmethod
     def _audit(
+        self,
         session: Session,
         *,
         now: datetime,
@@ -647,6 +647,7 @@ class NotificationWorker:
         session.add(
             AuditEntryModel(
                 audit_id=str(uuid4()),
+                site_id=self._pilot_site_id,
                 occurred_at=now,
                 actor_user_id=None,
                 action=action,
