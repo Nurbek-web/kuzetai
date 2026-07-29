@@ -1334,12 +1334,23 @@ class SiteEventService:
             )
         except Exception:
             self._degrade("evidence_reservation_unavailable")
+            failed_event = self._failed_candidate_receipt(trigger.event)
+            release_ok = self._safe_release(reservation_id)
+            if failed_event is None or not release_ok:
+                self._degrade("pending_evidence_recovery_retryable")
+                self._schedule_pending_evidence_recovery()
+                return None
             if not self._ack_pending_identity(
                 event_id=trigger.event.event_id,
                 reservation_id=reservation_id,
             ):
                 self._degrade("pending_evidence_ack_failed")
-            return DurableCandidate(trigger, None, None)
+                return None
+            return DurableCandidate(
+                replace(trigger, event=failed_event),
+                None,
+                None,
+            )
 
         try:
             self._validate_seed_reservation(seed, reservation)
@@ -1555,16 +1566,21 @@ class SiteEventService:
                     self._completed.popitem(last=False)
 
     def _terminalize_candidate(self, expected: CandidateEventV1) -> bool:
+        return self._failed_candidate_receipt(expected) is not None
+
+    def _failed_candidate_receipt(
+        self,
+        expected: CandidateEventV1,
+    ) -> CandidateEventV1 | None:
         try:
-            self._verified_transition(
+            return self._verified_transition(
                 callback=self._mark_evidence_failed,
                 expected=expected,
                 target="failed",
             )
-            return True
         except Exception:
             self._degrade("evidence_terminal_transition_failed")
-            return False
+            return None
 
     def _make_evidence_intent(
         self,
@@ -1684,10 +1700,7 @@ class SiteEventService:
             self._degrade("pending_evidence_recovery_read_failed")
             self._schedule_pending_evidence_recovery()
             return
-        capacity = self.engine.limits.max_pending_events
-        if len(records) > capacity:
-            self._degrade("pending_evidence_recovery_capacity_exceeded")
-        for index, record in enumerate(records):
+        for record in records:
             try:
                 if record.phase == "seed":
                     seed = _PendingEvidenceSeed.from_payload(record.payload)
@@ -1721,6 +1734,10 @@ class SiteEventService:
                     ):
                         raise ValueError("pending evidence seed candidate identity changed")
                     if candidate.evidence_status == "ready":
+                        if not self._safe_release(seed.reservation_id):
+                            raise _RetryablePendingEvidenceError(
+                                "ready seed reservation cleanup is not durable"
+                            )
                         self._ack_recovered_identity(
                             event_id=seed.trigger.event.event_id,
                             reservation_id=seed.reservation_id,
@@ -1736,7 +1753,10 @@ class SiteEventService:
                             reservation_id=seed.reservation_id,
                         )
                         continue
-                    if index >= capacity:
+                    if not self._pending_slot_available(
+                        seed.trigger.event.event_id
+                    ):
+                        self._degrade("pending_evidence_recovery_capacity_exceeded")
                         if not self._terminalize_candidate(candidate):
                             raise _RetryablePendingEvidenceError(
                                 "seed capacity reconciliation is not durable"
@@ -1782,16 +1802,19 @@ class SiteEventService:
                     work,
                     trigger=replace(work.trigger, event=candidate),
                 )
-                if index >= capacity:
-                    if not self._fail_pending_work(work):
-                        raise _RetryablePendingEvidenceError(
-                            "pending evidence capacity reconciliation is not durable"
-                        )
-                    continue
                 if record.phase == "active" and candidate.evidence_status in (
                     "pending",
                     "failed",
                 ):
+                    if not self._pending_slot_available(
+                        work.trigger.event.event_id
+                    ):
+                        self._degrade("pending_evidence_recovery_capacity_exceeded")
+                        if not self._fail_pending_work(work):
+                            raise _RetryablePendingEvidenceError(
+                                "pending evidence capacity reconciliation is not durable"
+                            )
+                        continue
                     if not self._register_pending_work(work):
                         raise _RetryablePendingEvidenceError(
                             "recovered pending evidence capacity reached"
@@ -2176,6 +2199,14 @@ class SiteEventService:
                 return False
             self._pending_processing.add(event_id)
             return True
+
+    def _pending_slot_available(self, event_id: UUID) -> bool:
+        with self._state_lock:
+            return (
+                event_id in self._pending_work
+                or len(self._pending_work)
+                < self.engine.limits.max_pending_events
+            )
 
     @staticmethod
     def _validate_refreshed_reservation(

@@ -569,9 +569,15 @@ class EncodedFragmentRing:
         with self._lock:
             released = 0
             for record in self._records.values():
-                if record.pins.pop(reservation_id, None) is not None:
+                expires_at = record.pins.pop(reservation_id, None)
+                if expires_at is None:
+                    continue
+                try:
                     self._write_metadata(record)
-                    released += 1
+                except BaseException:
+                    record.pins[reservation_id] = expires_at
+                    raise
+                released += 1
             return released
 
     def expire_pins(self) -> int:
