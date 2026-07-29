@@ -168,6 +168,17 @@ class JournalItem:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingEvidenceJournalItem:
+    """One finite crash-recovery record outside the replay FIFO."""
+
+    event_id: str
+    reservation_id: str
+    phase: Literal["reserved", "active"]
+    payload: dict[str, Any]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceJournalReplayStatus:
     depth: int
     quarantine_depth: int
@@ -238,6 +249,31 @@ class SQLiteWALJournal:
                 error_type TEXT NOT NULL,
                 quarantined_at TEXT NOT NULL,
                 UNIQUE(original_item_id, idempotency_key)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_evidence_work (
+                event_id TEXT PRIMARY KEY,
+                reservation_id TEXT NOT NULL UNIQUE,
+                phase TEXT NOT NULL CHECK (phase IN ('reserved', 'active')),
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_evidence_quarantine (
+                quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                reservation_id TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                error_type TEXT NOT NULL,
+                quarantined_at TEXT NOT NULL
             )
             """
         )
@@ -380,6 +416,242 @@ class SQLiteWALJournal:
             idempotency_key=event.dedupe_key,
             payload=event.model_dump(mode="json"),
         )
+
+    def reserve_pending_evidence_work(
+        self,
+        *,
+        event_id: str,
+        reservation_id: str,
+        payload: dict[str, Any],
+    ) -> PendingEvidenceJournalItem:
+        """Persist immutable lifecycle identity before preview work begins."""
+        if not event_id or not reservation_id:
+            raise ValueError("pending evidence identities must be non-empty")
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if len(payload_json.encode("utf-8")) > self.max_payload_bytes:
+            raise ValueError(
+                f"pending evidence payload exceeds {self.max_payload_bytes} bytes"
+            )
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._connection.execute(
+                    """
+                    SELECT event_id, reservation_id, phase, payload_json, created_at
+                    FROM pending_evidence_work WHERE event_id = ? OR reservation_id = ?
+                    """,
+                    (event_id, reservation_id),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["event_id"] != event_id
+                        or existing["reservation_id"] != reservation_id
+                        or existing["payload_json"] != payload_json
+                    ):
+                        raise JournalPayloadConflictError(
+                            "pending evidence identity was reused with different data"
+                        )
+                    self._connection.commit()
+                    return self._row_to_pending_evidence(existing)
+                count = self._connection.execute(
+                    "SELECT count(*) FROM pending_evidence_work"
+                ).fetchone()[0]
+                if count >= self.max_items:
+                    raise JournalFullError(
+                        f"pending evidence capacity {self.max_items} reached"
+                    )
+                self._connection.execute(
+                    """
+                    INSERT INTO pending_evidence_work
+                        (event_id, reservation_id, phase, payload_json, created_at)
+                    VALUES (?, ?, 'reserved', ?, ?)
+                    """,
+                    (event_id, reservation_id, payload_json, created_at),
+                )
+                row = self._connection.execute(
+                    """
+                    SELECT event_id, reservation_id, phase, payload_json, created_at
+                    FROM pending_evidence_work WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+                self._connection.commit()
+                assert row is not None
+                return self._row_to_pending_evidence(row)
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def activate_pending_evidence_work(
+        self,
+        *,
+        event_id: str,
+        reservation_id: str,
+        payload: dict[str, Any],
+    ) -> PendingEvidenceJournalItem:
+        """Atomically publish one exact persisted record to the periodic drain."""
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if len(payload_json.encode("utf-8")) > self.max_payload_bytes:
+            raise ValueError(
+                f"pending evidence payload exceeds {self.max_payload_bytes} bytes"
+            )
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT event_id, reservation_id, phase, payload_json, created_at
+                    FROM pending_evidence_work WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+                if row is None or row["reservation_id"] != reservation_id:
+                    raise JournalPayloadConflictError(
+                        "pending evidence activation identity changed"
+                    )
+                if row["phase"] == "reserved":
+                    self._connection.execute(
+                        """
+                        UPDATE pending_evidence_work
+                        SET phase = 'active', payload_json = ?
+                        WHERE event_id = ? AND reservation_id = ? AND phase = 'reserved'
+                        """,
+                        (payload_json, event_id, reservation_id),
+                    )
+                    row = self._connection.execute(
+                        """
+                        SELECT event_id, reservation_id, phase, payload_json, created_at
+                        FROM pending_evidence_work WHERE event_id = ?
+                        """,
+                        (event_id,),
+                    ).fetchone()
+                elif row["payload_json"] != payload_json:
+                    raise JournalPayloadConflictError(
+                        "active pending evidence payload changed"
+                    )
+                self._connection.commit()
+                assert row is not None
+                return self._row_to_pending_evidence(row)
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def pending_evidence_work_items(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[PendingEvidenceJournalItem, ...]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT event_id, reservation_id, phase, payload_json, created_at
+                FROM pending_evidence_work ORDER BY created_at, event_id LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(self._row_to_pending_evidence(row) for row in rows)
+
+    def acknowledge_pending_evidence_work(
+        self,
+        *,
+        event_id: str,
+        reservation_id: str,
+    ) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM pending_evidence_work
+                WHERE event_id = ? AND reservation_id = ?
+                """,
+                (event_id, reservation_id),
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
+
+    def pending_evidence_work_depth(self) -> int:
+        with self._lock:
+            return int(
+                self._connection.execute(
+                    "SELECT count(*) FROM pending_evidence_work"
+                ).fetchone()[0]
+            )
+
+    def quarantine_pending_evidence_work(
+        self,
+        *,
+        event_id: str,
+        reservation_id: str,
+        error_type: str,
+    ) -> bool:
+        """Move poison lifecycle work out of the active finite-capacity table."""
+        safe_error_type = error_type[:128] or "RecoveryError"
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT event_id, reservation_id, phase, payload_json, created_at
+                    FROM pending_evidence_work
+                    WHERE event_id = ? AND reservation_id = ?
+                    """,
+                    (event_id, reservation_id),
+                ).fetchone()
+                if row is None:
+                    self._connection.commit()
+                    return False
+                count = self._connection.execute(
+                    "SELECT count(*) FROM pending_evidence_quarantine"
+                ).fetchone()[0]
+                if count >= self.max_quarantine_items:
+                    self._connection.execute(
+                        """
+                        DELETE FROM pending_evidence_quarantine
+                        WHERE quarantine_id = (
+                            SELECT quarantine_id FROM pending_evidence_quarantine
+                            ORDER BY quarantine_id LIMIT 1
+                        )
+                        """
+                    )
+                self._connection.execute(
+                    """
+                    INSERT INTO pending_evidence_quarantine
+                        (event_id, reservation_id, phase, payload_json, created_at,
+                         error_type, quarantined_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["event_id"],
+                        row["reservation_id"],
+                        row["phase"],
+                        row["payload_json"],
+                        row["created_at"],
+                        safe_error_type,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                self._connection.execute(
+                    """
+                    DELETE FROM pending_evidence_work
+                    WHERE event_id = ? AND reservation_id = ?
+                    """,
+                    (event_id, reservation_id),
+                )
+                self._connection.commit()
+                return True
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def pending_evidence_quarantine_depth(self) -> int:
+        with self._lock:
+            return int(
+                self._connection.execute(
+                    "SELECT count(*) FROM pending_evidence_quarantine"
+                ).fetchone()[0]
+            )
 
     def enqueue(
         self,
@@ -582,6 +854,34 @@ class SQLiteWALJournal:
             kind=row["kind"],
             schema_version=row["schema_version"],
             idempotency_key=row["idempotency_key"],
+            payload=payload,
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _row_to_pending_evidence(
+        row: sqlite3.Row,
+    ) -> PendingEvidenceJournalItem:
+        malformed = False
+        try:
+            payload = json.loads(row["payload_json"])
+        except (json.JSONDecodeError, TypeError):
+            malformed = True
+            payload = {"schema_version": "__malformed_json__"}
+        if not isinstance(payload, dict):
+            malformed = True
+            payload = {"schema_version": "__malformed_json__"}
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+        except (TypeError, ValueError):
+            malformed = True
+            created_at = datetime.fromtimestamp(0, timezone.utc)
+        if malformed:
+            payload = {"schema_version": "__malformed_json__"}
+        return PendingEvidenceJournalItem(
+            event_id=str(row["event_id"]),
+            reservation_id=str(row["reservation_id"]),
+            phase=row["phase"],
             payload=payload,
             created_at=created_at,
         )
