@@ -14,6 +14,7 @@ import pytest
 
 from protector.pilot.runtime import _limit_exec
 from protector.pilot.runtime.evidence import (
+    BoundedMediaDescriptor,
     ClipAssembler,
     ClipAssemblyError,
     EncodedFragmentRing,
@@ -639,6 +640,32 @@ def test_ffprobe_requires_first_selected_video_packet_to_be_keyframed(
     assert media.first_packet_keyframe is True
 
 
+def test_ffprobe_refuses_descriptor_media_outside_its_finite_byte_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "oversize.mp4"
+    source_path.write_bytes(b"closed-fragment")
+    descriptor = os.open(source_path, os.O_RDONLY)
+    source = BoundedMediaDescriptor(
+        descriptor=descriptor,
+        max_bytes=source_path.stat().st_size - 1,
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ffprobe must not run outside the descriptor byte ceiling"
+        ),
+    )
+
+    try:
+        with pytest.raises(ClipAssemblyError, match="probe failed"):
+            FfprobeMediaProbe().probe(source, pass_fds=(descriptor,))
+    finally:
+        os.close(descriptor)
+
+
 @pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="portable FFmpeg descriptor smoke requires local ffmpeg and ffprobe",
@@ -1126,6 +1153,85 @@ def test_splitmux_bus_keyframe_claim_never_replaces_closed_packet_truth(
         )
 
     assert ring.fragments("camera-01") == ()
+
+
+def test_splitmux_packet_probe_and_adoption_hold_the_same_incoming_inode(
+    tmp_path: Path,
+) -> None:
+    class Structure:
+        def __init__(self, name: str, **values: object) -> None:
+            self.name = name
+            self.values = values
+
+        def get_name(self) -> str:
+            return self.name
+
+        def get_value(self, name: str) -> object:
+            return self.values[name]
+
+    ring = _ring(tmp_path / "inode-bound-spool", Clock())
+    incoming = ring.root / ".incoming" / "inode-bound"
+    incoming.mkdir(parents=True)
+    part = incoming / "00001.part.mp4"
+    original = b"probed-keyframe-bytes"
+    replacement = b"unprobed-non-keyframe-bytes"
+    part.write_bytes(original)
+
+    def swapping_probe(source: BoundedMediaDescriptor) -> bool:
+        assert source.max_bytes == 100
+        descriptor = os.dup(source.descriptor)
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            probed = os.read(descriptor, 100)
+        finally:
+            os.close(descriptor)
+        assert probed == original
+        swap = incoming / "replacement.part.mp4"
+        swap.write_bytes(replacement)
+        os.replace(swap, part)
+        return True
+
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+        packet_probe=swapping_probe,
+    )
+    mapper = SourceTimeMapper()
+    mapper.anchor(
+        camera_id="camera-01",
+        stream_epoch="epoch-1",
+        running_time_ns=1_000_000_000,
+        source_time=NOW,
+    )
+    factory.handle_splitmux_message(
+        camera_id="camera-01",
+        codec="h264",
+        stream_epoch="epoch-1",
+        structure=Structure(
+            "splitmuxsink-fragment-opened",
+            location=str(part),
+            **{"running-time": 0, "starts-with-keyframe": True},
+        ),
+        source_time_mapper=mapper,
+    )
+
+    fragment = factory.handle_splitmux_message(
+        camera_id="camera-01",
+        codec="h264",
+        stream_epoch="epoch-1",
+        structure=Structure(
+            "splitmuxsink-fragment-closed",
+            location=str(part),
+            **{"running-time": 2_000_000_000},
+        ),
+        source_time_mapper=mapper,
+    )
+
+    assert fragment is not None
+    assert fragment.path.read_bytes() == original
+    assert part.read_bytes() == replacement
+    assert ring.fragments("camera-01") == (fragment,)
 
 
 def test_source_time_mapping_keeps_one_canonical_transform_across_rtcp_jitter() -> None:

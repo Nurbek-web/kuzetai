@@ -139,6 +139,18 @@ class EvidenceReservation:
         return (self.end_at - self.start_at).total_seconds()
 
 
+@dataclass(frozen=True, slots=True)
+class BoundedMediaDescriptor:
+    """One held regular-file descriptor with a finite byte ceiling."""
+
+    descriptor: int
+    max_bytes: int
+
+    @property
+    def descriptor_path(self) -> Path:
+        return Path(f"/dev/fd/{self.descriptor}")
+
+
 @dataclass(slots=True)
 class _FragmentRecord:
     fragment: EncodedFragment
@@ -419,6 +431,8 @@ class EncodedFragmentRing:
         end_at: datetime,
         codec: Codec,
         starts_with_keyframe: bool,
+        max_bytes: int,
+        packet_probe: Callable[[BoundedMediaDescriptor], bool],
         stream_epoch: str = "default",
     ) -> EncodedFragment:
         """Adopt one splitmux-closed encoded file through the normal atomic path."""
@@ -427,6 +441,13 @@ class EncodedFragmentRing:
         if not part_path.is_relative_to(incoming_root):
             raise ValueError("closed splitmux fragment must be a regular file under .incoming")
         relative = part_path.relative_to(incoming_root)
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes <= 0
+            or max_bytes > self.max_camera_bytes
+        ):
+            raise ValueError("closed splitmux fragment byte bound is invalid")
         directory_descriptor = os.open(
             incoming_root,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -444,21 +465,37 @@ class EncodedFragmentRing:
                 directory_descriptor = child
             descriptor = os.open(
                 relative.parts[-1],
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=directory_descriptor,
             )
             try:
                 file_stat = os.fstat(descriptor)
                 if not stat.S_ISREG(file_stat.st_mode):
                     raise ValueError("closed splitmux fragment must be a regular file")
-                if file_stat.st_size > self.max_camera_bytes:
+                if file_stat.st_size <= 0 or file_stat.st_size > max_bytes:
                     raise SpoolCapacityError(
                         "closed splitmux fragment exceeds configured byte bound"
                     )
+                os.unlink(relative.parts[-1], dir_fd=directory_descriptor)
+                os.fsync(directory_descriptor)
+                source = BoundedMediaDescriptor(
+                    descriptor=descriptor,
+                    max_bytes=max_bytes,
+                )
+                if not packet_probe(source):
+                    raise ValueError(
+                        "closed splitmux fragment does not start with a keyframe"
+                    )
+                os.lseek(descriptor, 0, os.SEEK_SET)
                 payload = bytearray()
-                while block := os.read(descriptor, 1024 * 1024):
+                while block := os.read(
+                    descriptor,
+                    min(1024 * 1024, max_bytes + 1 - len(payload)),
+                ):
                     payload.extend(block)
-                    if len(payload) > self.max_camera_bytes:
+                    if len(payload) > max_bytes:
                         raise SpoolCapacityError(
                             "closed splitmux fragment exceeds configured byte bound"
                         )
@@ -473,8 +510,6 @@ class EncodedFragmentRing:
                 starts_with_keyframe=starts_with_keyframe,
                 stream_epoch=stream_epoch,
             )
-            os.unlink(relative.parts[-1], dir_fd=directory_descriptor)
-            os.fsync(directory_descriptor)
             return fragment
         except OSError as exc:
             raise ValueError("closed splitmux fragment could not be adopted safely") from exc
@@ -956,7 +991,7 @@ class SplitMuxEvidenceSinkFactory:
         ring: EncodedFragmentRing,
         fragment_seconds: int,
         max_fragment_bytes: int,
-        packet_probe: Callable[[Path], bool] | None = None,
+        packet_probe: Callable[[BoundedMediaDescriptor], bool] | None = None,
     ) -> None:
         if fragment_seconds not in (1, 2):
             raise ValueError("splitmux fragments must be 1-2 seconds")
@@ -1135,16 +1170,6 @@ class SplitMuxEvidenceSinkFactory:
             opened = self._opened.pop(key, None)
         if opened is None or running_value <= opened.running_time_ns:
             raise ValueError("splitmux close did not match a valid open fragment")
-        try:
-            first_packet_keyframe = self._packet_probe(location)
-        except ClipAssemblyError as exc:
-            raise ValueError(
-                "closed splitmux fragment keyframe truth could not be derived"
-            ) from exc
-        if not first_packet_keyframe:
-            raise ValueError(
-                "closed splitmux fragment does not start with a keyframe"
-            )
         start_at = source_time_mapper.map(
             camera_id=camera_id,
             stream_epoch=stream_epoch,
@@ -1166,8 +1191,11 @@ class SplitMuxEvidenceSinkFactory:
         )
 
     @staticmethod
-    def _probe_first_packet_keyframe(path: Path) -> bool:
-        return FfprobeMediaProbe().probe(path).first_packet_keyframe
+    def _probe_first_packet_keyframe(source: BoundedMediaDescriptor) -> bool:
+        return FfprobeMediaProbe().probe(
+            source,
+            pass_fds=(source.descriptor,),
+        ).first_packet_keyframe
 
     @staticmethod
     def _structure_value(
@@ -1194,23 +1222,25 @@ class SplitMuxEvidenceSinkFactory:
         stream_epoch: str = "default",
     ) -> EncodedFragment:
         """Finalise a target splitmux fragment after its close message supplies source time."""
-        part = Path(part_path)
-        try:
-            size = part.stat(follow_symlinks=False).st_size
-        except OSError as exc:
-            raise ValueError("closed splitmux fragment is unavailable") from exc
-        if size > self.max_fragment_bytes:
-            raise SpoolCapacityError("closed splitmux fragment exceeds staging byte bound")
+        if starts_with_keyframe is not True:
+            raise ValueError("splitmux fragment does not start with a keyframe")
         self.ring.assert_staging_within_bounds(camera_id)
-        return self.ring.commit_closed_fragment(
-            camera_id=camera_id,
-            part_path=part_path,
-            start_at=start_at,
-            end_at=end_at,
-            codec=codec,
-            starts_with_keyframe=starts_with_keyframe,
-            stream_epoch=stream_epoch,
-        )
+        try:
+            return self.ring.commit_closed_fragment(
+                camera_id=camera_id,
+                part_path=part_path,
+                start_at=start_at,
+                end_at=end_at,
+                codec=codec,
+                starts_with_keyframe=True,
+                max_bytes=self.max_fragment_bytes,
+                packet_probe=self._packet_probe,
+                stream_epoch=stream_epoch,
+            )
+        except ClipAssemblyError as exc:
+            raise ValueError(
+                "closed splitmux fragment keyframe truth could not be derived"
+            ) from exc
 
 
 class CodecTool(Protocol):
@@ -1277,12 +1307,27 @@ class FfprobeMediaProbe:
         *,
         pass_fds: tuple[int, ...] = (),
     ) -> MediaInfo:
-        source_arguments = (
-            ("-fd", str(path.descriptor), "fd:")
-            if isinstance(path, AssemblyOutput)
-            else (str(path),)
-        )
         try:
+            if isinstance(path, AssemblyOutput):
+                if (
+                    not isinstance(path.max_bytes, int)
+                    or isinstance(path.max_bytes, bool)
+                    or path.max_bytes <= 0
+                ):
+                    raise ValueError(
+                        "descriptor media byte ceiling must be finite and positive"
+                    )
+                source_stat = os.fstat(path.descriptor)
+                if (
+                    not stat.S_ISREG(source_stat.st_mode)
+                    or source_stat.st_size <= 0
+                    or source_stat.st_size > path.max_bytes
+                ):
+                    raise ValueError("descriptor media exceeds its finite byte ceiling")
+                os.lseek(path.descriptor, 0, os.SEEK_SET)
+                source_arguments = ("-fd", str(path.descriptor), "fd:")
+            else:
+                source_arguments = (str(path),)
             result = subprocess.run(
                 (
                     self.executable,
@@ -1304,6 +1349,11 @@ class FfprobeMediaProbe:
                 timeout=15,
                 pass_fds=pass_fds,
             )
+            if isinstance(path, AssemblyOutput):
+                source_stat = os.fstat(path.descriptor)
+                if source_stat.st_size <= 0 or source_stat.st_size > path.max_bytes:
+                    raise ValueError("descriptor media exceeded its finite byte ceiling")
+                os.lseek(path.descriptor, 0, os.SEEK_SET)
             payload = json.loads(result.stdout)
             if result.stderr.strip():
                 raise ValueError("ffprobe reported media errors")
