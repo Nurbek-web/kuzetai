@@ -224,30 +224,7 @@ class SQLiteWALJournal:
         table_sql = self._connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_items'"
         ).fetchone()[0]
-        if "evidence_intent" not in str(table_sql):
-            self._connection.executescript(
-                """
-                BEGIN IMMEDIATE;
-                DROP TABLE IF EXISTS journal_items_v2;
-                CREATE TABLE journal_items_v2 (
-                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind TEXT NOT NULL CHECK (
-                        kind IN ('candidate_event', 'evidence', 'evidence_intent')
-                    ),
-                    schema_version TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL UNIQUE,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                INSERT INTO journal_items_v2
-                    (item_id, kind, schema_version, idempotency_key, payload_json, created_at)
-                SELECT item_id, kind, schema_version, idempotency_key, payload_json, created_at
-                FROM journal_items;
-                DROP TABLE journal_items;
-                ALTER TABLE journal_items_v2 RENAME TO journal_items;
-                COMMIT;
-                """
-            )
+        needs_kind_migration = "evidence_intent" not in str(table_sql)
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS journal_quarantine (
@@ -264,7 +241,127 @@ class SQLiteWALJournal:
             )
             """
         )
+        self._normalise_candidate_identities(
+            rebuild_kind_constraint=needs_kind_migration
+        )
         self._connection.commit()
+
+    def _normalise_candidate_identities(
+        self,
+        *,
+        rebuild_kind_constraint: bool,
+    ) -> None:
+        """Atomically migrate pre-event-UUID candidate keys and payloads.
+
+        Older pilots derived the queue key without ``event_id`` and also
+        serialised that derived value into the JSON payload.  Canonicalising
+        both fields before accepting new work lets an exact retry converge
+        even when the bounded journal is already full.
+        """
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if rebuild_kind_constraint:
+                self._connection.execute("DROP TABLE IF EXISTS journal_items_v2")
+                self._connection.execute(
+                    """
+                    CREATE TABLE journal_items_v2 (
+                        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        kind TEXT NOT NULL CHECK (
+                            kind IN ('candidate_event', 'evidence', 'evidence_intent')
+                        ),
+                        schema_version TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        payload_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO journal_items_v2
+                        (item_id, kind, schema_version, idempotency_key,
+                         payload_json, created_at)
+                    SELECT item_id, kind, schema_version, idempotency_key,
+                           payload_json, created_at
+                    FROM journal_items
+                    """
+                )
+                self._connection.execute("DROP TABLE journal_items")
+                self._connection.execute(
+                    "ALTER TABLE journal_items_v2 RENAME TO journal_items"
+                )
+            rows = self._connection.execute(
+                """
+                SELECT item_id, idempotency_key, payload_json
+                FROM journal_items
+                WHERE kind = 'candidate_event'
+                ORDER BY item_id
+                """
+            ).fetchall()
+            groups: dict[str, list[tuple[sqlite3.Row, str]]] = {}
+            raw_key_owners: dict[str, int] = {}
+            for row in rows:
+                raw_key_owners[str(row["idempotency_key"])] = int(row["item_id"])
+                try:
+                    event = CandidateEventV1.model_validate_json(row["payload_json"])
+                except (TypeError, ValueError):
+                    # Poison work is handled by the bounded replay quarantine.
+                    continue
+                canonical_json = json.dumps(
+                    event.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                groups.setdefault(event.dedupe_key, []).append((row, canonical_json))
+
+            for canonical_key, entries in groups.items():
+                owner_id = raw_key_owners.get(canonical_key)
+                entry_ids = {int(row["item_id"]) for row, _payload in entries}
+                if owner_id is not None and owner_id not in entry_ids:
+                    raise JournalPayloadConflictError(
+                        "candidate journal migration found a material key conflict"
+                    )
+                if len({payload for _row, payload in entries}) != 1:
+                    raise JournalPayloadConflictError(
+                        "candidate journal migration found conflicting payloads"
+                    )
+
+            canonical_rows: list[tuple[int, str, str]] = []
+            duplicate_ids: list[int] = []
+            for canonical_key, entries in groups.items():
+                canonical_row, canonical_payload = entries[0]
+                canonical_rows.append(
+                    (
+                        int(canonical_row["item_id"]),
+                        canonical_key,
+                        canonical_payload,
+                    )
+                )
+                duplicate_ids.extend(
+                    int(row["item_id"]) for row, _payload in entries[1:]
+                )
+
+            if duplicate_ids:
+                self._connection.executemany(
+                    "DELETE FROM journal_items WHERE item_id = ?",
+                    ((item_id,) for item_id in duplicate_ids),
+                )
+            self._connection.executemany(
+                """
+                UPDATE journal_items
+                SET idempotency_key = ?, payload_json = ?
+                WHERE item_id = ?
+                """,
+                (
+                    (canonical_key, canonical_payload, item_id)
+                    for item_id, canonical_key, canonical_payload in canonical_rows
+                ),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._connection.rollback()
+            raise
 
     def close(self) -> None:
         with self._lock:

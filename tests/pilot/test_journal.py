@@ -170,6 +170,163 @@ def test_journal_migrates_legacy_kind_constraint_without_losing_work(
     assert migrated.depth() == 1
 
 
+def test_journal_normalizes_actual_old_candidate_key_and_payload_at_full_capacity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "old-candidate-key.sqlite3"
+    event_contract = _event()
+    old_key = (
+        f"{event_contract.camera_id}:{event_contract.module}:"
+        f"{event_contract.model_artifact_id}:{event_contract.opened_at.isoformat()}"
+    )
+    payload = event_contract.model_dump(mode="json")
+    payload["dedupe_key"] = old_key
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE journal_items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (
+                    kind IN ('candidate_event', 'evidence', 'evidence_intent')
+                ),
+                schema_version TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO journal_items
+                (kind, schema_version, idempotency_key, payload_json, created_at)
+            VALUES ('candidate_event', ?, ?, ?, ?)
+            """,
+            (
+                event_contract.schema_version,
+                old_key,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                NOW.isoformat(),
+            ),
+        )
+
+    journal = SQLiteWALJournal(path, max_items=1)
+    item = journal.enqueue_event(event_contract)
+
+    assert journal.depth() == 1
+    assert item.item_id == 1
+    assert item.idempotency_key == event_contract.dedupe_key
+    assert item.payload == event_contract.model_dump(mode="json")
+
+
+def test_journal_candidate_key_migration_converges_exact_duplicates_in_original_order(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "duplicate-candidate-keys.sqlite3"
+    duplicate = _event()
+    later = _event().model_copy(update={"opened_at": NOW + timedelta(seconds=20)})
+    old_key = (
+        f"{duplicate.camera_id}:{duplicate.module}:"
+        f"{duplicate.model_artifact_id}:{duplicate.opened_at.isoformat()}"
+    )
+    duplicate_payload = duplicate.model_dump(mode="json")
+    duplicate_payload["dedupe_key"] = old_key
+    rows = (
+        (old_key, duplicate_payload),
+        (duplicate.dedupe_key, duplicate.model_dump(mode="json")),
+        (later.dedupe_key, later.model_dump(mode="json")),
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE journal_items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO journal_items
+                (kind, schema_version, idempotency_key, payload_json, created_at)
+            VALUES ('candidate_event', 'candidate-event.v1', ?, ?, ?)
+            """,
+            [
+                (
+                    key,
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    (NOW + timedelta(seconds=index)).isoformat(),
+                )
+                for index, (key, payload) in enumerate(rows)
+            ],
+        )
+
+    journal = SQLiteWALJournal(path, max_items=3)
+    items = journal.items(limit=3)
+
+    assert [item.item_id for item in items] == [1, 3]
+    assert [item.idempotency_key for item in items] == [
+        duplicate.dedupe_key,
+        later.dedupe_key,
+    ]
+
+
+def test_journal_candidate_key_migration_rolls_back_on_material_conflict(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "conflicting-candidate-keys.sqlite3"
+    original = _event()
+    conflict = original.model_copy(update={"reason": "different material"})
+    old_key = (
+        f"{original.camera_id}:{original.module}:"
+        f"{original.model_artifact_id}:{original.opened_at.isoformat()}"
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE journal_items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO journal_items
+                (kind, schema_version, idempotency_key, payload_json, created_at)
+            VALUES ('candidate_event', 'candidate-event.v1', ?, ?, ?)
+            """,
+            (
+                (
+                    old_key,
+                    json.dumps(original.model_dump(mode="json"), sort_keys=True),
+                    NOW.isoformat(),
+                ),
+                (
+                    original.dedupe_key,
+                    json.dumps(conflict.model_dump(mode="json"), sort_keys=True),
+                    (NOW + timedelta(seconds=1)).isoformat(),
+                ),
+            ),
+        )
+
+    with pytest.raises(JournalPayloadConflictError, match="migration"):
+        SQLiteWALJournal(path, max_items=2)
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT item_id, idempotency_key FROM journal_items ORDER BY item_id"
+        ).fetchall()
+    assert rows == [(1, old_key), (2, original.dedupe_key)]
+
+
 def test_terminal_evidence_intent_replay_marks_candidate_failed(
     tmp_path: Path,
 ) -> None:

@@ -816,12 +816,18 @@ class EvidencePolicy:
     pre_roll_seconds: float
     post_roll_seconds: float
     source_references: Mapping[str, str]
+    pending_timeout_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         pre = _finite_non_negative(self.pre_roll_seconds, field="pre_roll_seconds")
         post = _finite_non_negative(self.post_roll_seconds, field="post_roll_seconds")
         if not 4.0 <= pre + post <= 10.0:
             raise ValueError("evidence pre/post window must total 4-10 seconds")
+        if (
+            not math.isfinite(self.pending_timeout_seconds)
+            or self.pending_timeout_seconds <= 0
+        ):
+            raise ValueError("pending evidence timeout must be finite and positive")
         if any(not camera or not source for camera, source in self.source_references.items()):
             raise ValueError("evidence source references must be non-empty")
         for source in self.source_references.values():
@@ -856,6 +862,8 @@ class SiteEventStatus:
     reasons: tuple[str, ...]
     journal_depth: int
     journal_quarantine_depth: int
+    processing_claims: int
+    pending_evidence_work: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -863,6 +871,15 @@ class SiteEventResult:
     engine_result: EngineIngestResult | None
     durable_candidates: tuple[DurableCandidate, ...]
     status: SiteEventStatus
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingEvidenceWork:
+    trigger: CandidateTrigger
+    reservation_id: str
+    intent: EvidenceIntent
+    event_at: datetime
+    expires_at: datetime
 
 
 class SiteEventService:
@@ -877,8 +894,8 @@ class SiteEventService:
         ring: Any,
         evidence_coordinator: Any,
         load_candidate: Callable[[UUID], CandidateEventV1],
-        mark_evidence_pending: Callable[[UUID], CandidateEventV1 | None],
-        mark_evidence_failed: Callable[[UUID], CandidateEventV1 | None],
+        mark_evidence_pending: Callable[[UUID], CandidateEventV1],
+        mark_evidence_failed: Callable[[UUID], CandidateEventV1],
         evidence_policy: EvidencePolicy,
     ) -> None:
         self.engine = engine
@@ -892,8 +909,11 @@ class SiteEventService:
         self._evidence_policy = evidence_policy
         self._reasons: OrderedDict[str, None] = OrderedDict()
         self._state_lock = threading.RLock()
+        self._journal_lock = threading.Lock()
         self._processing: set[UUID] = set()
         self._completed: OrderedDict[UUID, None] = OrderedDict()
+        self._pending_work: OrderedDict[UUID, _PendingEvidenceWork] = OrderedDict()
+        self._pending_processing: set[UUID] = set()
 
     @property
     def status(self) -> SiteEventStatus:
@@ -916,11 +936,16 @@ class SiteEventService:
             self._degrade("journal_depth_failed")
             with self._state_lock:
                 reasons = list(self._reasons)
+        with self._state_lock:
+            processing_claims = len(self._processing)
+            pending_evidence_work = len(self._pending_work)
         return SiteEventStatus(
             degraded=bool(reasons) or replay_degraded,
             reasons=tuple(reasons),
             journal_depth=depth,
             journal_quarantine_depth=quarantine_depth,
+            processing_claims=processing_claims,
+            pending_evidence_work=pending_evidence_work,
         )
 
     def start(self) -> SiteEventStatus:
@@ -948,6 +973,11 @@ class SiteEventService:
             source_time=source_time,
         )
         durable = self._process_triggers(triggers)
+        durable += self._drain_pending_evidence(
+            camera_id=camera_id,
+            stream_epoch=stream_epoch,
+            source_time=_utc(source_time, field="source_time"),
+        )
         try:
             self._replay_worker.run_periodic_batch()
         except Exception:
@@ -960,7 +990,17 @@ class SiteEventService:
     ) -> tuple[DurableCandidate, ...]:
         durable: list[DurableCandidate] = []
         for original_trigger in triggers:
-            if not self._claim(original_trigger.event.event_id):
+            claim = self._claim(original_trigger.event.event_id)
+            if claim == "duplicate":
+                continue
+            if not self._journal_candidate(original_trigger.event):
+                if claim == "claimed":
+                    self._finish_claim(
+                        original_trigger.event.event_id,
+                        completed=False,
+                    )
+                continue
+            if claim == "capacity":
                 continue
             completed = False
             try:
@@ -979,14 +1019,6 @@ class SiteEventService:
         trigger = original_trigger
         reservation: Any | None = None
         reservation_id = f"event-{trigger.event.event_id}"
-        try:
-            self._journal.enqueue_event(trigger.event)
-        except JournalFullError:
-            self._degrade("candidate_journal_full")
-            return None
-        except Exception:
-            self._degrade("candidate_journal_write_failed")
-            return None
 
         try:
             self._replay_worker.run_periodic_batch()
@@ -1027,40 +1059,107 @@ class SiteEventService:
             return DurableCandidate(trigger, None, None)
 
         try:
-            pending = self._pending_evidence(trigger, reservation)
+            pending = self._make_evidence_intent(trigger, reservation)
         except Exception:
             self._degrade("evidence_processing_failed")
-            self._terminalize_candidate(trigger.event.event_id)
+            self._terminalize_candidate(trigger.event)
             self._safe_release(reservation_id)
             return None
+        pending_work: _PendingEvidenceWork | None = None
+        if reservation.status == "pending":
+            pending_work = _PendingEvidenceWork(
+                trigger=trigger,
+                reservation_id=reservation_id,
+                intent=pending,
+                event_at=trigger.event.last_seen_at,
+                expires_at=reservation.target_end_at
+                + timedelta(seconds=self._evidence_policy.pending_timeout_seconds),
+            )
+            if not self._register_pending_work(pending_work):
+                self._degrade("pending_evidence_capacity_reached")
+                self._terminalize_candidate(trigger.event)
+                self._safe_release(reservation_id)
+                return None
+        pending_transition_verified = False
         try:
             self._evidence_coordinator.create_preview(
                 reservation,
                 evidence=pending,
             )
-            self._mark_evidence_pending(trigger.event.event_id)
-            pending_event = trigger.event.model_copy(update={"evidence_status": "pending"})
+            pending_event = self._verified_transition(
+                callback=self._mark_evidence_pending,
+                expected=trigger.event,
+                target="pending",
+            )
+            pending_transition_verified = True
             trigger = replace(trigger, event=pending_event)
             evidence = (
                 self._evidence_coordinator.complete(reservation, pending)
                 if reservation.status == "ready"
                 else None
             )
+            if evidence is not None:
+                self._validate_ready_evidence(pending, evidence)
+                trigger = replace(
+                    trigger,
+                    event=trigger.event.model_copy(
+                        update={"evidence_status": evidence.status}
+                    ),
+                )
         except Exception:
-            self._degrade("evidence_processing_failed")
+            if not pending_transition_verified:
+                self._degrade("evidence_pending_transition_unverified")
+            if pending_work is not None:
+                self._fail_pending_work(pending_work)
+            else:
+                self._degrade("evidence_processing_failed")
+                self._cancel_intent(
+                    trigger=original_trigger,
+                    reservation_id=reservation_id,
+                    intent=pending,
+                )
             return None
+        if pending_work is not None:
+            with self._state_lock:
+                current = self._pending_work.get(trigger.event.event_id)
+                if current is not None:
+                    self._pending_work[trigger.event.event_id] = replace(
+                        current,
+                        trigger=trigger,
+                    )
         return DurableCandidate(trigger, pending, evidence)
+
+    def _journal_candidate(self, event: CandidateEventV1) -> bool:
+        """Durably retain one-shot candidate metadata before evidence admission."""
+        try:
+            # Serialisation bounds actual journal writers without retaining a
+            # per-caller queue or holding the service state lock across I/O.
+            with self._journal_lock:
+                self._journal.enqueue_event(event)
+            return True
+        except JournalFullError:
+            self._degrade("candidate_journal_full")
+            return False
+        except Exception:
+            self._degrade("candidate_journal_write_failed")
+            return False
 
     @staticmethod
     def _same_candidate(persisted: CandidateEventV1, expected: CandidateEventV1) -> bool:
         return persisted.model_dump(mode="json") == expected.model_dump(mode="json")
 
-    def _claim(self, event_id: UUID) -> bool:
+    def _claim(
+        self,
+        event_id: UUID,
+    ) -> Literal["claimed", "duplicate", "capacity"]:
         with self._state_lock:
             if event_id in self._processing or event_id in self._completed:
-                return False
+                return "duplicate"
+            if len(self._processing) >= self.engine.limits.max_pending_events:
+                self._degrade("event_processing_capacity_reached")
+                return "capacity"
             self._processing.add(event_id)
-            return True
+            return "claimed"
 
     def _finish_claim(self, event_id: UUID, *, completed: bool) -> None:
         with self._state_lock:
@@ -1070,13 +1169,19 @@ class SiteEventService:
                 while len(self._completed) > self.engine.limits.max_pending_events:
                     self._completed.popitem(last=False)
 
-    def _terminalize_candidate(self, event_id: UUID) -> None:
+    def _terminalize_candidate(self, expected: CandidateEventV1) -> bool:
         try:
-            self._mark_evidence_failed(event_id)
+            self._verified_transition(
+                callback=self._mark_evidence_failed,
+                expected=expected,
+                target="failed",
+            )
+            return True
         except Exception:
             self._degrade("evidence_terminal_transition_failed")
+            return False
 
-    def _pending_evidence(
+    def _make_evidence_intent(
         self,
         trigger: CandidateTrigger,
         reservation: Any,
@@ -1097,11 +1202,193 @@ class SiteEventService:
             status="pending",
         )
 
-    def _safe_release(self, reservation_id: str) -> None:
+    def _register_pending_work(self, work: _PendingEvidenceWork) -> bool:
+        event_id = work.trigger.event.event_id
+        with self._state_lock:
+            existing = self._pending_work.get(event_id)
+            if existing is not None:
+                return existing == work
+            if len(self._pending_work) >= self.engine.limits.max_pending_events:
+                return False
+            self._pending_work[event_id] = work
+            return True
+
+    def _drain_pending_evidence(
+        self,
+        *,
+        camera_id: str,
+        stream_epoch: UUID,
+        source_time: datetime,
+    ) -> tuple[DurableCandidate, ...]:
+        with self._state_lock:
+            work_items = tuple(
+                work
+                for work in self._pending_work.values()
+                if work.trigger.event.camera_id == camera_id
+            )
+        completed: list[DurableCandidate] = []
+        for work in work_items:
+            event_id = work.trigger.event.event_id
+            if not self._claim_pending(event_id):
+                continue
+            try:
+                if work.trigger.stream_epoch != stream_epoch:
+                    self._degrade("evidence_pending_epoch_changed")
+                    self._fail_pending_work(work)
+                    continue
+                if source_time >= work.expires_at:
+                    self._degrade("evidence_pending_expired")
+                    self._fail_pending_work(work)
+                    continue
+                try:
+                    reservation = self._ring.reserve(
+                        reservation_id=work.reservation_id,
+                        camera_id=work.trigger.event.camera_id,
+                        stream_epoch=str(work.trigger.stream_epoch),
+                        event_at=work.event_at,
+                        pre_roll=self._evidence_policy.pre_roll_seconds,
+                        post_roll=self._evidence_policy.post_roll_seconds,
+                    )
+                    self._validate_refreshed_reservation(work, reservation)
+                except Exception:
+                    self._degrade("evidence_pending_reacquire_failed")
+                    continue
+                if reservation.status != "ready":
+                    continue
+                try:
+                    evidence = self._evidence_coordinator.complete(
+                        reservation,
+                        work.intent,
+                    )
+                    self._validate_ready_evidence(work.intent, evidence)
+                except Exception:
+                    self._degrade("evidence_pending_completion_failed")
+                    self._fail_pending_work(work)
+                    continue
+                with self._state_lock:
+                    self._pending_work.pop(event_id, None)
+                completed.append(
+                    DurableCandidate(
+                        replace(
+                            work.trigger,
+                            event=work.trigger.event.model_copy(
+                                update={"evidence_status": "ready"}
+                            ),
+                        ),
+                        work.intent,
+                        evidence,
+                    )
+                )
+            finally:
+                with self._state_lock:
+                    self._pending_processing.discard(event_id)
+        return tuple(completed)
+
+    def _claim_pending(self, event_id: UUID) -> bool:
+        with self._state_lock:
+            if event_id in self._pending_processing:
+                return False
+            if event_id not in self._pending_work:
+                return False
+            self._pending_processing.add(event_id)
+            return True
+
+    @staticmethod
+    def _validate_refreshed_reservation(
+        work: _PendingEvidenceWork,
+        reservation: Any,
+    ) -> None:
+        if (
+            reservation.reservation_id != work.reservation_id
+            or reservation.camera_id != work.trigger.event.camera_id
+            or reservation.target_start_at != work.intent.start_at
+            or reservation.target_end_at != work.intent.end_at
+        ):
+            raise ValueError("refreshed evidence reservation identity changed")
+        for fragment in reservation.fragments:
+            fragment_epoch = getattr(fragment, "stream_epoch", None)
+            if (
+                fragment_epoch is not None
+                and fragment_epoch != str(work.trigger.stream_epoch)
+            ):
+                raise ValueError("refreshed evidence reservation crossed stream epochs")
+
+    @staticmethod
+    def _validate_ready_evidence(
+        intent: EvidenceIntent,
+        evidence: EvidenceInput,
+    ) -> None:
+        if (
+            not isinstance(evidence, EvidenceInput)
+            or evidence.status != "ready"
+            or evidence.evidence_id != intent.evidence_id
+            or evidence.event_id != intent.event_id
+            or evidence.object_key != intent.object_key
+            or evidence.source_reference != intent.source_reference
+        ):
+            raise ValueError("completed evidence receipt identity changed")
+
+    def _fail_pending_work(self, work: _PendingEvidenceWork) -> bool:
+        cleaned = self._cancel_intent(
+            trigger=work.trigger,
+            reservation_id=work.reservation_id,
+            intent=work.intent,
+        )
+        if cleaned:
+            with self._state_lock:
+                self._pending_work.pop(work.trigger.event.event_id, None)
+        return cleaned
+
+    def _cancel_intent(
+        self,
+        *,
+        trigger: CandidateTrigger,
+        reservation_id: str,
+        intent: EvidenceIntent,
+    ) -> bool:
+        cleanup_ok = True
+        try:
+            self._evidence_coordinator.cancel(
+                reservation_id,
+                evidence=intent,
+            )
+        except Exception:
+            cleanup_ok = False
+            self._degrade("evidence_cancellation_failed")
+        release_ok = True if cleanup_ok else self._safe_release(reservation_id)
+        transition_ok = self._terminalize_candidate(trigger.event)
+        return cleanup_ok and release_ok and transition_ok
+
+    @classmethod
+    def _verified_transition(
+        cls,
+        *,
+        callback: Callable[[UUID], CandidateEventV1],
+        expected: CandidateEventV1,
+        target: Literal["pending", "failed"],
+    ) -> CandidateEventV1:
+        receipt = callback(expected.event_id)
+        if not isinstance(receipt, CandidateEventV1):
+            raise ValueError("candidate evidence transition returned no exact receipt")
+        expected_payload = expected.model_dump(
+            mode="json",
+            exclude={"evidence_status", "dedupe_key"},
+        )
+        receipt_payload = receipt.model_dump(
+            mode="json",
+            exclude={"evidence_status", "dedupe_key"},
+        )
+        if receipt_payload != expected_payload or receipt.evidence_status != target:
+            raise ValueError("candidate evidence transition receipt identity changed")
+        return receipt
+
+    def _safe_release(self, reservation_id: str) -> bool:
         try:
             self._ring.release(reservation_id)
+            return True
         except Exception:
             self._degrade("evidence_release_failed")
+            return False
 
     def _degrade(self, reason: str) -> None:
         with self._state_lock:

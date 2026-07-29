@@ -20,6 +20,7 @@ from protector.pilot.runtime.event_engine import (
     ModuleRule,
     SiteEventService,
 )
+from protector.pilot.runtime.evidence import EncodedFragmentRing
 from protector.pilot.storage.journal import (
     EvidenceJournalReplayWorker,
     SQLiteWALJournal,
@@ -468,8 +469,10 @@ class _UnavailableRing(_Ring):
 class _Coordinator:
     def __init__(self, *, order: list[str] | None = None) -> None:
         self.order = order
+        self.ring: _Ring | EncodedFragmentRing | None = None
         self.preview_calls: list[tuple[object, object]] = []
         self.complete_calls: list[tuple[object, object]] = []
+        self.cancel_calls: list[tuple[str, object]] = []
 
     def create_preview(self, reservation: object, *, evidence: object) -> SimpleNamespace:
         if self.order is not None:
@@ -483,6 +486,11 @@ class _Coordinator:
         self.complete_calls.append((reservation, evidence))
         assert isinstance(evidence, EvidenceIntent)
         return evidence.materialize(sha256="a" * 64, status="ready")
+
+    def cancel(self, reservation_id: str, *, evidence: object) -> None:
+        self.cancel_calls.append((reservation_id, evidence))
+        if self.ring is not None:
+            self.ring.release(reservation_id)
 
 
 def _service(
@@ -505,6 +513,7 @@ def _service(
     )
     selected_ring = ring or _Ring()
     selected_coordinator = coordinator or _Coordinator()
+    selected_coordinator.ring = selected_ring
     service = SiteEventService(
         engine=EventEngine(module_rules=(_module_rule(votes_required=1, sample_count=1),)),
         journal=journal,
@@ -512,8 +521,18 @@ def _service(
         ring=selected_ring,
         evidence_coordinator=selected_coordinator,
         load_candidate=load_candidate,
-        mark_evidence_pending=mark_evidence_pending or (lambda event_id: None),
-        mark_evidence_failed=mark_evidence_failed or (lambda event_id: None),
+        mark_evidence_pending=mark_evidence_pending
+        or (
+            lambda event_id: load_candidate(event_id).model_copy(
+                update={"evidence_status": "pending"}
+            )
+        ),
+        mark_evidence_failed=mark_evidence_failed
+        or (
+            lambda event_id: load_candidate(event_id).model_copy(
+                update={"evidence_status": "failed"}
+            )
+        ),
         evidence_policy=EvidencePolicy(
             pre_roll_seconds=2,
             post_roll_seconds=2,
@@ -545,7 +564,12 @@ def test_service_journals_candidate_then_associates_pending_evidence_before_comp
             for item in replayed
             if item.kind == "candidate_event" and item.payload["event_id"] == str(event_id)
         ),
-        mark_evidence_pending=lambda _event_id: order.append("mark-pending"),
+        mark_evidence_pending=lambda event_id: (
+            order.append("mark-pending"),
+            CandidateEventV1.model_validate(replayed[0].payload).model_copy(
+                update={"evidence_status": "pending"}
+            ),
+        )[1],
         ring=ring,
         coordinator=coordinator,
     )
@@ -563,11 +587,12 @@ def test_service_journals_candidate_then_associates_pending_evidence_before_comp
     assert coordinator.preview_calls[0][1] == pending
     assert coordinator.complete_calls[0][1] == pending
     assert result.durable_candidates[0].evidence.status == "ready"
+    assert result.durable_candidates[0].trigger.event.evidence_status == "ready"
     assert result.status.degraded is False
     assert order == ["persist", "reserve", "preview", "mark-pending", "complete"]
 
 
-def test_pending_transition_failure_stops_completion_and_preserves_preview_ownership(
+def test_pending_transition_failure_stops_completion_and_reconciles_preview_ownership(
     tmp_path: Path,
 ) -> None:
     journal = SQLiteWALJournal(tmp_path / "pending-transition.sqlite3", max_items=10)
@@ -590,9 +615,11 @@ def test_pending_transition_failure_stops_completion_and_preserves_preview_owner
 
     assert result.durable_candidates == ()
     assert "evidence_processing_failed" in result.status.reasons
+    assert "evidence_pending_transition_unverified" in result.status.reasons
     assert len(coordinator.preview_calls) == 1
     assert coordinator.complete_calls == []
-    assert ring.released == []
+    assert coordinator.cancel_calls
+    assert len(ring.released) == 1
 
 
 def test_evidence_journal_overflow_is_visible_and_never_acquires_a_pin(tmp_path: Path) -> None:
@@ -880,6 +907,33 @@ def test_service_claims_same_trigger_once_without_holding_engine_lock_during_io(
     assert len(coordinator.preview_calls) == 1
 
 
+def test_completed_duplicate_does_not_reenqueue_a_stale_candidate(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteWALJournal(tmp_path / "completed-duplicate.sqlite3", max_items=2)
+    persisted: dict[UUID, CandidateEventV1] = {}
+
+    def persist(item: object) -> None:
+        event = CandidateEventV1.model_validate(item.payload)
+        persisted[event.event_id] = event
+
+    trigger = EventEngine(
+        module_rules=(_module_rule(votes_required=1, sample_count=1),)
+    ).ingest(_observation(seq=1, seconds=0)).triggers[0]
+    service, _, _, replay = _service(
+        tmp_path,
+        journal=journal,
+        processor=persist,
+        load_candidate=lambda event_id: persisted[event_id],
+    )
+
+    assert len(service._process_triggers((trigger,))) == 1
+    assert journal.depth() == 0
+    assert service._process_triggers((trigger,)) == ()
+    assert journal.depth() == 0
+    assert replay.status.quarantine_depth == 0
+
+
 def test_journal_depth_read_failure_is_visible_degraded() -> None:
     class BrokenDepthJournal(_BrokenJournal):
         def depth(self) -> int:
@@ -921,3 +975,473 @@ def test_evidence_policy_rejects_secret_bearing_source_references(source: str) -
             post_roll_seconds=2,
             source_references={"cam-01": source},
         )
+
+
+def _append_fragment(
+    ring: EncodedFragmentRing,
+    *,
+    start_seconds: int,
+    epoch: UUID = EPOCH_A,
+) -> None:
+    ring.append(
+        camera_id="cam-01",
+        payload=f"fragment-{start_seconds}".encode(),
+        start_at=NOW + timedelta(seconds=start_seconds),
+        end_at=NOW + timedelta(seconds=start_seconds + 1),
+        codec="h264",
+        starts_with_keyframe=start_seconds == -2,
+        stream_epoch=str(epoch),
+    )
+
+
+def test_pending_post_roll_is_reacquired_and_completed_once_with_real_ring(
+    tmp_path: Path,
+) -> None:
+    ring = EncodedFragmentRing(
+        tmp_path / "real-ring",
+        ring_seconds=15,
+        max_camera_bytes=10_000,
+        max_spool_bytes=10_000,
+    )
+    _append_fragment(ring, start_seconds=-2)
+    _append_fragment(ring, start_seconds=-1)
+    persisted: dict[UUID, CandidateEventV1] = {}
+
+    def persist(item: object) -> None:
+        event = CandidateEventV1.model_validate(item.payload)
+        persisted[event.event_id] = event
+
+    def transition(event_id: UUID, status: str) -> CandidateEventV1:
+        persisted[event_id] = persisted[event_id].model_copy(
+            update={"evidence_status": status}
+        )
+        return persisted[event_id]
+
+    coordinator = _Coordinator()
+    service, _, _, _ = _service(
+        tmp_path,
+        journal=SQLiteWALJournal(tmp_path / "post-roll.sqlite3", max_items=10),
+        processor=persist,
+        load_candidate=lambda event_id: persisted[event_id],
+        mark_evidence_pending=lambda event_id: transition(event_id, "pending"),
+        mark_evidence_failed=lambda event_id: transition(event_id, "failed"),
+        ring=ring,  # type: ignore[arg-type]
+        coordinator=coordinator,
+    )
+
+    initial = service.process(_observation(seq=1, seconds=0))
+    assert initial.durable_candidates[0].evidence is None
+    assert initial.status.pending_evidence_work == 1
+    _append_fragment(ring, start_seconds=0)
+    _append_fragment(ring, start_seconds=1)
+
+    completed = service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_A,
+        source_time=NOW + timedelta(seconds=2),
+    )
+    duplicate = service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_A,
+        source_time=NOW + timedelta(seconds=2),
+    )
+
+    assert len(coordinator.complete_calls) == 1
+    assert completed.durable_candidates[0].evidence is not None
+    assert duplicate.durable_candidates == ()
+    assert completed.status.pending_evidence_work == 0
+
+
+def test_pending_post_roll_epoch_change_terminalizes_and_releases(
+    tmp_path: Path,
+) -> None:
+    replayed: list[object] = []
+    failed: dict[UUID, CandidateEventV1] = {}
+
+    def load(event_id: UUID) -> CandidateEventV1:
+        event = CandidateEventV1.model_validate(replayed[0].payload)
+        return failed.get(event_id, event)
+
+    def mark_pending(event_id: UUID) -> CandidateEventV1:
+        return load(event_id).model_copy(update={"evidence_status": "pending"})
+
+    def mark_failed(event_id: UUID) -> CandidateEventV1:
+        failed[event_id] = load(event_id).model_copy(update={"evidence_status": "failed"})
+        return failed[event_id]
+
+    service, ring, coordinator, _ = _service(
+        tmp_path,
+        journal=SQLiteWALJournal(tmp_path / "epoch-terminal.sqlite3", max_items=10),
+        processor=lambda item: replayed.append(item),
+        load_candidate=load,
+        mark_evidence_pending=mark_pending,
+        mark_evidence_failed=mark_failed,
+        ring=_Ring(ready=False),
+    )
+    initial = service.process(_observation(seq=1, seconds=0))
+    event_id = initial.durable_candidates[0].trigger.event.event_id
+
+    service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_B,
+        source_time=NOW + timedelta(seconds=3),
+    )
+
+    assert coordinator.cancel_calls
+    assert ring.released == [f"event-{event_id}"]
+    assert service.status.pending_evidence_work == 0
+    assert failed[event_id].evidence_status == "failed"
+    assert "evidence_pending_epoch_changed" in service.status.reasons
+
+
+def test_pending_post_roll_expires_to_failed_and_cleans_up(tmp_path: Path) -> None:
+    replayed: list[object] = []
+    states: dict[UUID, CandidateEventV1] = {}
+
+    def load(event_id: UUID) -> CandidateEventV1:
+        return states.get(event_id, CandidateEventV1.model_validate(replayed[0].payload))
+
+    def mark(event_id: UUID, status: str) -> CandidateEventV1:
+        states[event_id] = load(event_id).model_copy(update={"evidence_status": status})
+        return states[event_id]
+
+    service, ring, coordinator, _ = _service(
+        tmp_path,
+        journal=SQLiteWALJournal(tmp_path / "expiry.sqlite3", max_items=10),
+        processor=lambda item: replayed.append(item),
+        load_candidate=load,
+        mark_evidence_pending=lambda event_id: mark(event_id, "pending"),
+        mark_evidence_failed=lambda event_id: mark(event_id, "failed"),
+        ring=_Ring(ready=False),
+    )
+    initial = service.process(_observation(seq=1, seconds=0))
+    event_id = initial.durable_candidates[0].trigger.event.event_id
+
+    service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_A,
+        source_time=NOW + timedelta(seconds=30),
+    )
+
+    assert coordinator.cancel_calls
+    assert ring.released == [f"event-{event_id}"]
+    assert service.status.pending_evidence_work == 0
+    assert states[event_id].evidence_status == "failed"
+    assert "evidence_pending_expired" in service.status.reasons
+
+
+def test_pending_post_roll_waits_through_bounded_late_fragment_grace(
+    tmp_path: Path,
+) -> None:
+    replayed: list[object] = []
+    service, _ring, coordinator, _ = _service(
+        tmp_path,
+        journal=SQLiteWALJournal(tmp_path / "late-grace.sqlite3", max_items=10),
+        processor=lambda item: replayed.append(item),
+        load_candidate=lambda _event_id: CandidateEventV1.model_validate(
+            replayed[0].payload
+        ),
+        ring=_Ring(ready=False),
+    )
+    service.process(_observation(seq=1, seconds=0))
+
+    service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_A,
+        source_time=NOW + timedelta(seconds=2),
+    )
+
+    assert service.status.pending_evidence_work == 1
+    assert coordinator.cancel_calls == []
+
+
+def test_duplicate_periodic_workers_complete_one_pending_reservation_once(
+    tmp_path: Path,
+) -> None:
+    entered = Barrier(2)
+    release = Barrier(2)
+
+    class RefreshingRing(_Ring):
+        def reserve(self, **kwargs: object) -> SimpleNamespace:
+            reservation = super().reserve(**kwargs)
+            if len(self.calls) == 1:
+                reservation.status = "pending"
+                return reservation
+            entered.wait(timeout=5)
+            release.wait(timeout=5)
+            reservation.status = "ready"
+            return reservation
+
+    replayed: list[object] = []
+    states: dict[UUID, CandidateEventV1] = {}
+
+    def load(event_id: UUID) -> CandidateEventV1:
+        return states.get(event_id, CandidateEventV1.model_validate(replayed[0].payload))
+
+    def mark(event_id: UUID, status: str) -> CandidateEventV1:
+        states[event_id] = load(event_id).model_copy(update={"evidence_status": status})
+        return states[event_id]
+
+    service, ring, coordinator, _ = _service(
+        tmp_path,
+        journal=SQLiteWALJournal(tmp_path / "periodic-race.sqlite3", max_items=10),
+        processor=lambda item: replayed.append(item),
+        load_candidate=load,
+        mark_evidence_pending=lambda event_id: mark(event_id, "pending"),
+        mark_evidence_failed=lambda event_id: mark(event_id, "failed"),
+        ring=RefreshingRing(),
+    )
+    service.process(_observation(seq=1, seconds=0))
+
+    def periodic() -> object:
+        return service.run_periodic(
+            camera_id="cam-01",
+            stream_epoch=EPOCH_A,
+            source_time=NOW + timedelta(seconds=1),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = (pool.submit(periodic), pool.submit(periodic))
+        entered.wait(timeout=5)
+        release.wait(timeout=5)
+        results = [future.result() for future in futures]
+
+    assert len(ring.calls) == 2
+    assert len(coordinator.complete_calls) == 1
+    assert sum(len(result.durable_candidates) for result in results) == 1
+    assert service.status.pending_evidence_work == 0
+
+
+def test_pending_evidence_work_capacity_is_bounded_and_visible(tmp_path: Path) -> None:
+    persisted: dict[UUID, CandidateEventV1] = {}
+
+    def persist(item: object) -> None:
+        event = CandidateEventV1.model_validate(item.payload)
+        persisted[event.event_id] = event
+
+    def load(event_id: UUID) -> CandidateEventV1:
+        return persisted[event_id]
+
+    def mark(event_id: UUID, status: str) -> CandidateEventV1:
+        persisted[event_id] = persisted[event_id].model_copy(
+            update={"evidence_status": status}
+        )
+        return persisted[event_id]
+
+    journal = SQLiteWALJournal(tmp_path / "pending-capacity.sqlite3", max_items=10)
+    replay = EvidenceJournalReplayWorker(
+        journal=journal,
+        processor=persist,
+        batch_size=10,
+        retry_backoff_seconds=1,
+    )
+    ring = _Ring(ready=False)
+    coordinator = _Coordinator()
+    coordinator.ring = ring
+    service = SiteEventService(
+        engine=EventEngine(
+            module_rules=(_module_rule(votes_required=1, sample_count=1),),
+            limits=EngineLimits(max_pending_events=1),
+        ),
+        journal=journal,
+        replay_worker=replay,
+        ring=ring,
+        evidence_coordinator=coordinator,
+        load_candidate=load,
+        mark_evidence_pending=lambda event_id: mark(event_id, "pending"),
+        mark_evidence_failed=lambda event_id: mark(event_id, "failed"),
+        evidence_policy=EvidencePolicy(
+            pre_roll_seconds=2,
+            post_roll_seconds=2,
+            source_references={"cam-01": "nvr://cam-01"},
+        ),
+    )
+
+    first = service.process(_observation(seq=1, seconds=0, track_id="track-a"))
+    second = service.process(_observation(seq=2, seconds=1, track_id="track-b"))
+
+    assert len(first.durable_candidates) == 1
+    assert second.durable_candidates == ()
+    assert service.status.pending_evidence_work == 1
+    assert "pending_evidence_capacity_reached" in service.status.reasons
+    assert len(persisted) == 2
+    assert len(ring.calls) == 2
+    assert len(ring.released) == 1
+
+
+@pytest.mark.parametrize("failure", ("none", "wrong_event", "wrong_status", "raised"))
+def test_pending_transition_requires_exact_durable_receipt_and_cancels(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    replayed: list[object] = []
+
+    def transition(event_id: UUID) -> CandidateEventV1 | None:
+        event = CandidateEventV1.model_validate(replayed[0].payload)
+        if failure == "none":
+            return None
+        if failure == "wrong_event":
+            return event.model_copy(
+                update={"event_id": uuid4(), "evidence_status": "pending"}
+            )
+        if failure == "wrong_status":
+            return event
+        raise sqlite3.OperationalError("database is locked")
+
+    def failed(event_id: UUID) -> CandidateEventV1:
+        event = CandidateEventV1.model_validate(replayed[0].payload)
+        return event.model_copy(update={"evidence_status": "failed"})
+
+    service, ring, coordinator, _ = _service(
+        tmp_path,
+        journal=SQLiteWALJournal(tmp_path / f"bad-{failure}.sqlite3", max_items=10),
+        processor=lambda item: replayed.append(item),
+        load_candidate=lambda _event_id: CandidateEventV1.model_validate(
+            replayed[0].payload
+        ),
+        mark_evidence_pending=transition,
+        mark_evidence_failed=failed,
+    )
+    result = service.process(_observation(seq=1, seconds=0))
+
+    assert result.durable_candidates == ()
+    assert coordinator.cancel_calls
+    assert len(ring.released) == 1
+    assert service.status.pending_evidence_work == 0
+    assert "evidence_pending_transition_unverified" in result.status.reasons
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("none", "wrong_event", "wrong_status", "retryable", "deterministic"),
+)
+def test_failed_transition_requires_exact_receipt_and_retries_bounded_cleanup(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    replayed: list[object] = []
+    states: dict[UUID, CandidateEventV1] = {}
+    allow_success = False
+
+    def load(event_id: UUID) -> CandidateEventV1:
+        return states.get(event_id, CandidateEventV1.model_validate(replayed[0].payload))
+
+    def pending(event_id: UUID) -> CandidateEventV1:
+        states[event_id] = load(event_id).model_copy(update={"evidence_status": "pending"})
+        return states[event_id]
+
+    def failed(event_id: UUID) -> CandidateEventV1 | None:
+        event = load(event_id)
+        if allow_success:
+            states[event_id] = event.model_copy(update={"evidence_status": "failed"})
+            return states[event_id]
+        if failure == "none":
+            return None
+        if failure == "wrong_event":
+            return event.model_copy(
+                update={"event_id": uuid4(), "evidence_status": "failed"}
+            )
+        if failure == "wrong_status":
+            return event
+        if failure == "retryable":
+            raise sqlite3.OperationalError("database is locked")
+        raise ValueError("deterministic transition rejection")
+
+    service, ring, coordinator, _ = _service(
+        tmp_path,
+        journal=SQLiteWALJournal(tmp_path / f"failed-{failure}.sqlite3", max_items=10),
+        processor=lambda item: replayed.append(item),
+        load_candidate=load,
+        mark_evidence_pending=pending,
+        mark_evidence_failed=failed,
+        ring=_Ring(ready=False),
+    )
+    service.process(_observation(seq=1, seconds=0))
+
+    first = service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_B,
+        source_time=NOW + timedelta(seconds=1),
+    )
+
+    assert first.status.pending_evidence_work == 1
+    assert "evidence_terminal_transition_failed" in first.status.reasons
+    assert len(coordinator.cancel_calls) == 1
+    assert len(ring.released) == 1
+
+    allow_success = True
+    second = service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_B,
+        source_time=NOW + timedelta(seconds=2),
+    )
+
+    assert second.status.pending_evidence_work == 0
+    assert len(coordinator.cancel_calls) == 2
+    assert len(ring.released) == 2
+    assert len(states) == 1
+    assert next(iter(states.values())).evidence_status == "failed"
+
+
+def test_unique_inflight_claims_are_bounded_and_release_after_io(
+    tmp_path: Path,
+) -> None:
+    entered = Barrier(3)
+    release = Barrier(3)
+
+    class RecordingJournal:
+        def __init__(self) -> None:
+            self.events: dict[UUID, CandidateEventV1] = {}
+
+        def enqueue_event(self, event: CandidateEventV1) -> None:
+            self.events[event.event_id] = event
+
+        def depth(self) -> int:
+            return len(self.events)
+
+    journal = RecordingJournal()
+
+    def blocking_load(event_id: UUID) -> CandidateEventV1:
+        entered.wait(timeout=5)
+        release.wait(timeout=5)
+        return journal.events[event_id]
+
+    engine = EventEngine(
+        module_rules=(_module_rule(votes_required=1, sample_count=1),),
+        limits=EngineLimits(max_pending_events=2),
+    )
+    service = SiteEventService(
+        engine=engine,
+        journal=journal,
+        replay_worker=_Replay(),
+        ring=_Ring(),
+        evidence_coordinator=_Coordinator(),
+        load_candidate=blocking_load,
+        mark_evidence_pending=lambda event_id: (_ for _ in ()).throw(KeyError(event_id)),
+        mark_evidence_failed=lambda event_id: (_ for _ in ()).throw(KeyError(event_id)),
+        evidence_policy=EvidencePolicy(
+            pre_roll_seconds=2,
+            post_roll_seconds=2,
+            source_references={"cam-01": "nvr://cam-01"},
+        ),
+    )
+    triggers = tuple(
+        EventEngine(module_rules=(_module_rule(votes_required=1, sample_count=1),))
+        .ingest(_observation(seq=index + 1, seconds=index, track_id=f"track-{index}"))
+        .triggers[0]
+        for index in range(4)
+    )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(service._process_triggers, (trigger,)) for trigger in triggers
+        ]
+        entered.wait(timeout=5)
+        assert service.status.processing_claims == 2
+        assert "event_processing_capacity_reached" in service.status.reasons
+        release.wait(timeout=5)
+        for future in futures:
+            future.result()
+
+    assert journal.depth() == 4
+    assert service.status.processing_claims == 0
