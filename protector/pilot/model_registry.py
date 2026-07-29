@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -20,15 +22,15 @@ from types import MappingProxyType
 from typing import Annotated, Any, Callable, Literal
 
 import yaml
-from pydantic import Field, field_serializer, field_validator
+from pydantic import Field, ValidationError, field_serializer, field_validator
 
-from protector.pilot.config import FrozenModel, NonEmptyString
+from protector.pilot.config import FrozenModel, NonEmptyString, SiteConfig
 from protector.pilot.gates import (
     PILOT_TARGET_COMPUTE_CAPABILITY,
     PILOT_TARGET_GPU_ARCHITECTURE,
     PILOT_TENSORRT_VERSION,
+    AttestedFrozenReplayFanoutV1,
     ConditionalModelGateResultV1,
-    ExpectedConditionalWorkloadV1,
     MeasuredCapacityReportV1,
     ModelGate,
     ShadowStageEvidenceV1,
@@ -271,6 +273,7 @@ class EngineBuildResultV1(FrozenModel):
     schema_version: Literal["engine-build-result.v1"] = "engine-build-result.v1"
     artifact_id: NonEmptyString
     artifact_sha256: str
+    registry_entry_sha256: str
     engine_sha256: str
     precision: Literal["fp16", "int8"]
     target_gpu_architecture: Literal["NVIDIA L4 (Ada)"]
@@ -286,7 +289,7 @@ class EngineBuildResultV1(FrozenModel):
     calibration_corpus_sha256: str | None = None
     no_regression_report_sha256: str | None = None
 
-    @field_validator("artifact_sha256", "engine_sha256")
+    @field_validator("artifact_sha256", "registry_entry_sha256", "engine_sha256")
     @classmethod
     def hashes_are_digests(cls, value: str) -> str:
         return _digest(value, field_name="build result hash")
@@ -299,6 +302,59 @@ class EngineBuildResultV1(FrozenModel):
     @field_serializer("registry_record")
     def serialize_registry_record(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return dict(value)
+
+
+class EngineBuildIntentV1(FrozenModel):
+    """Durable non-deployable ownership record for one interrupted build."""
+
+    schema_version: Literal["engine-build-intent.v1"] = "engine-build-intent.v1"
+    artifact_id: NonEmptyString
+    artifact_sha256: str
+    registry_entry_sha256: str
+    precision: Literal["fp16", "int8"]
+    target_gpu_architecture: Literal["NVIDIA L4 (Ada)"]
+    target_compute_capability: Literal["8.9"]
+    tensorrt_version: Literal["10.16.0.72"]
+    observed_tensorrt_runtime_version: NonEmptyString
+    engine_path: NonEmptyString
+    receipt_path: NonEmptyString
+    commit_path: NonEmptyString
+    intent_path: NonEmptyString
+
+    @field_validator("artifact_sha256", "registry_entry_sha256")
+    @classmethod
+    def hashes_are_digests(cls, value: str) -> str:
+        return _digest(value, field_name="build intent hash")
+
+
+class EngineBuildCommitV1(FrozenModel):
+    """Final marker published only after exact engine and receipt are durable."""
+
+    schema_version: Literal["engine-build-commit.v1"] = "engine-build-commit.v1"
+    artifact_id: NonEmptyString
+    artifact_sha256: str
+    registry_entry_sha256: str
+    engine_sha256: str
+    receipt_sha256: str
+    precision: Literal["fp16", "int8"]
+    target_gpu_architecture: Literal["NVIDIA L4 (Ada)"]
+    target_compute_capability: Literal["8.9"]
+    tensorrt_version: Literal["10.16.0.72"]
+    observed_tensorrt_runtime_version: NonEmptyString
+    engine_path: NonEmptyString
+    receipt_path: NonEmptyString
+    commit_path: NonEmptyString
+    intent_path: NonEmptyString
+
+    @field_validator(
+        "artifact_sha256",
+        "registry_entry_sha256",
+        "engine_sha256",
+        "receipt_sha256",
+    )
+    @classmethod
+    def hashes_are_digests(cls, value: str) -> str:
+        return _digest(value, field_name="build commit hash")
 
 
 class EngineBuildError(RuntimeError):
@@ -357,16 +413,20 @@ def audit_model_entry(
     artifact_path: Path | None,
     *,
     engine_path: Path | None = None,
+    receipt_path: Path | None = None,
 ) -> ModelAuditResultV1:
     actual_digest: str | None = None
     path_reason: str | None = None
     if artifact_path is None:
         path_reason = "artifact file is required for hash audit"
     else:
-        if not artifact_path.is_file():
+        if not os.path.lexists(artifact_path):
             path_reason = "artifact file is missing"
         else:
-            actual_digest = _sha256_file(artifact_path)
+            try:
+                actual_digest = _sha256_file(artifact_path)
+            except (OSError, ValueError):
+                path_reason = "artifact file must be an available regular file"
     export_reasons = list(
         ModelGate.conditional_artifact_reasons(
             entry,
@@ -381,16 +441,41 @@ def audit_model_entry(
             require_engine=True,
         )
     )
+    if entry.engine is not None and (
+        entry.engine.target_gpu_architecture != PILOT_TARGET_GPU_ARCHITECTURE
+        or entry.engine.target_compute_capability
+        != PILOT_TARGET_COMPUTE_CAPABILITY
+        or entry.engine.tensorrt_version != PILOT_TENSORRT_VERSION
+    ):
+        deployment_reasons.append(
+            "engine does not match the exact NVIDIA L4 pilot target"
+        )
     if path_reason is not None:
         export_reasons.append(path_reason)
         deployment_reasons.append(path_reason)
     if entry.engine is not None and entry.engine.engine_sha256 is not None:
         if engine_path is None:
             deployment_reasons.append("engine file is required for deployment audit")
-        elif not engine_path.is_file():
+        elif not os.path.lexists(engine_path):
             deployment_reasons.append("engine file is missing")
-        elif _sha256_file(engine_path) != entry.engine.engine_sha256:
-            deployment_reasons.append("engine sha256 mismatch")
+        else:
+            try:
+                engine_sha256 = _sha256_file(engine_path)
+            except (OSError, ValueError):
+                deployment_reasons.append(
+                    "engine file must be an available regular file"
+                )
+            else:
+                if engine_sha256 != entry.engine.engine_sha256:
+                    deployment_reasons.append("engine sha256 mismatch")
+                else:
+                    deployment_reasons.extend(
+                        _engine_publication_audit_reasons(
+                            entry,
+                            engine_path=engine_path,
+                            receipt_path=receipt_path,
+                        )
+                    )
     return ModelAuditResultV1(
         approved_for_export=not export_reasons,
         approved_for_deployment=not deployment_reasons,
@@ -401,13 +486,104 @@ def audit_model_entry(
     )
 
 
+def _publication_paths(
+    engine_path: Path,
+    receipt_path: Path | None = None,
+) -> tuple[Path, Path, Path, Path]:
+    receipt = receipt_path or engine_path.with_suffix(
+        engine_path.suffix + ".build.json"
+    )
+    commit = engine_path.with_suffix(engine_path.suffix + ".commit.json")
+    intent = engine_path.with_suffix(engine_path.suffix + ".intent.json")
+    lock = engine_path.with_suffix(engine_path.suffix + ".lock")
+    return receipt, commit, intent, lock
+
+
+def _publication_destination(path: Path) -> Path:
+    """Resolve the parent but never follow an untrusted final directory entry."""
+
+    return path.parent.resolve() / path.name
+
+
+def _engine_publication_audit_reasons(
+    entry: ModelRegistryEntryV1,
+    *,
+    engine_path: Path,
+    receipt_path: Path | None,
+) -> tuple[str, ...]:
+    receipt, commit, intent, _ = _publication_paths(engine_path, receipt_path)
+    if os.path.lexists(intent):
+        return ("unfinished build intent",)
+    reasons: list[str] = []
+    if not receipt.is_file():
+        reasons.append("exact engine build receipt is missing")
+    if not commit.is_file():
+        reasons.append("final engine build commit marker is missing")
+    if reasons:
+        return tuple(reasons)
+    try:
+        receipt_bytes, receipt_payload = _read_bounded_json(
+            receipt,
+            max_bytes=2_000_000,
+        )
+        receipt_record = EngineBuildResultV1.model_validate(receipt_payload)
+    except (OSError, ValueError, ValidationError):
+        return ("exact engine build receipt is invalid",)
+    try:
+        _, commit_payload = _read_bounded_json(commit, max_bytes=65_536)
+        commit_record = EngineBuildCommitV1.model_validate(commit_payload)
+    except (OSError, ValueError, ValidationError):
+        return ("final engine build commit marker is invalid",)
+
+    engine = entry.engine
+    assert engine is not None and engine.engine_sha256 is not None
+    receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+    expected = {
+        "artifact_id": entry.artifact_id,
+        "artifact_sha256": entry.artifact_sha256,
+        "registry_entry_sha256": entry.registry_entry_sha256,
+        "engine_sha256": engine.engine_sha256,
+        "precision": engine.precision,
+        "target_gpu_architecture": engine.target_gpu_architecture,
+        "target_compute_capability": engine.target_compute_capability,
+        "tensorrt_version": engine.tensorrt_version,
+    }
+    receipt_values = {
+        key: getattr(receipt_record, key)
+        for key in expected
+    }
+    commit_values = {
+        key: getattr(commit_record, key)
+        for key in expected
+    }
+    if receipt_values != expected or commit_values != expected:
+        reasons.append("engine receipt or commit binding mismatch")
+    if commit_record.receipt_sha256 != receipt_sha256:
+        reasons.append("engine receipt sha256 does not match commit marker")
+    if (
+        commit_record.observed_tensorrt_runtime_version
+        != receipt_record.observed_tensorrt_runtime_version
+    ):
+        reasons.append("engine target runtime identity does not match receipt")
+    if commit_record.engine_path != str(_publication_destination(engine_path)):
+        reasons.append("engine path does not match commit marker")
+    if commit_record.receipt_path != str(_publication_destination(receipt)):
+        reasons.append("receipt path does not match commit marker")
+    if commit_record.commit_path != str(_publication_destination(commit)):
+        reasons.append("commit path does not match commit marker")
+    if commit_record.intent_path != str(_publication_destination(intent)):
+        reasons.append("intent path does not match commit marker")
+    return tuple(reasons)
+
+
 def evaluate_conditional_promotion(
     entry: ModelRegistryEntryV1,
     *,
     site_matrix: SignedSiteMatrixV1 | None,
     shadow_stage: ShadowStageEvidenceV1 | None,
     capacity_report: MeasuredCapacityReportV1 | None,
-    expected_workload: ExpectedConditionalWorkloadV1 | None,
+    site_config: SiteConfig | None,
+    frozen_replay: AttestedFrozenReplayFanoutV1 | None,
 ) -> ConditionalModelGateResultV1:
     """Thin registry wrapper around the single policy authority in ``gates.py``."""
 
@@ -416,7 +592,8 @@ def evaluate_conditional_promotion(
         site_matrix=site_matrix,
         shadow_stage=shadow_stage,
         capacity_report=capacity_report,
-        expected_workload=expected_workload,
+        site_config=site_config,
+        frozen_replay=frozen_replay,
     )
 
 
@@ -479,6 +656,7 @@ def build_engine(
     *,
     artifact_path: Path,
     output_path: Path,
+    receipt_path: Path | None = None,
     build_spec: EngineBuildSpecV1,
     trtexec_path: Path,
     calibration_path: Path | None = None,
@@ -542,107 +720,222 @@ def build_engine(
             else runtime_probe(trtexec_path)
         )
         _require_target_compatibility(build_spec, measured_runtime)
-        if output_path.exists():
-            raise EngineBuildError("refusing to overwrite an existing engine")
-
+        receipt, commit, intent, lock = _publication_paths(output_path, receipt_path)
+        resolved_publication_paths = {
+            _publication_destination(output_path),
+            _publication_destination(receipt),
+            _publication_destination(commit),
+            _publication_destination(intent),
+            _publication_destination(lock),
+        }
+        if len(resolved_publication_paths) != 5:
+            raise EngineBuildError("engine publication paths must be distinct")
+        if receipt.parent.resolve() != output_path.parent.resolve():
+            raise EngineBuildError("engine receipt must share the engine directory")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=".engine-build-",
-            dir=output_path.parent,
-        ) as temporary:
-            temporary_directory = Path(temporary)
-            temporary_engine = temporary_directory / "exporter-output.engine"
-            private_publication = temporary_directory / "publication.engine"
-            argv = [
-                str(trtexec_path),
-                f"--onnx={staged_artifact}",
-                f"--saveEngine={temporary_engine}",
-                "--skipInference",
-                "--fp16" if build_spec.precision == "fp16" else "--int8",
-            ]
-            if staged_calibration is not None:
-                argv.append(f"--calib={staged_calibration}")
-            launch_argv = [
-                sys.executable,
-                "-m",
-                "protector.pilot.runtime._limit_exec",
-                str(max_engine_bytes + 1),
-                "--",
-                *argv,
-            ]
-            return_code, exporter_output = _run_bounded(
-                launch_argv,
-                timeout_seconds=timeout_seconds,
-                max_output_bytes=max_output_bytes,
+        assert entry.artifact_sha256 is not None
+        intent_record = EngineBuildIntentV1(
+            artifact_id=entry.artifact_id,
+            artifact_sha256=entry.artifact_sha256,
+            registry_entry_sha256=entry.registry_entry_sha256,
+            precision=build_spec.precision,
+            target_gpu_architecture=build_spec.target_gpu_architecture,
+            target_compute_capability=build_spec.target_compute_capability,
+            tensorrt_version=build_spec.tensorrt_version,
+            observed_tensorrt_runtime_version=(
+                measured_runtime.tensorrt_runtime_version
+            ),
+            engine_path=str(_publication_destination(output_path)),
+            receipt_path=str(_publication_destination(receipt)),
+            commit_path=str(_publication_destination(commit)),
+            intent_path=str(_publication_destination(intent)),
+        )
+        lock_descriptor = _acquire_publication_lock(lock)
+        try:
+            recovered = _prepare_build_intent(
+                intent_record,
+                engine_path=output_path,
+                receipt_path=receipt,
+                commit_path=commit,
+                intent_path=intent,
             )
-            try:
-                exporter_output_stat = os.lstat(temporary_engine)
-            except FileNotFoundError:
-                exporter_output_stat = None
-            if (
-                exporter_output_stat is not None
-                and stat.S_ISREG(exporter_output_stat.st_mode)
-                and exporter_output_stat.st_size > max_engine_bytes
-            ):
-                raise EngineBuildError(
-                    "TensorRT exporter exceeded engine byte limit"
+        except BaseException:
+            _release_publication_lock(lock_descriptor)
+            raise
+        if recovered is not None:
+            _release_publication_lock(lock_descriptor)
+            return recovered
+        published: list[Path] = []
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".engine-build-",
+                dir=output_path.parent,
+            ) as temporary:
+                temporary_directory = Path(temporary)
+                temporary_engine = temporary_directory / "exporter-output.engine"
+                private_publication = temporary_directory / "publication.engine"
+                argv = [
+                    str(trtexec_path),
+                    f"--onnx={staged_artifact}",
+                    f"--saveEngine={temporary_engine}",
+                    "--skipInference",
+                    "--fp16" if build_spec.precision == "fp16" else "--int8",
+                ]
+                if staged_calibration is not None:
+                    argv.append(f"--calib={staged_calibration}")
+                launch_argv = [
+                    sys.executable,
+                    "-m",
+                    "protector.pilot.runtime._limit_exec",
+                    str(max_engine_bytes + 1),
+                    "--",
+                    *argv,
+                ]
+                return_code, exporter_output = _run_bounded(
+                    launch_argv,
+                    timeout_seconds=timeout_seconds,
+                    max_output_bytes=max_output_bytes,
                 )
-            if return_code != 0:
-                raise EngineBuildError(
-                    f"TensorRT exporter exited with status {return_code}"
+                try:
+                    exporter_output_stat = os.lstat(temporary_engine)
+                except FileNotFoundError:
+                    exporter_output_stat = None
+                if (
+                    exporter_output_stat is not None
+                    and stat.S_ISREG(exporter_output_stat.st_mode)
+                    and exporter_output_stat.st_size > max_engine_bytes
+                ):
+                    raise EngineBuildError(
+                        "TensorRT exporter exceeded engine byte limit"
+                    )
+                if return_code != 0:
+                    raise EngineBuildError(
+                        f"TensorRT exporter exited with status {return_code}"
+                    )
+                if not os.path.lexists(temporary_engine):
+                    raise EngineBuildError(
+                        "TensorRT exporter did not produce an engine"
+                    )
+                engine_sha256, engine_size = _stage_attested_file(
+                    temporary_engine,
+                    private_publication,
+                    label="TensorRT exporter output",
+                    max_bytes=max_engine_bytes,
                 )
-            if not os.path.lexists(temporary_engine):
-                raise EngineBuildError(
-                    "TensorRT exporter did not produce an engine"
-                )
-            engine_sha256, engine_size = _stage_attested_file(
-                temporary_engine,
-                private_publication,
-                label="TensorRT exporter output",
-                max_bytes=max_engine_bytes,
-            )
-            if engine_size <= 0:
-                raise EngineBuildError("TensorRT exporter did not produce an engine")
-            if (
-                build_spec.precision == "int8"
-                and build_spec.no_regression_report is not None
-                and build_spec.no_regression_report.candidate_engine_sha256
-                != engine_sha256
-            ):
-                raise EngineBuildError(
-                    "INT8 candidate engine does not match the no-regression event report"
-                )
-            os.chmod(private_publication, 0o444)
+                if engine_size <= 0:
+                    raise EngineBuildError(
+                        "TensorRT exporter did not produce an engine"
+                    )
+                if (
+                    entry.engine is None
+                    or entry.engine.engine_sha256 != engine_sha256
+                ):
+                    raise EngineBuildError(
+                        "candidate engine sha256 does not match the registry entry"
+                    )
+                if (
+                    build_spec.precision == "int8"
+                    and build_spec.no_regression_report is not None
+                    and build_spec.no_regression_report.candidate_engine_sha256
+                    != engine_sha256
+                ):
+                    raise EngineBuildError(
+                        "INT8 candidate engine does not match the no-regression event report"
+                    )
+                os.chmod(private_publication, 0o444)
 
-            assert entry.artifact_sha256 is not None
-            result = EngineBuildResultV1(
-                artifact_id=entry.artifact_id,
-                artifact_sha256=entry.artifact_sha256,
-                engine_sha256=engine_sha256,
-                precision=build_spec.precision,
-                target_gpu_architecture=build_spec.target_gpu_architecture,
-                target_compute_capability=build_spec.target_compute_capability,
-                tensorrt_version=build_spec.tensorrt_version,
-                observed_tensorrt_runtime_version=(
-                    measured_runtime.tensorrt_runtime_version
-                ),
-                raw_tensorrt_banner=measured_runtime.raw_tensorrt_banner,
-                argv=tuple(argv),
-                exporter_output=exporter_output,
-                registry_record=_audit_record(entry),
-                calibration_corpus_sha256=(
-                    build_spec.calibration_corpus.sha256
-                    if build_spec.calibration_corpus is not None
-                    else None
-                ),
-                no_regression_report_sha256=(
-                    build_spec.no_regression_report.report_sha256
-                    if build_spec.no_regression_report is not None
-                    else None
-                ),
-            )
-            _publish_engine(private_publication, output_path)
-            return result
+                result = EngineBuildResultV1(
+                    artifact_id=entry.artifact_id,
+                    artifact_sha256=entry.artifact_sha256,
+                    registry_entry_sha256=entry.registry_entry_sha256,
+                    engine_sha256=engine_sha256,
+                    precision=build_spec.precision,
+                    target_gpu_architecture=build_spec.target_gpu_architecture,
+                    target_compute_capability=build_spec.target_compute_capability,
+                    tensorrt_version=build_spec.tensorrt_version,
+                    observed_tensorrt_runtime_version=(
+                        measured_runtime.tensorrt_runtime_version
+                    ),
+                    raw_tensorrt_banner=measured_runtime.raw_tensorrt_banner,
+                    argv=tuple(argv),
+                    exporter_output=exporter_output,
+                    registry_record=_audit_record(entry),
+                    calibration_corpus_sha256=(
+                        build_spec.calibration_corpus.sha256
+                        if build_spec.calibration_corpus is not None
+                        else None
+                    ),
+                    no_regression_report_sha256=(
+                        build_spec.no_regression_report.report_sha256
+                        if build_spec.no_regression_report is not None
+                        else None
+                    ),
+                )
+                private_receipt = temporary_directory / "publication-receipt.json"
+                try:
+                    receipt_sha256 = _stage_json_file(
+                        private_receipt,
+                        result.model_dump(mode="json"),
+                        max_bytes=2_000_000,
+                    )
+                except OSError as exc:
+                    raise EngineBuildError("engine build receipt staging failed") from exc
+                commit_record = EngineBuildCommitV1(
+                    artifact_id=entry.artifact_id,
+                    artifact_sha256=entry.artifact_sha256,
+                    registry_entry_sha256=entry.registry_entry_sha256,
+                    engine_sha256=engine_sha256,
+                    receipt_sha256=receipt_sha256,
+                    precision=build_spec.precision,
+                    target_gpu_architecture=build_spec.target_gpu_architecture,
+                    target_compute_capability=build_spec.target_compute_capability,
+                    tensorrt_version=build_spec.tensorrt_version,
+                    observed_tensorrt_runtime_version=(
+                        measured_runtime.tensorrt_runtime_version
+                    ),
+                    engine_path=str(_publication_destination(output_path)),
+                    receipt_path=str(_publication_destination(receipt)),
+                    commit_path=str(_publication_destination(commit)),
+                    intent_path=str(_publication_destination(intent)),
+                )
+                private_commit = temporary_directory / "publication-commit.json"
+                _stage_json_file(
+                    private_commit,
+                    commit_record.model_dump(mode="json"),
+                    max_bytes=65_536,
+                )
+                os.chmod(private_receipt, 0o444)
+                os.chmod(private_commit, 0o444)
+
+                for source, destination in (
+                    (private_publication, output_path),
+                    (private_receipt, receipt),
+                ):
+                    _publish_build_product(source, destination)
+                    published.append(destination)
+                _fsync_directory(output_path.parent)
+                _publish_build_product(private_commit, commit)
+                published.append(commit)
+                _fsync_directory(output_path.parent)
+                intent.unlink()
+                _fsync_directory(output_path.parent)
+                return result
+        except Exception as exc:
+            try:
+                _cleanup_failed_build(
+                    published=published,
+                    intent_path=intent,
+                    directory=output_path.parent,
+                )
+            except OSError as cleanup_exc:
+                raise EngineBuildError(
+                    "engine build failed; durable non-deployable intent retained"
+                ) from cleanup_exc
+            if isinstance(exc, EngineBuildError):
+                raise
+            raise EngineBuildError("engine build publication failed") from exc
+        finally:
+            _release_publication_lock(lock_descriptor)
 
 
 def _stage_attested_file(
@@ -694,28 +987,249 @@ def _stage_attested_file(
         os.close(source_descriptor)
 
 
-def _publish_engine(private_publication: Path, output_path: Path) -> None:
-    """No-clobber publish with compensating durable cleanup on fsync failure."""
+def _stage_json_file(path: Path, payload: Any, *, max_bytes: int) -> str:
+    """Create and fsync one bounded private JSON file, returning exact digest."""
 
-    published = False
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise EngineBuildError("machine-readable build record exceeded byte limit")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+        0o400,
+    )
     try:
-        os.link(private_publication, output_path)
-        published = True
-        _fsync_directory(output_path.parent)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
+    else:
+        os.close(descriptor)
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_bounded_json(path: Path, *, max_bytes: int) -> tuple[bytes, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_bytes:
+            raise ValueError("build record is not a bounded regular file")
+        chunks: list[bytes] = []
+        read = 0
+        while chunk := os.read(descriptor, 65_536):
+            read += len(chunk)
+            if read > max_bytes:
+                raise ValueError("build record exceeds byte limit")
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    encoded = b"".join(chunks)
+    payload = json.loads(encoded)
+    if not isinstance(payload, dict):
+        raise ValueError("build record must be a JSON mapping")
+    return encoded, payload
+
+
+def _acquire_publication_lock(path: Path) -> int:
+    """Own one crash-released publication lock without following path aliases."""
+
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise EngineBuildError(
+            "engine publication lock must be an available regular file"
+        ) from exc
+    try:
+        lock_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_size > 4_096:
+            raise EngineBuildError(
+                "engine publication lock must be a bounded regular file"
+            )
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise EngineBuildError(
+                    "engine publication already in progress"
+                ) from exc
+            raise EngineBuildError("engine publication lock is unavailable") from exc
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _release_publication_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_build_product(source: Path, destination: Path) -> None:
+    """No-clobber hard-link publication; callers own durability and cleanup."""
+
+    try:
+        os.link(source, destination)
     except FileExistsError as exc:
         raise EngineBuildError("concurrent engine publication refused") from exc
-    except OSError as exc:
-        if published:
+
+
+def _prepare_build_intent(
+    record: EngineBuildIntentV1,
+    *,
+    engine_path: Path,
+    receipt_path: Path,
+    commit_path: Path,
+    intent_path: Path,
+) -> EngineBuildResultV1 | None:
+    """Recover an exact interrupted state, then durably claim destinations."""
+
+    if os.path.lexists(intent_path):
+        try:
+            _, payload = _read_bounded_json(intent_path, max_bytes=65_536)
+            existing = EngineBuildIntentV1.model_validate(payload)
+        except (OSError, ValueError, ValidationError) as exc:
+            raise EngineBuildError(
+                "existing build intent is invalid and requires quarantine"
+            ) from exc
+        if existing != record:
+            raise EngineBuildError("existing build intent belongs to another build")
+        if os.path.lexists(commit_path):
+            recovered = _recover_committed_build(
+                intent=record,
+                engine_path=engine_path,
+                receipt_path=receipt_path,
+                commit_path=commit_path,
+            )
             try:
-                output_path.unlink(missing_ok=True)
-            finally:
-                try:
-                    _fsync_directory(output_path.parent)
-                except OSError:
-                    pass
+                intent_path.unlink()
+                _fsync_directory(engine_path.parent)
+            except OSError as exc:
+                raise EngineBuildError(
+                    "committed build recovery could not clear durable intent"
+                ) from exc
+            return recovered
+        try:
+            engine_path.unlink(missing_ok=True)
+            receipt_path.unlink(missing_ok=True)
+            _fsync_directory(engine_path.parent)
+            intent_path.unlink()
+            _fsync_directory(engine_path.parent)
+        except OSError as exc:
+            raise EngineBuildError(
+                "interrupted build recovery failed; non-deployable intent retained"
+            ) from exc
+    elif (
+        os.path.lexists(engine_path)
+        or os.path.lexists(receipt_path)
+        or os.path.lexists(commit_path)
+    ):
+        raise EngineBuildError("refusing to overwrite an existing engine publication")
+
+    with tempfile.TemporaryDirectory(
+        prefix=".engine-intent-",
+        dir=engine_path.parent,
+    ) as temporary:
+        staged = Path(temporary) / "build.intent.json"
+        _stage_json_file(
+            staged,
+            record.model_dump(mode="json"),
+            max_bytes=65_536,
+        )
+        try:
+            _publish_build_product(staged, intent_path)
+            _fsync_directory(engine_path.parent)
+        except OSError as exc:
+            raise EngineBuildError(
+                "build intent publication durability failed; "
+                "non-deployable intent retained"
+            ) from exc
+    return None
+
+
+def _recover_committed_build(
+    *,
+    intent: EngineBuildIntentV1,
+    engine_path: Path,
+    receipt_path: Path,
+    commit_path: Path,
+) -> EngineBuildResultV1:
+    """Validate every committed byte/binding before clearing a stale intent."""
+
+    try:
+        receipt_bytes, receipt_payload = _read_bounded_json(
+            receipt_path,
+            max_bytes=2_000_000,
+        )
+        result = EngineBuildResultV1.model_validate(receipt_payload)
+        _, commit_payload = _read_bounded_json(commit_path, max_bytes=65_536)
+        commit = EngineBuildCommitV1.model_validate(commit_payload)
+        engine_sha256 = _sha256_file(engine_path)
+    except (OSError, ValueError, ValidationError) as exc:
         raise EngineBuildError(
-            "engine publication durability failed; destination was removed"
+            "committed build recovery failed exact product validation"
         ) from exc
+    expected_common = {
+        "artifact_id": intent.artifact_id,
+        "artifact_sha256": intent.artifact_sha256,
+        "registry_entry_sha256": intent.registry_entry_sha256,
+        "precision": intent.precision,
+        "target_gpu_architecture": intent.target_gpu_architecture,
+        "target_compute_capability": intent.target_compute_capability,
+        "tensorrt_version": intent.tensorrt_version,
+        "observed_tensorrt_runtime_version": (
+            intent.observed_tensorrt_runtime_version
+        ),
+    }
+    if (
+        any(getattr(result, key) != value for key, value in expected_common.items())
+        or any(getattr(commit, key) != value for key, value in expected_common.items())
+        or result.engine_sha256 != engine_sha256
+        or commit.engine_sha256 != engine_sha256
+        or commit.receipt_sha256
+        != hashlib.sha256(receipt_bytes).hexdigest()
+        or commit.engine_path != intent.engine_path
+        or commit.receipt_path != intent.receipt_path
+        or commit.commit_path != intent.commit_path
+        or commit.intent_path != intent.intent_path
+        or str(_publication_destination(engine_path)) != intent.engine_path
+        or str(_publication_destination(receipt_path)) != intent.receipt_path
+    ):
+        raise EngineBuildError(
+            "committed build recovery found a product binding mismatch"
+        )
+    return result
+
+
+def _cleanup_failed_build(
+    *,
+    published: list[Path],
+    intent_path: Path,
+    directory: Path,
+) -> None:
+    """Remove only products published by this attempt; keep intent on failure."""
+
+    for path in reversed(published):
+        path.unlink(missing_ok=True)
+    _fsync_directory(directory)
+    intent_path.unlink(missing_ok=True)
+    _fsync_directory(directory)
 
 
 def _require_target_compatibility(
@@ -873,10 +1387,17 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def _sha256_file(path: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1_048_576):
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("path must be a regular file")
+        while chunk := os.read(descriptor, 1_048_576):
             digest.update(chunk)
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
 
 
@@ -909,7 +1430,9 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 __all__ = [
     "CalibrationCorpusV1",
     "CommercialRightsEvidenceV1",
+    "EngineBuildCommitV1",
     "EngineBuildError",
+    "EngineBuildIntentV1",
     "EngineBuildResultV1",
     "EngineBuildSpecV1",
     "EngineRecordV1",

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -56,7 +59,7 @@ def _entry_payload(artifact_sha256: str) -> dict[str, object]:
         },
         "engine": {
             "schema_version": "engine-record.v1",
-            "engine_sha256": "e" * 64,
+            "engine_sha256": hashlib.sha256(b"target-l4-engine").hexdigest(),
             "tensorrt_version": "10.16.0.72",
             "target_gpu_architecture": "NVIDIA L4 (Ada)",
             "target_compute_capability": "8.9",
@@ -233,8 +236,8 @@ def test_complete_registry_entry_audits_exact_file_and_records_required_provenan
     result = audit_model_entry(entry, artifact, engine_path=engine_path)
 
     assert result.approved_for_export is True
-    assert result.approved_for_deployment is True
-    assert result.reasons == ()
+    assert result.approved_for_deployment is False
+    assert "receipt" in " ".join(result.deployment_reasons)
     assert result.record == {
         "artifact_id": "weapon-rfdetr-2026-07-29",
         "artifact_sha256": digest,
@@ -266,6 +269,92 @@ def test_complete_registry_entry_audits_exact_file_and_records_required_provenan
         },
         "training_provenance": "registry://training/weapon-rfdetr/run-0042",
     }
+
+
+@pytest.mark.parametrize(
+    "unsafe_reference",
+    [
+        r"https://models.example.kz\tenant\model.onnx",
+        "https://models.example.kz/model.onnx;token=secret",
+        "https://models.example.kz/a/../model.onnx",
+        "https://models.example.kz/a//model.onnx",
+        "https://models.example.kz/model%2fonxx",
+        "https:///model.onnx",
+        "https://-bad.example.kz/model.onnx",
+        "s3:///model.onnx",
+        "s3://Bucket/model.onnx",
+        "s3://bucket_name/model.onnx",
+        "registry:///training/run-7",
+        "registry://Training/run-7",
+        "registry://training/a/../run-7",
+        "../reports/model.json",
+        "/absolute/reports/model.json",
+        "reports//model.json",
+        "reports/model.json;token=secret",
+        "reports/model%2ejson",
+        "ftp://models.example.kz/model.onnx",
+        "reports/model.json?",
+        "reports/model.json#",
+        "reports/model.json\tsecret",
+    ],
+)
+def test_reference_validator_rejects_every_noncanonical_supported_scheme_form(
+    unsafe_reference: str,
+) -> None:
+    payload = _entry_payload("a" * 64)
+    payload["source_uri"] = unsafe_reference
+
+    with pytest.raises(ValidationError, match="canonical and credential-free"):
+        ModelRegistryEntryV1.model_validate(payload)
+
+
+def test_reference_validator_preserves_valid_canonical_supported_forms() -> None:
+    valid = (
+        "https://models.example.kz/model.onnx",
+        "s3://kz-model-registry/models/model.onnx",
+        "registry://training/weapon/run-7",
+        "reports/site/model.json",
+    )
+
+    for reference in valid:
+        payload = _entry_payload("a" * 64)
+        payload["source_uri"] = reference
+        assert ModelRegistryEntryV1.model_validate(payload).source_uri == reference
+
+
+@pytest.mark.parametrize(
+    "target_change",
+    [
+        {"target_gpu_architecture": "NVIDIA RTX 4090"},
+        {"target_compute_capability": "9.0"},
+        {"tensorrt_version": "10.8.0.43"},
+    ],
+)
+def test_deployment_audit_never_approves_a_nonpilot_engine_target(
+    tmp_path: Path,
+    target_change: dict[str, str],
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    engine_path = tmp_path / "candidate.engine"
+    engine_path.write_bytes(b"candidate-engine")
+    base = _entry(digest)
+    entry = base.model_copy(
+        update={
+            "engine": base.engine.model_copy(
+                update={
+                    "engine_sha256": hashlib.sha256(
+                        engine_path.read_bytes()
+                    ).hexdigest(),
+                    **target_change,
+                }
+            )
+        }
+    )
+
+    result = audit_model_entry(entry, artifact, engine_path=engine_path)
+
+    assert result.approved_for_deployment is False
+    assert "exact NVIDIA L4 pilot target" in " ".join(result.deployment_reasons)
 
 
 def test_source_artifact_can_pass_export_preflight_before_an_engine_exists(
@@ -301,6 +390,30 @@ def test_audit_never_approves_unhashed_source_or_unverified_engine_bytes(
     assert "engine file is required for deployment audit" in no_engine_bytes.deployment_reasons
     assert mismatch.approved_for_deployment is False
     assert "engine sha256 mismatch" in mismatch.deployment_reasons
+
+
+def test_deployment_audit_refuses_symlinked_artifact_and_engine_paths(
+    tmp_path: Path,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    artifact_link = tmp_path / "candidate-link.onnx"
+    artifact_link.symlink_to(artifact)
+    engine = tmp_path / "candidate.engine"
+    engine.write_bytes(b"target-l4-engine")
+    engine_link = tmp_path / "candidate-link.engine"
+    engine_link.symlink_to(engine)
+
+    linked_artifact = audit_model_entry(_entry(digest), artifact_link)
+    linked_engine = audit_model_entry(
+        _entry(digest),
+        artifact,
+        engine_path=engine_link,
+    )
+
+    assert linked_artifact.approved_for_export is False
+    assert "regular file" in " ".join(linked_artifact.export_reasons)
+    assert linked_engine.approved_for_deployment is False
+    assert "regular file" in " ".join(linked_engine.deployment_reasons)
 
 
 @pytest.mark.parametrize("status", ["unknown", "ambiguous", "rejected"])
@@ -355,8 +468,20 @@ def test_export_consumes_attested_bytes_when_source_path_changes_after_preflight
         replacement.replace(artifact)
         return _compatible_runtime_probe(Path("unused"))
 
+    base = _entry(digest)
+    entry = base.model_copy(
+        update={
+            "engine": base.engine.model_copy(
+                update={
+                    "engine_sha256": hashlib.sha256(
+                        b"rights-cleared-onnx"
+                    ).hexdigest()
+                }
+            )
+        }
+    )
     result = build_engine(
-        _entry(digest),
+        entry,
         artifact_path=artifact,
         output_path=output,
         build_spec=EngineBuildSpecV1(),
@@ -418,6 +543,433 @@ def test_fp16_build_uses_target_l4_argv_and_records_engine_identity(tmp_path: Pa
     assert onnx_argument.endswith("/attested-model.onnx")
     assert "--fp16" in result.argv
     assert not any(argument in {"sh", "bash", "-c"} for argument in result.argv)
+
+
+def test_engine_receipt_and_commit_are_published_as_one_auditable_state(
+    tmp_path: Path,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    output = tmp_path / "build" / "weapon.engine"
+    receipt = output.with_suffix(output.suffix + ".build.json")
+    commit = output.with_suffix(output.suffix + ".commit.json")
+    intent = output.with_suffix(output.suffix + ".intent.json")
+
+    result = build_engine(
+        _entry(digest),
+        artifact_path=artifact,
+        output_path=output,
+        build_spec=EngineBuildSpecV1(),
+        trtexec_path=_make_fake_trtexec(tmp_path),
+        runtime_probe=_compatible_runtime_probe,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+
+    assert output.is_file()
+    assert receipt.is_file()
+    assert commit.is_file()
+    assert not intent.exists()
+    receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+    commit_payload = json.loads(commit.read_text(encoding="utf-8"))
+    assert receipt_payload == result.model_dump(mode="json")
+    assert commit_payload["engine_sha256"] == result.engine_sha256
+    assert commit_payload["receipt_sha256"] == hashlib.sha256(
+        receipt.read_bytes()
+    ).hexdigest()
+    assert commit_payload["engine_path"] == str(output.resolve())
+    assert commit_payload["receipt_path"] == str(receipt.resolve())
+    assert commit_payload["commit_path"] == str(commit.resolve())
+    assert commit_payload["intent_path"] == str(intent.resolve())
+
+    deployed_entry = _entry(digest)
+    audit = audit_model_entry(deployed_entry, artifact, engine_path=output)
+    assert audit.approved_for_deployment is True
+
+
+def test_deployment_audit_requires_exact_receipt_commit_and_no_build_intent(
+    tmp_path: Path,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    output = tmp_path / "build" / "weapon.engine"
+    result = build_engine(
+        _entry(digest),
+        artifact_path=artifact,
+        output_path=output,
+        build_spec=EngineBuildSpecV1(),
+        trtexec_path=_make_fake_trtexec(tmp_path),
+        runtime_probe=_compatible_runtime_probe,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+    entry = _entry(digest)
+    receipt = output.with_suffix(output.suffix + ".build.json")
+    commit = output.with_suffix(output.suffix + ".commit.json")
+    intent = output.with_suffix(output.suffix + ".intent.json")
+
+    commit_bytes = commit.read_bytes()
+    commit.unlink()
+    missing_commit = audit_model_entry(entry, artifact, engine_path=output)
+    assert missing_commit.approved_for_deployment is False
+    assert "commit" in " ".join(missing_commit.deployment_reasons)
+
+    commit.write_bytes(commit_bytes)
+    receipt.chmod(0o600)
+    receipt.write_text("{}\n", encoding="utf-8")
+    mismatched_receipt = audit_model_entry(entry, artifact, engine_path=output)
+    assert mismatched_receipt.approved_for_deployment is False
+    assert "receipt" in " ".join(mismatched_receipt.deployment_reasons)
+
+    receipt.write_text(
+        json.dumps(result.model_dump(mode="json"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    intent.write_text("{}\n", encoding="utf-8")
+    unfinished = audit_model_entry(entry, artifact, engine_path=output)
+    assert unfinished.approved_for_deployment is False
+    assert "unfinished build intent" in unfinished.deployment_reasons
+
+
+def test_receipt_stage_failure_leaves_no_deployable_product_and_retry_is_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    output = tmp_path / "build" / "weapon.engine"
+    original_stage_json = model_registry._stage_json_file
+
+    def fail_receipt_stage(path: Path, payload: object, *, max_bytes: int) -> str:
+        if path.name == "publication-receipt.json":
+            raise OSError("simulated receipt write failure")
+        return original_stage_json(path, payload, max_bytes=max_bytes)
+
+    monkeypatch.setattr(model_registry, "_stage_json_file", fail_receipt_stage)
+    with pytest.raises(EngineBuildError, match="receipt"):
+        build_engine(
+            _entry(digest),
+            artifact_path=artifact,
+            output_path=output,
+            build_spec=EngineBuildSpecV1(),
+            trtexec_path=_make_fake_trtexec(tmp_path),
+            runtime_probe=_compatible_runtime_probe,
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )
+
+    for suffix in ("", ".build.json", ".commit.json", ".intent.json"):
+        assert not Path(f"{output}{suffix}").exists()
+
+    monkeypatch.setattr(model_registry, "_stage_json_file", original_stage_json)
+    assert build_engine(
+        _entry(digest),
+        artifact_path=artifact,
+        output_path=output,
+        build_spec=EngineBuildSpecV1(),
+        trtexec_path=_make_fake_trtexec(tmp_path, name="retry-trtexec"),
+        runtime_probe=_compatible_runtime_probe,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+
+
+def test_restart_after_engine_publish_recovers_matching_intent_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    output = tmp_path / "build" / "weapon.engine"
+    original_publish = model_registry._publish_build_product
+
+    class SimulatedProcessStop(BaseException):
+        pass
+
+    def stop_after_engine(source: Path, destination: Path) -> None:
+        original_publish(source, destination)
+        if destination == output:
+            raise SimulatedProcessStop
+
+    monkeypatch.setattr(model_registry, "_publish_build_product", stop_after_engine)
+    with pytest.raises(SimulatedProcessStop):
+        build_engine(
+            _entry(digest),
+            artifact_path=artifact,
+            output_path=output,
+            build_spec=EngineBuildSpecV1(),
+            trtexec_path=_make_fake_trtexec(tmp_path),
+            runtime_probe=_compatible_runtime_probe,
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )
+    assert output.exists()
+    assert output.with_suffix(output.suffix + ".intent.json").exists()
+    assert not output.with_suffix(output.suffix + ".commit.json").exists()
+
+    monkeypatch.setattr(model_registry, "_publish_build_product", original_publish)
+    result = build_engine(
+        _entry(digest),
+        artifact_path=artifact,
+        output_path=output,
+        build_spec=EngineBuildSpecV1(),
+        trtexec_path=_make_fake_trtexec(tmp_path, name="restart-trtexec"),
+        runtime_probe=_compatible_runtime_probe,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+    assert result.engine_sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert not output.with_suffix(output.suffix + ".intent.json").exists()
+
+
+def test_restart_after_commit_durable_validates_products_and_clears_intent(
+    tmp_path: Path,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    output = tmp_path / "build" / "weapon.engine"
+    first = build_engine(
+        _entry(digest),
+        artifact_path=artifact,
+        output_path=output,
+        build_spec=EngineBuildSpecV1(),
+        trtexec_path=_make_fake_trtexec(tmp_path),
+        runtime_probe=_compatible_runtime_probe,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+    receipt = output.with_suffix(output.suffix + ".build.json")
+    commit = output.with_suffix(output.suffix + ".commit.json")
+    intent = output.with_suffix(output.suffix + ".intent.json")
+    intent_record = model_registry.EngineBuildIntentV1(
+        artifact_id=first.artifact_id,
+        artifact_sha256=first.artifact_sha256,
+        registry_entry_sha256=first.registry_entry_sha256,
+        precision=first.precision,
+        target_gpu_architecture=first.target_gpu_architecture,
+        target_compute_capability=first.target_compute_capability,
+        tensorrt_version=first.tensorrt_version,
+        observed_tensorrt_runtime_version=first.observed_tensorrt_runtime_version,
+        engine_path=str(output.resolve()),
+        receipt_path=str(receipt.resolve()),
+        commit_path=str(commit.resolve()),
+        intent_path=str(intent.resolve()),
+    )
+    intent.write_text(
+        json.dumps(intent_record.model_dump(mode="json"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    recovered = build_engine(
+        _entry(digest),
+        artifact_path=artifact,
+        output_path=output,
+        build_spec=EngineBuildSpecV1(),
+        trtexec_path=_make_fake_trtexec(
+            tmp_path,
+            name="must-not-run-trtexec",
+            exit_code=99,
+        ),
+        runtime_probe=_compatible_runtime_probe,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+
+    assert recovered == first
+    assert not intent.exists()
+    assert output.is_file() and receipt.is_file() and commit.is_file()
+
+
+def test_live_engine_publication_refuses_identical_retry_without_recovering_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    entry = _entry(digest)
+    output = tmp_path / "build" / "weapon.engine"
+    engine_published = threading.Event()
+    resume_first_build = threading.Event()
+    first_results: list[object] = []
+    original_publish = model_registry._publish_build_product
+
+    def pause_first_build_after_engine(source: Path, destination: Path) -> None:
+        original_publish(source, destination)
+        if destination == output and threading.current_thread().name == "build-a":
+            engine_published.set()
+            assert resume_first_build.wait(timeout=10)
+
+    def run_first_build() -> None:
+        try:
+            first_results.append(
+                build_engine(
+                    entry,
+                    artifact_path=artifact,
+                    output_path=output,
+                    build_spec=EngineBuildSpecV1(),
+                    trtexec_path=_make_fake_trtexec(
+                        tmp_path,
+                        name="build-a-trtexec",
+                    ),
+                    runtime_probe=_compatible_runtime_probe,
+                    timeout_seconds=10,
+                    max_output_bytes=1024,
+                )
+            )
+        except BaseException as exc:
+            first_results.append(exc)
+
+    monkeypatch.setattr(
+        model_registry,
+        "_publish_build_product",
+        pause_first_build_after_engine,
+    )
+    first_build = threading.Thread(target=run_first_build, name="build-a")
+    first_build.start()
+    assert engine_published.wait(timeout=10)
+
+    second_error: EngineBuildError | None = None
+    try:
+        build_engine(
+            entry,
+            artifact_path=artifact,
+            output_path=output,
+            build_spec=EngineBuildSpecV1(),
+            trtexec_path=_make_fake_trtexec(
+                tmp_path,
+                name="build-b-must-not-run-trtexec",
+                exit_code=99,
+            ),
+            runtime_probe=_compatible_runtime_probe,
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )
+    except EngineBuildError as exc:
+        second_error = exc
+    finally:
+        resume_first_build.set()
+        first_build.join(timeout=10)
+
+    assert not first_build.is_alive()
+    assert second_error is not None
+    assert "publication already in progress" in str(second_error)
+    assert len(first_results) == 1
+    assert not isinstance(first_results[0], BaseException)
+    assert output.read_bytes() == b"target-l4-engine"
+    assert output.with_suffix(output.suffix + ".build.json").is_file()
+    assert output.with_suffix(output.suffix + ".commit.json").is_file()
+    assert not os.path.lexists(output.with_suffix(output.suffix + ".intent.json"))
+    assert audit_model_entry(entry, artifact, engine_path=output).approved_for_deployment
+
+
+@pytest.mark.parametrize("link_kind", ["dangling", "self_loop"])
+def test_deployment_audit_refuses_any_intent_directory_entry_without_following_it(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    entry = _entry(digest)
+    output = tmp_path / "build" / "weapon.engine"
+    build_engine(
+        entry,
+        artifact_path=artifact,
+        output_path=output,
+        build_spec=EngineBuildSpecV1(),
+        trtexec_path=_make_fake_trtexec(tmp_path),
+        runtime_probe=_compatible_runtime_probe,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+    intent = output.with_suffix(output.suffix + ".intent.json")
+    target = intent.name if link_kind == "self_loop" else "missing-intent-record"
+    intent.symlink_to(target)
+
+    result = audit_model_entry(entry, artifact, engine_path=output)
+
+    assert result.approved_for_deployment is False
+    assert result.deployment_reasons == ("unfinished build intent",)
+
+
+@pytest.mark.parametrize("alias", ["engine", "commit", "intent", "lock"])
+def test_engine_publication_paths_must_be_distinct(
+    tmp_path: Path,
+    alias: str,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    output = tmp_path / "build" / "weapon.engine"
+    aliases = {
+        "engine": output,
+        "commit": output.with_suffix(output.suffix + ".commit.json"),
+        "intent": output.with_suffix(output.suffix + ".intent.json"),
+        "lock": output.with_suffix(output.suffix + ".lock"),
+    }
+
+    with pytest.raises(EngineBuildError, match="distinct"):
+        build_engine(
+            _entry(digest),
+            artifact_path=artifact,
+            output_path=output,
+            receipt_path=aliases[alias],
+            build_spec=EngineBuildSpecV1(),
+            trtexec_path=_make_fake_trtexec(tmp_path),
+            runtime_probe=_compatible_runtime_probe,
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("link_kind", ["dangling", "existing_target", "self_loop"])
+def test_engine_publication_lock_refuses_symlinks_without_following_them(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    output = tmp_path / "build" / "weapon.engine"
+    output.parent.mkdir()
+    lock = output.with_suffix(output.suffix + ".lock")
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"must-not-change")
+    targets = {
+        "dangling": "missing-lock-target",
+        "existing_target": str(victim),
+        "self_loop": lock.name,
+    }
+    lock.symlink_to(targets[link_kind])
+
+    with pytest.raises(EngineBuildError, match="publication lock"):
+        build_engine(
+            _entry(digest),
+            artifact_path=artifact,
+            output_path=output,
+            build_spec=EngineBuildSpecV1(),
+            trtexec_path=_make_fake_trtexec(tmp_path),
+            runtime_probe=_compatible_runtime_probe,
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )
+
+    assert victim.read_bytes() == b"must-not-change"
+    assert lock.is_symlink()
+    assert not output.exists()
+
+
+def test_engine_publication_lock_is_bounded_regular_and_owner_only(
+    tmp_path: Path,
+) -> None:
+    artifact, digest = _write_onnx(tmp_path)
+    output = tmp_path / "build" / "weapon.engine"
+
+    build_engine(
+        _entry(digest),
+        artifact_path=artifact,
+        output_path=output,
+        build_spec=EngineBuildSpecV1(),
+        trtexec_path=_make_fake_trtexec(tmp_path),
+        runtime_probe=_compatible_runtime_probe,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+
+    lock_stat = os.lstat(output.with_suffix(output.suffix + ".lock"))
+    assert stat.S_ISREG(lock_stat.st_mode)
+    assert stat.S_IMODE(lock_stat.st_mode) == 0o600
+    assert lock_stat.st_size <= 4096
 
 
 def test_runtime_probe_refuses_non_l4_or_tensorrt_mismatch_before_build_side_effect(
@@ -604,10 +1156,11 @@ def test_publication_durability_failure_removes_destination_and_allows_retry(
             runtime_probe=_compatible_runtime_probe,
             timeout_seconds=10,
             max_output_bytes=1024,
-        )
+    )
 
     assert not output.exists()
-    assert calls >= 2
+    assert output.with_suffix(output.suffix + ".intent.json").exists()
+    assert calls == 1
 
     monkeypatch.setattr(model_registry, "_fsync_directory", original_fsync_directory)
     result = build_engine(

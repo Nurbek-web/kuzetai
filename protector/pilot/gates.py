@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, Protocol
 from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
-from protector.pilot.config import FrozenModel, NonEmptyString
+from protector.pilot.config import FrozenModel, NonEmptyString, SiteConfig
 from protector.pilot.domain import GateMode
 
 _OPERATOR_ELIGIBLE_ANALYTICS = frozenset(
@@ -36,22 +38,74 @@ def _digest(value: str, *, field_name: str) -> str:
 
 
 def validate_credential_free_reference(value: str) -> str:
-    """Accept canonical opaque references while refusing embedded access material."""
+    """Accept only canonical HTTPS, S3, registry, or scoped relative references."""
 
-    if value != value.strip() or any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise ValueError("reference must be canonical and credential-free")
-    if any(encoded in value.lower() for encoded in ("%3f", "%23", "%40", "%0a", "%0d")):
-        raise ValueError("reference must be canonical and credential-free")
+    message = "reference must be canonical and credential-free"
+    if (
+        value != value.strip()
+        or any(character.isspace() for character in value)
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or "\\" in value
+        or "%" in value
+        or "?" in value
+        or "#" in value
+        or ";" in value
+    ):
+        raise ValueError(message)
     try:
         parsed = urlsplit(value)
     except ValueError as exc:
-        raise ValueError("reference must be canonical and credential-free") from exc
+        raise ValueError(message) from exc
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError("reference must be canonical and credential-free")
+        raise ValueError(message)
     if parsed.query or parsed.fragment:
-        raise ValueError("reference must be canonical and credential-free")
-    if parsed.scheme and parsed.scheme != parsed.scheme.lower():
-        raise ValueError("reference must be canonical and credential-free")
+        raise ValueError(message)
+    if parsed.scheme not in {"", "https", "s3", "registry"}:
+        raise ValueError(message)
+
+    def canonical_path(path: str, *, absolute: bool) -> bool:
+        if not path or path.endswith("/") or "//" in path:
+            return False
+        if absolute != path.startswith("/"):
+            return False
+        parts = path[1:].split("/") if absolute else path.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            return False
+        return PurePosixPath(path).as_posix() == path
+
+    if not parsed.scheme:
+        if parsed.netloc or not canonical_path(parsed.path, absolute=False):
+            raise ValueError(message)
+        return value
+
+    if parsed.scheme != value.split(":", maxsplit=1)[0]:
+        raise ValueError(message)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(message) from exc
+    hostname = parsed.hostname
+    if hostname is None or hostname != hostname.lower():
+        raise ValueError(message)
+    labels = hostname.split(".")
+    if (
+        len(hostname) > 253
+        or any(
+            re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            is None
+            for label in labels
+        )
+    ):
+        raise ValueError(message)
+    if parsed.scheme in {"s3", "registry"}:
+        if port is not None or parsed.netloc != hostname:
+            raise ValueError(message)
+    else:
+        expected_authority = hostname if port is None else f"{hostname}:{port}"
+        if parsed.netloc != expected_authority or port == 443:
+            raise ValueError(message)
+    if not canonical_path(parsed.path, absolute=True):
+        raise ValueError(message)
     return value
 
 
@@ -248,6 +302,88 @@ class CameraAnalyticScheduleV1(FrozenModel):
     inferences_per_sample: Annotated[int, Field(ge=1, le=256)]
 
 
+class FrozenReplayCameraFanoutV1(FrozenModel):
+    """Measured per-sample inference fanout for one exact replay camera."""
+
+    camera_id: NonEmptyString
+    inferences_per_sample: Annotated[int, Field(ge=1, le=256)]
+
+
+class FrozenReplayFanoutManifestV1(FrozenModel):
+    """Exact replay/fanout evidence; it never contains stream credentials."""
+
+    schema_version: Literal["frozen-replay-fanout-manifest.v1"]
+    site_id: NonEmptyString
+    module: Literal["fire_smoke", "weapon"]
+    corpus_id: NonEmptyString
+    corpus_sha256: str
+    cameras: Annotated[
+        tuple[FrozenReplayCameraFanoutV1, ...],
+        Field(min_length=20, max_length=20),
+    ]
+
+    @model_validator(mode="after")
+    def camera_identities_and_fanout_are_exact(self) -> FrozenReplayFanoutManifestV1:
+        camera_ids = tuple(camera.camera_id for camera in self.cameras)
+        if len(camera_ids) != len(set(camera_ids)):
+            raise ValueError("frozen replay camera IDs must be unique")
+        if self.module == "fire_smoke" and any(
+            camera.inferences_per_sample != 1 for camera in self.cameras
+        ):
+            raise ValueError("fire replay must use one full-frame inference per sample")
+        return self
+
+    @field_validator("corpus_sha256")
+    @classmethod
+    def corpus_hash_is_a_digest(cls, value: str) -> str:
+        return _digest(value, field_name="frozen replay corpus sha256")
+
+    @property
+    def manifest_sha256(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+class AttestedFrozenReplayFanoutV1(FrozenModel):
+    """Canonical manifest plus the digest signed by the capacity-test authority."""
+
+    schema_version: Literal["attested-frozen-replay-fanout.v1"]
+    manifest: FrozenReplayFanoutManifestV1
+    manifest_sha256: str
+    passed: bool
+    report_reference: NonEmptyString
+    report_sha256: str
+    signed_by: NonEmptyString
+    signed_at: datetime
+
+    @field_validator("manifest_sha256", "report_sha256")
+    @classmethod
+    def manifest_hash_is_a_digest(cls, value: str) -> str:
+        return _digest(value, field_name="frozen replay manifest sha256")
+
+    @field_validator("report_reference")
+    @classmethod
+    def report_reference_is_credential_free(cls, value: str) -> str:
+        return validate_credential_free_reference(value)
+
+    @field_validator("signed_at")
+    @classmethod
+    def signing_time_is_utc(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def digest_matches_exact_manifest(self) -> AttestedFrozenReplayFanoutV1:
+        if self.manifest_sha256 != self.manifest.manifest_sha256:
+            raise ValueError("frozen replay manifest sha256 mismatch")
+        if not self.passed:
+            raise ValueError("frozen replay fanout attestation did not pass")
+        return self
+
+
 class ExpectedConditionalWorkloadV1(FrozenModel):
     """Canonical site-owned workload used independently of measured capacity."""
 
@@ -292,6 +428,59 @@ class ExpectedConditionalWorkloadV1(FrozenModel):
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+
+def site_config_sha256(site_config: SiteConfig) -> str:
+    """Hash the immutable non-secret configuration without resolving stream secrets."""
+
+    encoded = json.dumps(
+        site_config.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def derive_expected_conditional_workload(
+    *,
+    site_id: str,
+    module: Literal["fire_smoke", "weapon"],
+    site_config: SiteConfig,
+    frozen_replay: AttestedFrozenReplayFanoutV1,
+) -> ExpectedConditionalWorkloadV1:
+    """Derive capacity demand from the exact site schedule and attested replay."""
+
+    manifest = frozen_replay.manifest
+    if manifest.site_id != site_id or manifest.module != module:
+        raise ValueError("frozen replay site or module binding mismatch")
+    feeds = site_config.ready_to_start.feeds
+    configured_camera_ids = tuple(feed.camera_id for feed in feeds)
+    fanout_by_camera = {
+        camera.camera_id: camera.inferences_per_sample
+        for camera in manifest.cameras
+    }
+    if set(fanout_by_camera) != set(configured_camera_ids):
+        raise ValueError("frozen replay cameras do not match the site configuration")
+    schedules: list[CameraAnalyticScheduleV1] = []
+    for feed in feeds:
+        analytics_hz = feed.analytics_hz.get(module)
+        if analytics_hz is None or analytics_hz <= 0:
+            raise ValueError(f"{module} schedule must be explicitly positive for every camera")
+        schedules.append(
+            CameraAnalyticScheduleV1(
+                camera_id=feed.camera_id,
+                analytics_hz=analytics_hz,
+                inferences_per_sample=fanout_by_camera[feed.camera_id],
+            )
+        )
+    return ExpectedConditionalWorkloadV1(
+        schema_version="expected-conditional-workload.v1",
+        site_id=site_id,
+        module=module,
+        site_config_sha256=site_config_sha256(site_config),
+        frozen_workload_sha256=frozen_replay.manifest_sha256,
+        cameras=tuple(schedules),
+    )
 
 
 class ConditionalArtifactEvidence(Protocol):
@@ -507,7 +696,8 @@ class ModelGate:
         site_matrix: SignedSiteMatrixV1 | None,
         shadow_stage: ShadowStageEvidenceV1 | None,
         capacity_report: MeasuredCapacityReportV1 | None,
-        expected_workload: ExpectedConditionalWorkloadV1 | None,
+        site_config: SiteConfig | None,
+        frozen_replay: AttestedFrozenReplayFanoutV1 | None,
     ) -> ConditionalModelGateResultV1:
         """Evaluate conditional analytics through one staged, evidence-bound policy."""
 
@@ -537,6 +727,20 @@ class ModelGate:
             return decision(
                 "disabled", ("analytic is not approved for conditional promotion",)
             )
+        expected_workload: ExpectedConditionalWorkloadV1 | None = None
+        if site_config is not None and frozen_replay is not None:
+            try:
+                expected_workload = derive_expected_conditional_workload(
+                    site_id=artifact.site_id,
+                    module=artifact.module,
+                    site_config=site_config,
+                    frozen_replay=frozen_replay,
+                )
+            except ValueError as exc:
+                return decision(
+                    "disabled",
+                    (f"configured site workload is invalid: {exc}",),
+                )
         engine = artifact.engine
         if (
             engine is None
@@ -579,11 +783,6 @@ class ModelGate:
             or capacity_report.tensorrt_version != artifact.engine.tensorrt_version
         ):
             return decision("disabled", ("capacity report binding mismatch",))
-        if expected_workload is not None and (
-            expected_workload.site_id != artifact.site_id
-            or expected_workload.module != artifact.module
-        ):
-            return decision("disabled", ("expected workload binding mismatch",))
         if (
             capacity_report is not None
             and expected_workload is not None
@@ -615,6 +814,10 @@ class ModelGate:
 
         if capacity_report is None:
             reasons.append("missing measured capacity report")
+        elif site_config is None:
+            reasons.append("missing immutable site configuration")
+        elif frozen_replay is None:
+            reasons.append("missing signed frozen replay fanout evidence")
         elif expected_workload is None:
             reasons.append("missing configured site workload")
         else:

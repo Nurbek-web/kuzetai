@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from protector.pilot.model_registry import (  # noqa: E402
     EngineBuildError,
     EngineBuildSpecV1,
-    atomic_write_json,
     build_engine,
     load_model_entry,
 )
@@ -70,10 +69,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         entry = load_model_entry(arguments.manifest)
         spec = _load_build_spec(arguments.build_spec)
-        result = build_engine(
+        build_engine(
             entry,
             artifact_path=arguments.artifact,
             output_path=arguments.engine,
+            receipt_path=result_path,
             build_spec=spec,
             trtexec_path=arguments.trtexec,
             calibration_path=arguments.calibration,
@@ -84,7 +84,6 @@ def main(argv: list[str] | None = None) -> int:
     except (EngineBuildError, OSError, ValueError) as exc:
         print(f"engine build refused: {exc}", file=sys.stderr)
         return 2
-    atomic_write_json(result_path, result.model_dump(mode="json"))
     return 0
 
 

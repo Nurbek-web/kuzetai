@@ -10,12 +10,14 @@ from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from protector.pilot.config import FrozenModel, NonEmptyString
+from protector.pilot.config import FrozenModel, NonEmptyString, SiteConfig
 from protector.pilot.gates import (
+    AttestedFrozenReplayFanoutV1,
     ExpectedConditionalWorkloadV1,
     MeasuredCapacityReportV1,
     ShadowStageEvidenceV1,
     SignedSiteMatrixV1,
+    derive_expected_conditional_workload,
 )
 from protector.pilot.model_registry import (
     ModelRegistryEntryV1,
@@ -96,7 +98,7 @@ class VerifierCandidateV1(FrozenModel):
     source_time: datetime
     confidence: Annotated[float, Field(ge=0, le=1)]
     roi: NormalizedBox
-    detector_artifact_id: NonEmptyString
+    origin: ConditionalWorkItemV1
 
     @field_validator("source_time")
     @classmethod
@@ -108,6 +110,17 @@ class VerifierCandidateV1(FrozenModel):
     def roi_is_valid(cls, value: NormalizedBox) -> NormalizedBox:
         return _valid_box(value)
 
+    @model_validator(mode="after")
+    def candidate_matches_origin_sample(self) -> VerifierCandidateV1:
+        if self.origin.module != "weapon":
+            raise ValueError("verifier candidate origin must be weapon detector work")
+        if (
+            self.camera_id != self.origin.camera_id
+            or self.source_time != self.origin.source_time
+        ):
+            raise ValueError("verifier candidate camera/time must match its origin")
+        return self
+
 
 class VerifierWorkItemV1(FrozenModel):
     schema_version: Literal["verifier-work-item.v1"] = "verifier-work-item.v1"
@@ -116,6 +129,7 @@ class VerifierWorkItemV1(FrozenModel):
     source_time: datetime
     confidence: Annotated[float, Field(ge=0, le=1)]
     roi: NormalizedBox
+    detector_work_id: NonEmptyString
     detector_artifact_id: NonEmptyString
     verifier_artifact_id: NonEmptyString
     site_id: NonEmptyString
@@ -176,7 +190,8 @@ class ConditionalDeploymentV1(FrozenModel):
     site_matrix: SignedSiteMatrixV1 | None = None
     shadow_stage: ShadowStageEvidenceV1 | None = None
     capacity_report: MeasuredCapacityReportV1 | None = None
-    expected_workload: ExpectedConditionalWorkloadV1
+    site_config: SiteConfig
+    frozen_replay: AttestedFrozenReplayFanoutV1
     verification_boundary: Literal["human_confirmation", "bounded_shadow_verifier"]
 
     @model_validator(mode="after")
@@ -216,6 +231,7 @@ class ConditionalSchedulerMetrics:
     camera_state_overflow_dropped_total: int
     disabled_work_suppressed_total: int
     person_roi_overflow_dropped_total: int
+    unconfigured_or_stale_suppressed_total: int
 
 
 @dataclass
@@ -230,6 +246,7 @@ class _EvaluatedDeployment:
     deployment: ConditionalDeploymentV1
     mode: Literal["disabled", "shadow", "operator"]
     decision_sha256: str
+    expected_workload: ExpectedConditionalWorkloadV1 | None
 
 
 class ConditionalAnalyticsScheduler:
@@ -293,13 +310,16 @@ class ConditionalAnalyticsScheduler:
         if authority is not None:
             authority_site_id = authority.deployment.entry.site_id
             authority_config_sha256 = (
-                authority.deployment.expected_workload.site_config_sha256
+                authority.expected_workload.site_config_sha256
+                if authority.expected_workload is not None
+                else None
             )
             for module in ("fire_smoke", "weapon"):
                 evaluated = self._deployments[module]
                 if evaluated is not None and (
                     evaluated.deployment.entry.site_id != authority_site_id
-                    or evaluated.deployment.expected_workload.site_config_sha256
+                    or evaluated.expected_workload is None
+                    or evaluated.expected_workload.site_config_sha256
                     != authority_config_sha256
                 ):
                     self._deployments[module] = None
@@ -317,8 +337,10 @@ class ConditionalAnalyticsScheduler:
             and (
                 detector.deployment.entry.site_id
                 != verifier.deployment.entry.site_id
-                or detector.deployment.expected_workload.site_config_sha256
-                != verifier.deployment.expected_workload.site_config_sha256
+                or detector.expected_workload is None
+                or verifier.expected_workload is None
+                or detector.expected_workload.site_config_sha256
+                != verifier.expected_workload.site_config_sha256
             )
         ):
             self._deployments["verifier"] = None
@@ -336,6 +358,8 @@ class ConditionalAnalyticsScheduler:
             "weapon": deque(),
         }
         self._verifier_queue: deque[VerifierWorkItemV1] = deque()
+        self._issued_weapon_work_order: deque[str] = deque()
+        self._issued_weapon_work: dict[str, ConditionalWorkItemV1] = {}
         self._shadow_queues: dict[str, deque[ShadowWorkItemV1]] = {
             module: deque() for module in configured_shadow
         }
@@ -352,6 +376,12 @@ class ConditionalAnalyticsScheduler:
         self._camera_state_overflow_dropped_total = 0
         self._disabled_work_suppressed_total = 0
         self._person_roi_overflow_dropped_total = 0
+        self._unconfigured_or_stale_suppressed_total = 0
+        self._approved_cameras = frozenset(
+            camera_id
+            for module in ("fire_smoke", "weapon")
+            for camera_id in self._intervals[module]
+        )
 
     @property
     def camera_state_count(self) -> int:
@@ -377,12 +407,23 @@ class ConditionalAnalyticsScheduler:
             site_matrix=deployment.site_matrix,
             shadow_stage=deployment.shadow_stage,
             capacity_report=deployment.capacity_report,
-            expected_workload=deployment.expected_workload,
+            site_config=deployment.site_config,
+            frozen_replay=deployment.frozen_replay,
         )
+        try:
+            expected_workload = derive_expected_conditional_workload(
+                site_id=deployment.entry.site_id,
+                module=deployment.entry.module,
+                site_config=deployment.site_config,
+                frozen_replay=deployment.frozen_replay,
+            )
+        except ValueError:
+            expected_workload = None
         return _EvaluatedDeployment(
             deployment=deployment,
             mode=decision.mode,
             decision_sha256=decision.decision_sha256,
+            expected_workload=expected_workload,
         )
 
     def _build_intervals(self) -> dict[str, dict[str, float]]:
@@ -392,21 +433,21 @@ class ConditionalAnalyticsScheduler:
         }
         for module in ("fire_smoke", "weapon"):
             evaluated = self._deployments[module]
-            if evaluated is None:
+            if evaluated is None or evaluated.expected_workload is None:
                 continue
             intervals[module] = {
                 camera.camera_id: 1.0 / camera.analytics_hz
-                for camera in evaluated.deployment.expected_workload.cameras
+                for camera in evaluated.expected_workload.cameras
             }
         return intervals
 
     def _build_weapon_inference_fanout(self) -> dict[str, int]:
         evaluated = self._deployments["weapon"]
-        if evaluated is None:
+        if evaluated is None or evaluated.expected_workload is None:
             return {}
         return {
             camera.camera_id: camera.inferences_per_sample
-            for camera in evaluated.deployment.expected_workload.cameras
+            for camera in evaluated.expected_workload.cameras
         }
 
     def _gate_mode(
@@ -425,6 +466,10 @@ class ConditionalAnalyticsScheduler:
         if not camera_id.strip():
             raise ValueError("camera_id must not be empty")
         normalized_time = _utc(source_time)
+        if camera_id not in self._approved_cameras:
+            with self._lock:
+                self._unconfigured_or_stale_suppressed_total += 1
+            return
         configured_fanout = self._weapon_inference_fanout.get(
             camera_id,
             self._max_person_rois_per_sample,
@@ -515,6 +560,8 @@ class ConditionalAnalyticsScheduler:
         evaluated = self._deployments[module]
         assert evaluated is not None and evaluated.mode != "disabled"
         deployment = evaluated.deployment
+        expected_workload = evaluated.expected_workload
+        assert expected_workload is not None
         entry = deployment.entry
         engine = entry.engine
         assert entry.artifact_sha256 is not None
@@ -529,9 +576,9 @@ class ConditionalAnalyticsScheduler:
             artifact_id=entry.artifact_id,
             artifact_sha256=entry.artifact_sha256,
             site_id=entry.site_id,
-            site_config_sha256=deployment.expected_workload.site_config_sha256,
+            site_config_sha256=expected_workload.site_config_sha256,
             expected_workload_sha256=(
-                deployment.expected_workload.expected_workload_sha256
+                expected_workload.expected_workload_sha256
             ),
             registry_entry_sha256=entry.registry_entry_sha256,
             engine_sha256=engine.engine_sha256,
@@ -549,6 +596,12 @@ class ConditionalAnalyticsScheduler:
             self._scheduled_overflow_dropped_total += 1
             return
         queue.append(item)
+        if item.module == "weapon":
+            while len(self._issued_weapon_work_order) >= self._queue_capacity:
+                expired = self._issued_weapon_work_order.popleft()
+                self._issued_weapon_work.pop(expired, None)
+            self._issued_weapon_work_order.append(item.work_id)
+            self._issued_weapon_work[item.work_id] = item
         self._scheduled_total += 1
 
     def drain(
@@ -568,9 +621,39 @@ class ConditionalAnalyticsScheduler:
             with self._lock:
                 self._disabled_work_suppressed_total += 1
             return False
-        if candidate.detector_artifact_id != detector.deployment.entry.artifact_id:
-            raise ValueError("verifier candidate does not match the weapon detector artifact")
         with self._lock:
+            origin = candidate.origin
+            issued_origin = self._issued_weapon_work.get(origin.work_id)
+            detector_workload = detector.expected_workload
+            detector_entry = detector.deployment.entry
+            detector_engine = detector_entry.engine
+            if (
+                candidate.camera_id not in self._approved_cameras
+                or issued_origin != origin
+                or detector_workload is None
+                or detector_engine is None
+                or origin.site_id != detector_entry.site_id
+                or origin.site_config_sha256
+                != detector_workload.site_config_sha256
+                or origin.expected_workload_sha256
+                != detector_workload.expected_workload_sha256
+                or origin.registry_entry_sha256
+                != detector_entry.registry_entry_sha256
+                or origin.artifact_id != detector_entry.artifact_id
+                or origin.artifact_sha256 != detector_entry.artifact_sha256
+                or origin.engine_sha256 != detector_engine.engine_sha256
+                or origin.target_gpu_architecture
+                != detector_engine.target_gpu_architecture
+                or origin.target_compute_capability
+                != detector_engine.target_compute_capability
+                or origin.tensorrt_version != detector_engine.tensorrt_version
+                or origin.decision_sha256 != detector.decision_sha256
+                or origin.verification_boundary
+                != detector.deployment.verification_boundary
+                or origin.gate_mode != detector.mode
+            ):
+                self._unconfigured_or_stale_suppressed_total += 1
+                return False
             if (
                 self._gate_mode("weapon") == "disabled"
                 or self._gate_mode("verifier") == "disabled"
@@ -584,9 +667,7 @@ class ConditionalAnalyticsScheduler:
                 self._verifier_overflow_dropped_total += 1
                 return False
             assert verifier is not None
-            detector_entry = detector.deployment.entry
             verifier_entry = verifier.deployment.entry
-            detector_engine = detector_entry.engine
             verifier_engine = verifier_entry.engine
             assert detector_entry.artifact_sha256 is not None
             assert verifier_entry.artifact_sha256 is not None
@@ -601,17 +682,18 @@ class ConditionalAnalyticsScheduler:
                     source_time=candidate.source_time,
                     confidence=candidate.confidence,
                     roi=candidate.roi,
-                    detector_artifact_id=candidate.detector_artifact_id,
+                    detector_work_id=origin.work_id,
+                    detector_artifact_id=origin.artifact_id,
                     verifier_artifact_id=verifier_entry.artifact_id,
                     site_id=detector_entry.site_id,
                     site_config_sha256=(
-                        detector.deployment.expected_workload.site_config_sha256
+                        detector_workload.site_config_sha256
                     ),
                     detector_expected_workload_sha256=(
-                        detector.deployment.expected_workload.expected_workload_sha256
+                        detector_workload.expected_workload_sha256
                     ),
                     verifier_expected_workload_sha256=(
-                        verifier.deployment.expected_workload.expected_workload_sha256
+                        verifier.expected_workload.expected_workload_sha256
                     ),
                     detector_registry_entry_sha256=(
                         detector_entry.registry_entry_sha256
@@ -700,6 +782,9 @@ class ConditionalAnalyticsScheduler:
                 camera_state_overflow_dropped_total=self._camera_state_overflow_dropped_total,
                 disabled_work_suppressed_total=self._disabled_work_suppressed_total,
                 person_roi_overflow_dropped_total=self._person_roi_overflow_dropped_total,
+                unconfigured_or_stale_suppressed_total=(
+                    self._unconfigured_or_stale_suppressed_total
+                ),
             )
 
 

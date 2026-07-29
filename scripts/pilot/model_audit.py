@@ -29,6 +29,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="Exact engine file required for deployment-scope approval.",
     )
+    parser.add_argument(
+        "--receipt",
+        type=Path,
+        help="Exact build receipt; defaults to <engine>.build.json.",
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--scope",
@@ -43,7 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         entry = load_model_entry(arguments.manifest)
-        result = audit_model_entry(entry, arguments.artifact, engine_path=arguments.engine)
+        result = audit_model_entry(
+            entry,
+            arguments.artifact,
+            engine_path=arguments.engine,
+            receipt_path=arguments.receipt,
+        )
     except (OSError, ValueError) as exc:
         atomic_write_json(
             arguments.out,
