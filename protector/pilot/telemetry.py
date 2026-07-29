@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -131,6 +132,7 @@ class RuntimeTelemetryPublisher:
         *,
         client: TelemetryClient,
         runtime_session_id: str,
+        publisher_generation: int | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not runtime_session_id or len(runtime_session_id) > 128:
@@ -139,8 +141,16 @@ class RuntimeTelemetryPublisher:
             raise ValueError("telemetry client must provide post")
         if clock is not None and not callable(clock):
             raise ValueError("telemetry clock must be callable")
+        generation = time.time_ns() if publisher_generation is None else publisher_generation
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or not 1 <= generation <= 9_223_372_036_854_775_807
+        ):
+            raise ValueError("runtime publisher generation is invalid")
         self._client = client
         self.runtime_session_id = runtime_session_id
+        self.publisher_generation = generation
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sequence = 0
 
@@ -186,6 +196,7 @@ class RuntimeTelemetryPublisher:
         envelope: dict[str, object] = {
             "publisher": "runtime",
             "runtime_session_id": self.runtime_session_id,
+            "publisher_generation": self.publisher_generation,
             "sequence": next_sequence,
             "observed_at": timestamp,
             "components": [
@@ -237,6 +248,7 @@ class NotificationTelemetryPublisher:
         *,
         client: TelemetryClient,
         worker_session_id: str,
+        publisher_generation: int | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not worker_session_id or len(worker_session_id) > 128:
@@ -245,8 +257,16 @@ class NotificationTelemetryPublisher:
             raise ValueError("telemetry client must provide post")
         if clock is not None and not callable(clock):
             raise ValueError("telemetry clock must be callable")
+        generation = time.time_ns() if publisher_generation is None else publisher_generation
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or not 1 <= generation <= 9_223_372_036_854_775_807
+        ):
+            raise ValueError("notification publisher generation is invalid")
         self._client = client
         self.worker_session_id = worker_session_id
+        self.publisher_generation = generation
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sequence = 0
         self._previous = {
@@ -289,6 +309,7 @@ class NotificationTelemetryPublisher:
             {
                 "publisher": "notifications",
                 "runtime_session_id": self.worker_session_id,
+                "publisher_generation": self.publisher_generation,
                 "sequence": next_sequence,
                 "observed_at": observed_at.astimezone(UTC).isoformat(),
                 "components": [{"name": "notifications", "state": state}],

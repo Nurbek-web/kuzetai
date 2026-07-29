@@ -244,6 +244,9 @@ services:
       - --site-id=${PILOT_SITE_ID:?set-authoritative-site-id}
       - --site-config=/run/config/site.yaml
       - --site-config-sha256=${PILOT_SITE_CONFIG_SHA256:?set-reviewed-site-config-sha256}
+      - --interval-seconds=3600
+      - --evidence-batch-size=1000
+      - --audit-batch-size=10000
     secrets:
       - retention_database_url
       - object_store_access_key

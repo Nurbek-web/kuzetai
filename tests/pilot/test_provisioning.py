@@ -60,6 +60,9 @@ def _runtime_manifest() -> RuntimeModelManifestV1:
         schema_version="deepstream-runtime-manifest.v1",
         site_id=SITE_ID,
         artifact=artifact,
+        registry_entry_sha256="d" * 64,
+        frozen_workload_sha256="e" * 64,
+        expected_workload_sha256="f" * 64,
         engine_sha256="c" * 64,
         precision="fp16",
         target_compute_capability="8.9",
@@ -268,4 +271,41 @@ def test_reviewed_provisioning_rejects_digest_or_persistent_drift(tmp_path: Path
             timezone_name="Asia/Almaty",
             site_config=config,
             runtime_manifest=manifest,
+        )
+
+
+@pytest.mark.parametrize(
+    "binding",
+    (
+        "registry_entry_sha256",
+        "frozen_workload_sha256",
+        "expected_workload_sha256",
+    ),
+)
+def test_capacity_inner_bindings_are_independent_of_recomputed_outer_digest(
+    tmp_path: Path,
+    binding: str,
+) -> None:
+    (
+        site_path,
+        site_sha,
+        manifest_path,
+        manifest_sha,
+        capacity_path,
+        _capacity_sha,
+    ) = _reviewed_files(tmp_path)
+    tampered = yaml.safe_load(capacity_path.read_text())
+    tampered[binding] = "0" * 64
+    capacity_path.write_text(yaml.safe_dump(tampered, sort_keys=True))
+    recomputed_outer_sha = hashlib.sha256(capacity_path.read_bytes()).hexdigest()
+
+    with pytest.raises(ProvisioningError, match="exact bindings"):
+        load_reviewed_inputs(
+            site_id=SITE_ID,
+            site_config_path=site_path,
+            site_config_sha256=site_sha,
+            runtime_manifest_path=manifest_path,
+            runtime_manifest_sha256=manifest_sha,
+            measured_capacity_path=capacity_path,
+            measured_capacity_sha256=recomputed_outer_sha,
         )

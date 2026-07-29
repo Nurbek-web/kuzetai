@@ -101,12 +101,17 @@ def _grant_runtime_access(
     connection.execute(
         """
         REVOKE ALL ON TABLE
-          audit_archive_receipts, audit_archive_items, audit_prune_authorizations
+          audit_archive_receipts, audit_archive_items, audit_prune_authorizations,
+          audit_item_compaction_authorizations
           FROM kuzet_api
         """
     )
     connection.execute(
         "REVOKE ALL ON TABLE audit_prune_authorizations FROM kuzet_api, kuzet_retention"
+    )
+    connection.execute(
+        "REVOKE ALL ON TABLE audit_item_compaction_authorizations "
+        "FROM kuzet_api, kuzet_retention"
     )
     connection.execute(
         """

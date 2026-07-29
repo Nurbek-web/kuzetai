@@ -98,6 +98,46 @@ class CameraHealthSampleModel(Base):
     degraded_reason: Mapped[str | None] = mapped_column(Text)
 
 
+class TelemetryPublisherEpochModel(Base):
+    __tablename__ = "telemetry_publisher_epochs"
+    __table_args__ = (
+        CheckConstraint(
+            "publisher IN ('runtime', 'notifications')",
+            name="ck_telemetry_publisher",
+        ),
+        CheckConstraint("generation > 0", name="ck_telemetry_generation"),
+        CheckConstraint("last_sequence >= 0", name="ck_telemetry_last_sequence"),
+        CheckConstraint(
+            "length(last_payload_digest) = 64",
+            name="ck_telemetry_payload_digest",
+        ),
+        Index(
+            "ix_telemetry_publisher_generation",
+            "site_id",
+            "publisher",
+            "generation",
+        ),
+    )
+
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    publisher: Mapped[str] = mapped_column(String(32), primary_key=True)
+    runtime_session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    last_payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    activated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+
 class ModelArtifactModel(Base):
     __tablename__ = "model_artifacts"
     __table_args__ = (
@@ -449,7 +489,18 @@ class AuditArchiveReceiptModel(Base):
     __tablename__ = "audit_archive_receipts"
     __table_args__ = (
         CheckConstraint("length(archive_sha256) = 64", name="ck_audit_archive_sha256"),
-        CheckConstraint("row_count > 0", name="ck_audit_archive_row_count"),
+        CheckConstraint(
+            "row_count > 0 AND row_count <= 10000",
+            name="ck_audit_archive_row_count",
+        ),
+        CheckConstraint(
+            "length(detached_signature) <= 16384",
+            name="ck_audit_archive_signature_bound",
+        ),
+        CheckConstraint(
+            "length(canonical_receipt) <= 16384",
+            name="ck_audit_archive_receipt_bound",
+        ),
         UniqueConstraint("archive_object_key", name="uq_audit_archive_object_key"),
     )
 
@@ -500,6 +551,14 @@ class AuditPruneAuthorizationModel(Base):
     backend_pid: Mapped[int] = mapped_column(Integer, primary_key=True)
     transaction_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     audit_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+
+
+class AuditItemCompactionAuthorizationModel(Base):
+    __tablename__ = "audit_item_compaction_authorizations"
+
+    backend_pid: Mapped[int] = mapped_column(Integer, primary_key=True)
+    transaction_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(String(36), primary_key=True)
 
 
 event.listen(

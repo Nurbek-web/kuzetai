@@ -14,9 +14,12 @@ import pytest
 import yaml
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 
+from protector.pilot import retention_service
 from protector.pilot.audit_archive import EncryptedAuditArchiveStore
+from protector.pilot.config import load_site_config
 from protector.pilot.domain import CandidateEventV1
 from protector.pilot.gates import CommercialRightsRecordV1, ModelArtifactV1
 from protector.pilot.retention import (
@@ -407,6 +410,7 @@ def test_operational_migration_uses_receipt_bound_postgres_prune_without_general
     assert "runtime_session_id" in sql
     assert "audit_archive_receipts" in sql
     assert "audit_archive_items" in sql
+    assert "audit_item_compaction_authorizations" in sql
     assert "pilot_prune_archived_audit" in sql
     assert "SECURITY DEFINER" in sql
     assert "audit_prune_authorizations" in sql
@@ -419,10 +423,197 @@ def test_operational_migration_uses_receipt_bound_postgres_prune_without_general
         "audit archive receipt item count is inconsistent"
     )
     assert "REVOKE ALL ON FUNCTION pilot_prune_archived_audit(text) FROM PUBLIC" in sql
+    scope_check = sql.index("audit archive receipt scope is inconsistent")
+    audit_delete = sql.index("DELETE FROM public.audit_entries AS audit")
+    item_delete = sql.index("DELETE FROM public.audit_archive_items AS item")
+    receipt_update = sql.index("UPDATE public.audit_archive_receipts")
+    assert scope_check < audit_delete < item_delete < receipt_update
+    assert "authorization.receipt_id = OLD.receipt_id" in sql
+    assert (
+        "REVOKE ALL ON TABLE audit_item_compaction_authorizations FROM PUBLIC"
+        in sql
+    )
     assert "TO kuzet_retention" in sql
     assert "TO kuzet;" not in sql
     assert "session_replication_role" not in sql
     assert "DISABLE TRIGGER" not in sql
+
+
+def test_pending_audit_prune_retry_compacts_items_and_keeps_idempotent_receipt(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    audit_id = repository.append_audit(
+        AuditEntryInput(
+            actor_user_id=None,
+            action="retention.retry",
+            entity_type="site",
+            entity_id="site-1",
+            payload={},
+            idempotency_key="audit-prune-retry",
+            occurred_at=NOW - timedelta(days=100),
+        )
+    ).audit_id
+    attempts = 0
+
+    def prune(receipt_id: str, audit_ids: tuple[str, ...]) -> int:
+        nonlocal attempts
+        attempts += 1
+        with repository.session_factory() as session:
+            receipt = session.get(AuditArchiveReceiptModel, receipt_id)
+            assert receipt is not None
+            if receipt.pruned_at is not None:
+                return receipt.row_count
+        if attempts == 1:
+            return 0
+        assert audit_ids == (audit_id,)
+        # Portable simulation of the migration-owned transaction. Generated
+        # PostgreSQL SQL separately proves the exact trigger authorization.
+        with repository.session_factory.begin() as session:
+            session.execute(
+                delete(AuditArchiveItemModel).where(
+                    AuditArchiveItemModel.receipt_id == receipt_id
+                )
+            )
+            session.execute(
+                update(AuditArchiveReceiptModel)
+                .where(AuditArchiveReceiptModel.receipt_id == receipt_id)
+                .values(pruned_at=NOW)
+            )
+        return len(audit_ids)
+
+    store = RecordingAuditArchiveStore()
+    coordinator = AuditArchiveCoordinator(
+        session_factory=repository.session_factory,
+        archive_store=store,
+        pruner=prune,
+        pilot_site_id="site-1",
+        retention_days=90,
+        batch_size=10,
+        clock=lambda: NOW,
+    )
+
+    failed = coordinator.run_once()
+    with repository.session_factory() as session:
+        pending = session.scalar(select(AuditArchiveReceiptModel))
+        assert pending is not None and pending.pruned_at is None
+        assert session.query(AuditArchiveItemModel).count() == 1
+    retried = coordinator.run_once()
+
+    assert failed.failure_reasons == ("receipt_bound_prune_incomplete",)
+    assert (retried.archived, retried.pruned, retried.failed) == (0, 1, 0)
+    assert len(store.published) == 1
+    with repository.session_factory() as session:
+        receipt = session.scalar(select(AuditArchiveReceiptModel))
+        assert receipt is not None and receipt.pruned_at is not None
+        assert receipt.canonical_receipt.startswith(
+            "schema=kuzet-audit-archive-receipt.v1\n"
+        )
+        assert session.query(AuditArchiveItemModel).count() == 0
+    assert prune(receipt.receipt_id, (audit_id,)) == 1
+
+
+def test_audit_item_staging_compacts_each_cycle_but_receipt_roots_remain_bounded(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    for cycle in range(5):
+        receipt_id = str(uuid4())
+        with repository.session_factory.begin() as session:
+            session.add(
+                AuditArchiveReceiptModel(
+                    receipt_id=receipt_id,
+                    site_id="site-1",
+                    cutoff_at=NOW,
+                    archive_object_key=f"audit/site-1/{cycle}.jsonl.age",
+                    archive_sha256=f"{cycle:x}".rjust(64, "0"),
+                    detached_signature="bounded-signature",
+                    signing_key_id="audit-key",
+                    canonical_receipt=(
+                        "schema=kuzet-audit-archive-receipt.v1\n"
+                        f"object_key=audit/site-1/{cycle}.jsonl.age\n"
+                    ),
+                    row_count=100,
+                    created_at=NOW,
+                )
+            )
+            session.flush()
+            session.add_all(
+                AuditArchiveItemModel(
+                    receipt_id=receipt_id,
+                    audit_id=str(uuid4()),
+                    occurred_at=NOW - timedelta(days=100),
+                    row_sha256=f"{item:x}".rjust(64, "0"),
+                )
+                for item in range(100)
+            )
+        with repository.session_factory() as session:
+            protected = session.scalar(
+                select(AuditArchiveItemModel).where(
+                    AuditArchiveItemModel.receipt_id == receipt_id
+                )
+            )
+            assert protected is not None
+            with pytest.raises(ValueError, match="append-only"):
+                session.delete(protected)
+                session.flush()
+            session.rollback()
+        # Simulate the narrowly authorized migration function after its exact
+        # receipt/site/cutoff checks and audit-row deletion have succeeded.
+        with repository.session_factory.begin() as session:
+            session.execute(
+                delete(AuditArchiveItemModel).where(
+                    AuditArchiveItemModel.receipt_id == receipt_id
+                )
+            )
+            session.execute(
+                update(AuditArchiveReceiptModel)
+                .where(AuditArchiveReceiptModel.receipt_id == receipt_id)
+                .values(pruned_at=NOW)
+            )
+        with repository.session_factory() as session:
+            assert session.query(AuditArchiveItemModel).count() == 0
+            receipts = session.query(AuditArchiveReceiptModel).all()
+            assert len(receipts) == cycle + 1
+            assert all(receipt.row_count <= 10_000 for receipt in receipts)
+            assert all(
+                len(receipt.canonical_receipt.encode("utf-8")) <= 16_384
+                and len(receipt.detached_signature.encode("utf-8")) <= 16_384
+                for receipt in receipts
+            )
+
+
+@pytest.mark.parametrize(
+    ("row_count", "signature", "canonical"),
+    (
+        (10_001, "signature", "receipt"),
+        (1, "x" * 16_385, "receipt"),
+        (1, "signature", "x" * 16_385),
+    ),
+)
+def test_durable_receipt_root_has_enforced_row_and_archive_batch_bounds(
+    tmp_path: Path,
+    row_count: int,
+    signature: str,
+    canonical: str,
+) -> None:
+    repository = _repository(tmp_path)
+    with pytest.raises(IntegrityError):
+        with repository.session_factory.begin() as session:
+            session.add(
+                AuditArchiveReceiptModel(
+                    receipt_id=str(uuid4()),
+                    site_id="site-1",
+                    cutoff_at=NOW,
+                    archive_object_key=f"audit/site-1/{uuid4()}.jsonl.age",
+                    archive_sha256="a" * 64,
+                    detached_signature=signature,
+                    signing_key_id="audit-key",
+                    canonical_receipt=canonical,
+                    row_count=row_count,
+                    created_at=NOW,
+                )
+            )
 
 
 def test_audit_archive_caps_bytes_and_fails_closed_on_multisite_unattributed_rows(
@@ -1632,12 +1823,27 @@ def test_deployment_and_backup_artifacts_are_hardened_and_secret_free() -> None:
     assert "REVOKE CONNECT" in role_bootstrap
     assert "INSERT, UPDATE, DELETE ON ALL TABLES" not in role_bootstrap
     assert "ALTER DEFAULT PRIVILEGES" not in role_bootstrap
+    assert "GRANT DELETE ON TABLE audit_archive_items" not in role_bootstrap
+    assert "audit_item_compaction_authorizations" in role_bootstrap
     assert "PILOT_MEASURED_CAPACITY_SHA256" in compose
     assert "service_completed_successfully" in compose
+    audit_retention_policy = (
+        REPO_ROOT / "deploy/pilot/AUDIT_RETENTION.md"
+    ).read_text()
+    assert "at most 24" in audit_retention_policy
+    assert "not a zero-growth claim" in audit_retention_policy
     assert parsed["networks"]["storage-egress"]["external"] is True
     network_policy = (REPO_ROOT / "deploy/pilot/NETWORK_POLICY.md").read_text()
+    target_acceptance = (
+        REPO_ROOT / "deploy/pilot/TARGET_ACCEPTANCE.md"
+    ).read_text()
     assert "DOCKER-USER" in network_policy
     assert "0.0.0.0/0" in network_policy and "Never substitute" in network_policy
+    assert "validate_runtime_mounts.py" in target_acceptance
+    assert "PILOT_RUNTIME_MOUNT_ARGV" in target_acceptance
+    assert '"$PILOT_RUNTIME_IMAGE_ID" \\' in target_acceptance
+    assert "runtime-mount-contract.v1" in target_acceptance
+    assert "all 20 `/run/secrets/<safe-name>`" in target_acceptance
     assert dockerignore[0] == "**"
     assert "!protector/**" in dockerignore
     assert "!deploy/pilot/**" in dockerignore
@@ -1666,3 +1872,82 @@ def test_deployment_and_backup_artifacts_are_hardened_and_secret_free() -> None:
             check=False,
         )
         assert syntax.returncode == 0, syntax.stderr
+
+
+def _resolved_retention_command() -> list[str]:
+    compose = yaml.safe_load(
+        (REPO_ROOT / "deploy/pilot/docker-compose.yml").read_text()
+    )
+    replacements = {
+        "--archive-signing-key-id": "audit-key-1",
+        "--archive-prefix": "audit/site-1",
+        "--site-id": "site-1",
+        "--site-config-sha256": "a" * 64,
+    }
+    resolved: list[str] = []
+    for item in compose["services"]["retention"]["command"]:
+        name = item.split("=", 1)[0]
+        value = replacements.get(name)
+        resolved.append(f"{name}={value}" if value is not None else item)
+    return resolved
+
+
+def test_production_retention_command_builds_distinct_bounded_real_coordinators() -> None:
+    arguments = retention_service.parse_retention_arguments(
+        _resolved_retention_command()
+    )
+    site = load_site_config(REPO_ROOT / "configs/pilot.example.yaml")
+    evidence, audit = retention_service.build_retention_coordinators(
+        arguments=arguments,
+        site=site,
+        sessions=object(),  # constructors only retain the session-factory boundary
+        evidence_store=RecordingStore(),
+        archive_store=RecordingAuditArchiveStore(),
+        clock=lambda: NOW,
+    )
+
+    assert arguments.interval_seconds == 3_600
+    assert evidence.batch_size == 1_000
+    assert audit.batch_size == 10_000
+
+
+@pytest.mark.parametrize(
+    ("argument", "invalid_value"),
+    (
+        ("--evidence-batch-size", "0"),
+        ("--evidence-batch-size", "1001"),
+        ("--audit-batch-size", "0"),
+        ("--audit-batch-size", "10001"),
+    ),
+)
+def test_retention_cli_rejects_batch_bounds_before_reviewed_or_external_inputs(
+    argument: str,
+    invalid_value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = [
+        (
+            f"{argument}={invalid_value}"
+            if item.split("=", 1)[0] == argument
+            else item
+        )
+        for item in _resolved_retention_command()
+    ]
+    reviewed_config_called = False
+
+    def unexpected_reviewed_config(*args: object, **kwargs: object) -> object:
+        nonlocal reviewed_config_called
+        reviewed_config_called = True
+        raise AssertionError("invalid CLI reached reviewed or external inputs")
+
+    monkeypatch.setattr(
+        retention_service,
+        "_reviewed_config",
+        unexpected_reviewed_config,
+    )
+
+    with pytest.raises(SystemExit) as exit_status:
+        retention_service.main(command)
+
+    assert exit_status.value.code == 2
+    assert reviewed_config_called is False

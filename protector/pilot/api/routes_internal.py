@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from protector.pilot.api.dependencies import (
     ApiContext,
@@ -83,6 +84,11 @@ def ingest_health(
     sample: HealthSampleRequest,
     context: Annotated[ApiContext, Depends(get_context)],
 ) -> dict[str, object]:
+    if context.telemetry is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "authoritative_telemetry_required"},
+        )
     row_ids = _persist_health_samples((sample,), context)
     return {"health_sample_id": row_ids[0], "status": "accepted"}
 
@@ -98,66 +104,81 @@ def _persist_health_samples(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="pilot site unavailable",
         ) from exc
+    with context.repository.session_factory.begin() as session:
+        return _persist_health_samples_in_session(
+            samples,
+            context,
+            session,
+            site_id=site_id,
+        )
+
+
+def _persist_health_samples_in_session(
+    samples: tuple[HealthSampleRequest, ...] | list[HealthSampleRequest],
+    context: ApiContext,
+    session: Session,
+    *,
+    site_id: str,
+) -> tuple[int, ...]:
     camera_ids = [sample.camera_id for sample in samples]
     if len(set(camera_ids)) != len(camera_ids):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"code": "duplicate_camera_health"},
         )
-    with context.repository.session_factory.begin() as session:
-        cameras = list(
-            session.scalars(
-                select(CameraModel)
-                .where(
-                    CameraModel.camera_id.in_(camera_ids),
-                    CameraModel.site_id == site_id,
-                    CameraModel.enabled.is_(True),
-                )
-                .with_for_update()
+    cameras = list(
+        session.scalars(
+            select(CameraModel)
+            .where(
+                CameraModel.camera_id.in_(camera_ids),
+                CameraModel.site_id == site_id,
+                CameraModel.enabled.is_(True),
             )
+            .with_for_update()
         )
-        cameras_by_id = {camera.camera_id: camera for camera in cameras}
-        if set(cameras_by_id) != set(camera_ids):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={"code": "camera_not_found"},
+    )
+    cameras_by_id = {camera.camera_id: camera for camera in cameras}
+    if set(cameras_by_id) != set(camera_ids):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "camera_not_found"},
+        )
+    latest_observed = {
+        camera_id: session.scalar(
+            select(CameraHealthSampleModel.observed_at)
+            .where(CameraHealthSampleModel.camera_id == camera_id)
+            .order_by(
+                CameraHealthSampleModel.observed_at.desc(),
+                CameraHealthSampleModel.health_sample_id.desc(),
             )
-        latest_observed = {
-            camera_id: session.scalar(
-                select(CameraHealthSampleModel.observed_at)
-                .where(CameraHealthSampleModel.camera_id == camera_id)
-                .order_by(
-                    CameraHealthSampleModel.observed_at.desc(),
-                    CameraHealthSampleModel.health_sample_id.desc(),
-                )
-                .limit(1)
-            )
-            for camera_id in camera_ids
-        }
-        for sample in samples:
-            latest_observed_at = latest_observed[sample.camera_id]
-            if latest_observed_at is not None and latest_observed_at.tzinfo is None:
-                latest_observed_at = latest_observed_at.replace(tzinfo=UTC)
-            if (
-                latest_observed_at is not None
-                and sample.observed_at < latest_observed_at.astimezone(UTC)
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={"code": "stale_health_sample"},
-                )
-        rows = [CameraHealthSampleModel(**sample.model_dump()) for sample in samples]
-        session.add_all(rows)
-        for sample in samples:
-            cameras_by_id[sample.camera_id].state = sample.state
-        try:
-            session.flush()
-        except IntegrityError as exc:
+            .limit(1)
+        )
+        for camera_id in camera_ids
+    }
+    for sample in samples:
+        latest_observed_at = latest_observed[sample.camera_id]
+        if latest_observed_at is not None and latest_observed_at.tzinfo is None:
+            latest_observed_at = latest_observed_at.replace(tzinfo=UTC)
+        if (
+            latest_observed_at is not None
+            and sample.observed_at < latest_observed_at.astimezone(UTC)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "invalid_health_sample"},
-            ) from exc
-        return tuple(row.health_sample_id for row in rows)
+                detail={"code": "stale_health_sample"},
+            )
+    rows = [CameraHealthSampleModel(**sample.model_dump()) for sample in samples]
+    session.add_all(rows)
+    for sample in samples:
+        cameras_by_id[sample.camera_id].state = sample.state
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "invalid_health_sample"},
+        ) from exc
+    return tuple(row.health_sample_id for row in rows)
 
 
 ModuleName = Literal[
@@ -264,6 +285,7 @@ class TelemetryRequest(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
     )
+    publisher_generation: int = Field(ge=1, le=9_223_372_036_854_775_807)
     sequence: int = Field(ge=0)
     observed_at: datetime
     components: list[ComponentTelemetry] = Field(min_length=1, max_length=3)
@@ -433,8 +455,6 @@ def ingest_telemetry(
             snapshot_values,
             runtime_session_id=payload.runtime_session_id,
         )
-        if payload.health:
-            _persist_health_samples(payload.health, context)
         for item in payload.samples:
             context.metrics.update_samples(
                 item.camera_id,
@@ -489,16 +509,43 @@ def ingest_telemetry(
             )
 
     try:
+        site_id = resolve_pilot_site_id(context)
+    except PilotSiteConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="pilot site unavailable",
+        ) from exc
+    payload_digest = hashlib.sha256(
+        payload.model_dump_json().encode("utf-8")
+    ).hexdigest()
+    try:
         accepted = context.telemetry.apply(
             publisher=payload.publisher,
             runtime_session_id=payload.runtime_session_id,
             sequence=payload.sequence,
             observed_at=payload.observed_at,
             components=components,  # type: ignore[arg-type]
-            payload_digest=hashlib.sha256(
-                payload.model_dump_json().encode("utf-8")
-            ).hexdigest(),
+            payload_digest=payload_digest,
             update=update_metrics,
+            authorize=lambda: context.repository.authorize_telemetry_epoch(
+                site_id=site_id,
+                publisher=payload.publisher,
+                runtime_session_id=payload.runtime_session_id,
+                publisher_generation=payload.publisher_generation,
+                sequence=payload.sequence,
+                observed_at=payload.observed_at,
+                payload_digest=payload_digest,
+                persist=(
+                    lambda session: _persist_health_samples_in_session(
+                        payload.health,
+                        context,
+                        session,
+                        site_id=site_id,
+                    )
+                    if payload.health
+                    else None
+                ),
+            ),
         )
     except ValueError as exc:
         raise HTTPException(

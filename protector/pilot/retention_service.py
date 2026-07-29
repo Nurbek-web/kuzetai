@@ -7,6 +7,7 @@ import hashlib
 import os
 import stat
 import time
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,10 +18,16 @@ from protector.pilot.audit_archive import EncryptedAuditArchiveStore
 from protector.pilot.config import SiteConfig, load_site_config
 from protector.pilot.retention import (
     AuditArchiveCoordinator,
+    AuditArchiveStore,
+    EvidenceDeleteStore,
     EvidenceRetentionCoordinator,
     PostgresReceiptBoundAuditPruner,
 )
-from protector.pilot.storage.db import create_engine, create_session_factory
+from protector.pilot.storage.db import (
+    SessionFactory,
+    create_engine,
+    create_session_factory,
+)
 from protector.pilot.storage.object_store import S3CompatibleObjectStore
 
 _MAX_SECRET_BYTES = 16 * 1024
@@ -50,7 +57,24 @@ def _reviewed_config(path: Path, expected_sha256: str) -> SiteConfig:
     return load_site_config(path)
 
 
-def main() -> int:
+def _bounded_integer(*, minimum: int, maximum: int, label: str) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer") from exc
+        if not minimum <= parsed <= maximum:
+            raise argparse.ArgumentTypeError(
+                f"{label} must be between {minimum} and {maximum}"
+            )
+        return parsed
+
+    return parse
+
+
+def parse_retention_arguments(
+    argv: Sequence[str] | None = None,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database-url-secret", type=Path, required=True)
     parser.add_argument("--access-key-secret", type=Path, required=True)
@@ -63,11 +87,67 @@ def main() -> int:
     parser.add_argument("--site-id", required=True)
     parser.add_argument("--site-config", type=Path, required=True)
     parser.add_argument("--site-config-sha256", required=True)
-    parser.add_argument("--interval-seconds", type=int, default=60)
-    parser.add_argument("--batch-size", type=int, default=100)
-    arguments = parser.parse_args()
-    if not 5 <= arguments.interval_seconds <= 3600:
-        parser.error("retention interval must be between 5 and 3600 seconds")
+    parser.add_argument(
+        "--interval-seconds",
+        type=_bounded_integer(
+            minimum=5,
+            maximum=3_600,
+            label="retention interval",
+        ),
+        default=60,
+    )
+    parser.add_argument(
+        "--evidence-batch-size",
+        type=_bounded_integer(
+            minimum=1,
+            maximum=1_000,
+            label="evidence retention batch",
+        ),
+        default=100,
+    )
+    parser.add_argument(
+        "--audit-batch-size",
+        type=_bounded_integer(
+            minimum=1,
+            maximum=10_000,
+            label="audit retention batch",
+        ),
+        default=100,
+    )
+    return parser.parse_args(argv)
+
+
+def build_retention_coordinators(
+    *,
+    arguments: argparse.Namespace,
+    site: SiteConfig,
+    sessions: SessionFactory,
+    evidence_store: EvidenceDeleteStore,
+    archive_store: AuditArchiveStore,
+    clock: Callable[[], datetime] | None = None,
+) -> tuple[EvidenceRetentionCoordinator, AuditArchiveCoordinator]:
+    evidence = EvidenceRetentionCoordinator(
+        session_factory=sessions,
+        object_store=evidence_store,
+        pilot_site_id=arguments.site_id,
+        retention_days=site.storage.retention.evidence_retention_days,
+        batch_size=arguments.evidence_batch_size,
+        clock=clock,
+    )
+    audit = AuditArchiveCoordinator(
+        session_factory=sessions,
+        archive_store=archive_store,
+        pruner=PostgresReceiptBoundAuditPruner(sessions),
+        pilot_site_id=arguments.site_id,
+        retention_days=site.storage.retention.metadata_retention_days,
+        batch_size=arguments.audit_batch_size,
+        clock=clock,
+    )
+    return evidence, audit
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = parse_retention_arguments(argv)
     site = _reviewed_config(arguments.site_config, arguments.site_config_sha256)
     if site.storage.evidence_prefix.split("/")[-1] != arguments.site_id:
         raise RuntimeError("retention evidence prefix is not site scoped")
@@ -118,21 +198,12 @@ def main() -> int:
         server_side_encryption=site.storage.server_side_encryption,
         kms_key_id=site.storage.kms_key_id,
     )
-    evidence = EvidenceRetentionCoordinator(
-        session_factory=sessions,
-        object_store=evidence_store,
-        pilot_site_id=arguments.site_id,
-        retention_days=site.storage.retention.evidence_retention_days,
-        batch_size=arguments.batch_size,
-        clock=lambda: datetime.now(UTC),
-    )
-    audit = AuditArchiveCoordinator(
-        session_factory=sessions,
+    evidence, audit = build_retention_coordinators(
+        arguments=arguments,
+        site=site,
+        sessions=sessions,
+        evidence_store=evidence_store,
         archive_store=archive_store,
-        pruner=PostgresReceiptBoundAuditPruner(sessions),
-        pilot_site_id=arguments.site_id,
-        retention_days=site.storage.retention.metadata_retention_days,
-        batch_size=arguments.batch_size,
         clock=lambda: datetime.now(UTC),
     )
     try:

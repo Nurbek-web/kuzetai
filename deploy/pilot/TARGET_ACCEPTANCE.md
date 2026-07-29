@@ -10,6 +10,12 @@ Required fixtures:
 - populated site configuration with exactly 20 credential references;
 - populated runtime manifest and its SHA-256;
 - signed measured-capacity report and its SHA-256;
+- a reviewed `runtime-mount-contract.v1` and its SHA-256, listing direct
+  read-only file mounts for all 20 `/run/secrets/<safe-name>` RTSP references,
+  the machine token, reviewed inputs, model, engine, and `nvinfer` config plus
+  the one writable evidence-spool directory; every camera secret must use a
+  unique host source path disjoint from token, reviewed-input, and artifact
+  sources;
 - rights-cleared model, TensorRT engine, and `nvinfer` configuration matching
   their manifest hashes;
 - 20 real RTSP feeds or lawful timestamp-preserving replays matching the
@@ -27,7 +33,14 @@ docker build \
   --file deploy/pilot/Dockerfile.runtime \
   --tag "$PILOT_RUNTIME_IMAGE" \
   .
-docker image inspect "$PILOT_RUNTIME_IMAGE" \
+export PILOT_RUNTIME_IMAGE_ID="$(
+  docker image inspect "$PILOT_RUNTIME_IMAGE" --format '{{.Id}}'
+)"
+case "$PILOT_RUNTIME_IMAGE_ID" in
+  sha256:????????????????????????????????????????????????????????????????) ;;
+  *) echo "captured runtime image ID is not immutable" >&2; exit 1 ;;
+esac
+docker image inspect "$PILOT_RUNTIME_IMAGE_ID" \
   --format '{{json .RepoDigests}} {{.Id}}'
 ```
 
@@ -41,9 +54,28 @@ export PILOT_CAMERA_LAN_NETWORK=kuzet-camera-lan
 export PILOT_SITE_CONFIG=/srv/kuzet/reviewed/site.yaml
 export PILOT_RUNTIME_MANIFEST=/srv/kuzet/reviewed/runtime-manifest.yaml
 export PILOT_CAPACITY_REPORT=/srv/kuzet/reviewed/measured-capacity.yaml
+export PILOT_MOUNT_CONTRACT=/srv/kuzet/reviewed/runtime-mount-contract.yaml
 export PILOT_SITE_CONFIG_SHA256=REPLACE_WITH_64_HEX
 export PILOT_RUNTIME_MANIFEST_SHA256=REPLACE_WITH_64_HEX
 export PILOT_MEASURED_CAPACITY_SHA256=REPLACE_WITH_64_HEX
+export PILOT_MOUNT_CONTRACT_SHA256=REPLACE_WITH_64_HEX
+
+# The validator reads only bounded regular files and emits one safe argv item
+# per line. It hashes model/engine/config sources, verifies the captured image
+# ID, requires exact target coverage, and never resolves or prints RTSP values.
+mapfile -t PILOT_RUNTIME_MOUNT_ARGV < <(
+  uv run python scripts/pilot/validate_runtime_mounts.py \
+    --site-config "$PILOT_SITE_CONFIG" \
+    --site-config-sha256 "$PILOT_SITE_CONFIG_SHA256" \
+    --runtime-manifest "$PILOT_RUNTIME_MANIFEST" \
+    --runtime-manifest-sha256 "$PILOT_RUNTIME_MANIFEST_SHA256" \
+    --measured-capacity-report "$PILOT_CAPACITY_REPORT" \
+    --measured-capacity-sha256 "$PILOT_MEASURED_CAPACITY_SHA256" \
+    --mount-contract "$PILOT_MOUNT_CONTRACT" \
+    --mount-contract-sha256 "$PILOT_MOUNT_CONTRACT_SHA256" \
+    --image-id "$PILOT_RUNTIME_IMAGE_ID"
+)
+test "${#PILOT_RUNTIME_MOUNT_ARGV[@]}" -eq 56
 
 runtime_id=$(
   docker create \
@@ -56,12 +88,8 @@ runtime_id=$(
     --memory 16g \
     --cpus 8 \
     --network "$PILOT_CONTROL_NETWORK" \
-    --mount type=bind,src="$PILOT_SITE_CONFIG",dst=/run/config/site.yaml,readonly \
-    --mount type=bind,src="$PILOT_RUNTIME_MANIFEST",dst=/run/config/runtime-manifest.yaml,readonly \
-    --mount type=bind,src="$PILOT_CAPACITY_REPORT",dst=/run/config/measured-capacity.yaml,readonly \
-    --mount type=bind,src=/srv/kuzet/secrets/machine_token,dst=/run/secrets/machine_token,readonly \
-    --mount type=bind,src=/srv/kuzet/evidence-spool,dst=/srv/kuzet/evidence-spool \
-    "$PILOT_RUNTIME_IMAGE" \
+    "${PILOT_RUNTIME_MOUNT_ARGV[@]}" \
+    "$PILOT_RUNTIME_IMAGE_ID" \
     --site-config /run/config/site.yaml \
     --site-config-sha256 "$PILOT_SITE_CONFIG_SHA256" \
     --runtime-manifest /run/config/runtime-manifest.yaml \

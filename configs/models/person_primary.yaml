@@ -14,6 +14,9 @@ artifact:
   preprocessing: null
   analytic: person
 artifact_path: null
+registry_entry_sha256: null
+frozen_workload_sha256: null
+expected_workload_sha256: null
 engine_sha256: null
 engine_path: null
 # Mount the populated, signed config at this exact target-container path.

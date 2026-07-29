@@ -22,9 +22,11 @@ from protector.pilot.config import (
 from protector.pilot.gates import (
     CapacityReportV1,
     CommercialRightsRecordV1,
+    MeasuredCapacityReportV1,
     ModelArtifactV1,
     ShadowStageReportV1,
     TargetSiteReportV1,
+    site_config_sha256,
 )
 from protector.pilot.runtime.deepstream import (
     DEEPSTREAM_IMAGE,
@@ -52,6 +54,11 @@ from protector.pilot.runtime.evidence import (
     SourceTimeMapper,
     SourceTimeMappingError,
     SplitMuxEvidenceSinkFactory,
+)
+from protector.pilot.runtime.mount_contract import (
+    RuntimeBindMountV1,
+    RuntimeMountContractV1,
+    validate_runtime_mount_contract,
 )
 from protector.pilot.runtime.supervisor import CameraSupervisor
 
@@ -124,6 +131,9 @@ def _manifest() -> RuntimeModelManifestV1:
         schema_version="deepstream-runtime-manifest.v1",
         site_id="customer-site-1",
         artifact=artifact,
+        registry_entry_sha256="d" * 64,
+        frozen_workload_sha256="e" * 64,
+        expected_workload_sha256="f" * 64,
         engine_sha256="c" * 64,
         precision="fp16",
         target_compute_capability="8.9",
@@ -1703,6 +1713,319 @@ def test_target_entrypoint_refuses_to_start_without_a_site_and_runtime_manifest(
         main([])
 
     assert exit_status.value.code == 2
+
+
+def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_inputs(
+    tmp_path: Path,
+) -> None:
+    feeds = tuple(
+        feed.model_copy(
+            update={
+                "rtsp_url": SecretReference(
+                    docker_secret=Path(f"/run/secrets/camera_{index:02d}_rtsp"),
+                )
+            }
+        )
+        for index, feed in enumerate(_site().ready_to_start.feeds, start=1)
+    )
+    site = _site().model_copy(
+        update={
+            "ready_to_start": _site().ready_to_start.model_copy(
+                update={"feeds": feeds}
+            )
+        }
+    )
+    model_source = tmp_path / "person.onnx"
+    engine_source = tmp_path / "person.engine"
+    config_source = tmp_path / "person_primary.txt"
+    model_source.write_bytes(b"approved-model")
+    engine_source.write_bytes(b"approved-engine")
+    model_target = Path("/run/runtime/person.onnx")
+    engine_target = Path("/run/runtime/person.engine")
+    config_target = Path("/run/runtime/person_primary.txt")
+    config_source.write_text(
+        (
+            f"[property]\nonnx-file={model_target}\n"
+            f"model-engine-file={engine_target}\n"
+        )
+    )
+    base_manifest = _manifest()
+    manifest = base_manifest.model_copy(
+        update={
+            "artifact_path": model_target,
+            "artifact": base_manifest.artifact.model_copy(
+                update={"sha256": hashlib.sha256(model_source.read_bytes()).hexdigest()}
+            ),
+            "engine_path": engine_target,
+            "engine_sha256": hashlib.sha256(engine_source.read_bytes()).hexdigest(),
+            "nvinfer_config_path": config_target,
+            "nvinfer_config_sha256": hashlib.sha256(
+                config_source.read_bytes()
+            ).hexdigest(),
+        }
+    )
+    site_source = tmp_path / "site.yaml"
+    runtime_source = tmp_path / "runtime.yaml"
+    capacity_source = tmp_path / "capacity.yaml"
+    token_source = tmp_path / "machine_token"
+    evidence_source = tmp_path / "evidence-spool"
+    site_source.write_text(yaml.safe_dump(site.model_dump(mode="json")))
+    runtime_source.write_text(yaml.safe_dump(manifest.model_dump(mode="json")))
+    capacity_source.write_text("schema_version: measured-capacity-report.v1\n")
+    token_source.write_text("machine-token-fixture")
+    evidence_source.mkdir()
+    mounts = [
+        RuntimeBindMountV1(
+            source=site_source,
+            target=Path("/run/config/site.yaml"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=runtime_source,
+            target=Path("/run/config/runtime-manifest.yaml"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=capacity_source,
+            target=Path("/run/config/measured-capacity.yaml"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=token_source,
+            target=Path("/run/secrets/machine_token"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=evidence_source,
+            target=Path("/srv/kuzet/evidence-spool"),
+            kind="directory",
+            read_only=False,
+        ),
+        RuntimeBindMountV1(
+            source=model_source,
+            target=model_target,
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=engine_source,
+            target=engine_target,
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=config_source,
+            target=config_target,
+            kind="file",
+            read_only=True,
+        ),
+    ]
+    for index in range(1, 21):
+        secret = tmp_path / f"camera_{index:02d}_rtsp"
+        secret.write_text(f"rtsp://fixture-camera-{index:02d}")
+        mounts.append(
+            RuntimeBindMountV1(
+                source=secret,
+                target=Path(f"/run/secrets/camera_{index:02d}_rtsp"),
+                kind="file",
+                read_only=True,
+            )
+        )
+    contract = RuntimeMountContractV1(
+        schema_version="runtime-mount-contract.v1",
+        image_id=f"sha256:{'1' * 64}",
+        mounts=tuple(mounts),
+    )
+
+    argv = validate_runtime_mount_contract(
+        site_config=site,
+        runtime_manifest=manifest,
+        contract=contract,
+        expected_image_id=contract.image_id,
+        site_config_source=site_source,
+        runtime_manifest_source=runtime_source,
+        measured_capacity_source=capacity_source,
+    )
+
+    assert len(contract.mounts) == 28
+    assert len(argv) == 56
+    assert all("rtsp://" not in argument for argument in argv)
+    duplicate_secret_site = site.model_copy(
+        update={
+            "ready_to_start": site.ready_to_start.model_copy(
+                update={
+                    "feeds": (
+                        feeds[0],
+                        feeds[1].model_copy(update={"rtsp_url": feeds[0].rtsp_url}),
+                        *feeds[2:],
+                    )
+                }
+            )
+        }
+    )
+    duplicate_secret_contract = contract.model_copy(
+        update={
+            "mounts": tuple(
+                mount
+                for mount in contract.mounts
+                if mount.target != Path("/run/secrets/camera_02_rtsp")
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="20 unique direct camera secret"):
+        validate_runtime_mount_contract(
+            site_config=duplicate_secret_site,
+            runtime_manifest=manifest,
+            contract=duplicate_secret_contract,
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+        )
+    camera_01_source = next(
+        mount.source
+        for mount in contract.mounts
+        if mount.target == Path("/run/secrets/camera_01_rtsp")
+    )
+    duplicate_camera_source_contract = contract.model_copy(
+        update={
+            "mounts": tuple(
+                mount.model_copy(update={"source": camera_01_source})
+                if mount.target == Path("/run/secrets/camera_02_rtsp")
+                else mount
+                for mount in contract.mounts
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="unique and disjoint host source"):
+        validate_runtime_mount_contract(
+            site_config=site,
+            runtime_manifest=manifest,
+            contract=duplicate_camera_source_contract,
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+        )
+    token_source_collision_contract = contract.model_copy(
+        update={
+            "mounts": tuple(
+                mount.model_copy(update={"source": token_source})
+                if mount.target == Path("/run/secrets/camera_01_rtsp")
+                else mount
+                for mount in contract.mounts
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="unique and disjoint host source"):
+        validate_runtime_mount_contract(
+            site_config=site,
+            runtime_manifest=manifest,
+            contract=token_source_collision_contract,
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+        )
+    with pytest.raises(ValueError, match="exact required target set"):
+        validate_runtime_mount_contract(
+            site_config=site,
+            runtime_manifest=manifest,
+            contract=contract.model_copy(update={"mounts": contract.mounts[:-1]}),
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+        )
+    with pytest.raises(ValueError, match="immutable SHA-256 image ID"):
+        RuntimeMountContractV1(
+            schema_version="runtime-mount-contract.v1",
+            image_id="kuzet-pilot-runtime:review",
+            mounts=contract.mounts,
+        )
+
+
+@pytest.mark.parametrize(
+    "binding",
+    (
+        "registry_entry_sha256",
+        "frozen_workload_sha256",
+        "expected_workload_sha256",
+    ),
+)
+def test_target_entrypoint_rejects_rehashed_capacity_with_tampered_inner_binding(
+    tmp_path: Path,
+    binding: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    site = _site()
+    manifest = _manifest()
+    site_path = tmp_path / "site.yaml"
+    manifest_path = tmp_path / "runtime.yaml"
+    capacity_path = tmp_path / "capacity.yaml"
+    site_path.write_text(yaml.safe_dump(site.model_dump(mode="json"), sort_keys=True))
+    manifest_path.write_text(
+        yaml.safe_dump(manifest.model_dump(mode="json"), sort_keys=True)
+    )
+    capacity = MeasuredCapacityReportV1(
+        schema_version="measured-capacity-report.v1",
+        site_id=manifest.site_id,
+        artifact_id=manifest.artifact.artifact_id,
+        artifact_sha256=manifest.artifact.sha256,
+        registry_entry_sha256=manifest.registry_entry_sha256,
+        engine_sha256=manifest.engine_sha256,
+        precision="fp16",
+        target_gpu_architecture="NVIDIA L4 (Ada)",
+        target_compute_capability=manifest.target_compute_capability,
+        tensorrt_version=manifest.tensorrt_version,
+        site_config_sha256=site_config_sha256(site),
+        frozen_workload_sha256=manifest.frozen_workload_sha256,
+        expected_workload_sha256=manifest.expected_workload_sha256,
+        stream_count=20,
+        effective_throughput_hz=125.0,
+        required_throughput_hz=100.0,
+        scheduled_drop_fraction=0.005,
+        queue_age_p95_seconds=0.5,
+        queue_age_p99_seconds=1.0,
+        gpu_utilization_max=0.7,
+        vram_utilization_max=0.75,
+        passed=True,
+        report_reference="reports/target-capacity.json",
+        report_sha256="9" * 64,
+        signed_by="capacity-qa",
+        signed_at=datetime(2026, 7, 29, 11, 0, tzinfo=UTC),
+    ).model_dump(mode="json")
+    capacity[binding] = "0" * 64
+    capacity_path.write_text(yaml.safe_dump(capacity, sort_keys=True))
+
+    with pytest.raises(SystemExit) as exit_status:
+        main(
+            [
+                "--site-config",
+                str(site_path),
+                "--site-config-sha256",
+                hashlib.sha256(site_path.read_bytes()).hexdigest(),
+                "--runtime-manifest",
+                str(manifest_path),
+                "--runtime-manifest-sha256",
+                hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                "--measured-capacity-report",
+                str(capacity_path),
+                "--measured-capacity-sha256",
+                hashlib.sha256(capacity_path.read_bytes()).hexdigest(),
+                "--control-plane-url",
+                "http://api:8000",
+                "--machine-token-file",
+                str(tmp_path / "unread-token"),
+            ]
+        )
+
+    assert exit_status.value.code == 2
+    assert "missing exact bindings or 25% headroom" in capsys.readouterr().err
 
 
 def test_deepstream_adapter_exposes_the_same_bounded_observation_drain_as_replay() -> None:

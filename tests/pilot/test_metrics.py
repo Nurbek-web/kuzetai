@@ -10,8 +10,10 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import protector.pilot.api.routes_internal as routes_internal
 from protector.pilot.api.app import create_app
 from protector.pilot.api.production import (
     build_evidence_link_signer,
@@ -27,7 +29,12 @@ from protector.pilot.metrics import (
 )
 from protector.pilot.runtime.supervisor import CameraHealth
 from protector.pilot.storage.db import create_engine, create_session_factory
-from protector.pilot.storage.models import Base, CameraHealthSampleModel
+from protector.pilot.storage.models import (
+    Base,
+    CameraHealthSampleModel,
+    CameraModel,
+    TelemetryPublisherEpochModel,
+)
 from protector.pilot.storage.repositories import PilotRepository
 from protector.pilot.telemetry import (
     AsyncRuntimeTelemetryPublisher,
@@ -52,18 +59,21 @@ def _metrics() -> PilotMetrics:
 def _telemetry_app(
     tmp_path: Path,
 ) -> tuple[TestClient, PilotMetrics]:
-    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'telemetry.db'}")
+    database_path = tmp_path / "telemetry.db"
+    initialize = not database_path.exists()
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
     Base.metadata.create_all(engine)
     repository = PilotRepository(create_session_factory(engine))
-    repository.add_site(site_id="site-1", name="Pilot")
-    for camera_id in CAMERAS:
-        repository.add_camera(
-            camera_id=camera_id,
-            site_id="site-1",
-            name=camera_id,
-            source_reference="secret://source",
-            codec="h264",
-        )
+    if initialize:
+        repository.add_site(site_id="site-1", name="Pilot")
+        for camera_id in CAMERAS:
+            repository.add_camera(
+                camera_id=camera_id,
+                site_id="site-1",
+                name=camera_id,
+                source_reference="secret://source",
+                codec="h264",
+            )
     metrics = PilotMetrics(
         site_id="site-1",
         camera_ids=CAMERAS,
@@ -116,17 +126,21 @@ def _snapshot(**overrides: object) -> HealthProbeSnapshot:
     return HealthProbeSnapshot(**values)  # type: ignore[arg-type]
 
 
-def _health_envelope() -> list[dict[str, object]]:
+def _health_envelope(
+    *,
+    runtime_session_id: str = "runtime-a",
+    state: str = "online",
+) -> list[dict[str, object]]:
     return [
         {
             "camera_id": camera_id,
-            "runtime_session_id": "runtime-a",
+            "runtime_session_id": runtime_session_id,
             "observed_at": NOW.isoformat(),
-            "state": "online",
-            "last_frame_at": NOW.isoformat(),
+            "state": state,
+            "last_frame_at": NOW.isoformat() if state == "online" else None,
             "reconnect_count": 0,
             "dropped_samples": 0,
-            "degraded_reason": None,
+            "degraded_reason": None if state == "online" else "source unavailable",
         }
         for camera_id in CAMERAS
     ]
@@ -332,6 +346,7 @@ def test_runtime_publisher_emits_twenty_health_samples_and_one_bounded_envelope(
     publisher = RuntimeTelemetryPublisher(
         client=Client(),  # type: ignore[arg-type]
         runtime_session_id="runtime-a",
+        publisher_generation=11,
         clock=lambda: NOW,
     )
 
@@ -345,6 +360,7 @@ def test_runtime_publisher_emits_twenty_health_samples_and_one_bounded_envelope(
     telemetry = [payload for path, payload in requests if path.endswith("/telemetry")]
     assert len(telemetry) == 1
     assert telemetry[0]["publisher"] == "runtime"
+    assert telemetry[0]["publisher_generation"] == 11
     assert telemetry[0]["sequence"] == 1
     assert len(telemetry[0]["samples"]) == 20  # type: ignore[arg-type]
     assert len(telemetry[0]["health"]) == 20  # type: ignore[arg-type]
@@ -362,6 +378,7 @@ def test_notification_publisher_owns_only_cumulative_delivery_results() -> None:
     publisher = NotificationTelemetryPublisher(
         client=Client(),  # type: ignore[arg-type]
         worker_session_id="notifications-a",
+        publisher_generation=12,
         clock=lambda: NOW,
     )
     publisher.publish(
@@ -390,6 +407,7 @@ def test_notification_publisher_owns_only_cumulative_delivery_results() -> None:
         {"result": "failed", "total": 1},
         {"result": "dead_letter", "total": 0},
     ]
+    assert requests[1]["publisher_generation"] == 12
     with pytest.raises(ValueError, match="cumulative"):
         publisher.publish(
             state="healthy",
@@ -472,6 +490,7 @@ def test_authenticated_runtime_and_worker_telemetry_is_scraped_and_drives_readin
         json={
             "publisher": "runtime",
             "runtime_session_id": "runtime-a",
+            "publisher_generation": 1,
             "sequence": 1,
             "observed_at": NOW.isoformat(),
             "components": [
@@ -513,6 +532,7 @@ def test_authenticated_runtime_and_worker_telemetry_is_scraped_and_drives_readin
         json={
             "publisher": "notifications",
             "runtime_session_id": "worker-a",
+            "publisher_generation": 1,
             "sequence": 1,
             "observed_at": NOW.isoformat(),
             "components": [{"name": "notifications", "state": "healthy"}],
@@ -555,6 +575,7 @@ def test_telemetry_rejects_cross_publisher_fields_and_duplicate_finite_keys(
         json={
             "publisher": "runtime",
             "runtime_session_id": "runtime-a",
+            "publisher_generation": 1,
             "sequence": 1,
             "observed_at": NOW.isoformat(),
             "components": [
@@ -571,6 +592,7 @@ def test_telemetry_rejects_cross_publisher_fields_and_duplicate_finite_keys(
         json={
             "publisher": "notifications",
             "runtime_session_id": "worker-a",
+            "publisher_generation": 1,
             "sequence": 1,
             "observed_at": NOW.isoformat(),
             "components": [{"name": "notifications", "state": "healthy"}],
@@ -596,6 +618,7 @@ def test_telemetry_prevalidates_full_envelope_and_binds_duplicate_sequence_to_bo
     base = {
         "publisher": "runtime",
         "runtime_session_id": "runtime-a",
+        "publisher_generation": 1,
         "sequence": 1,
         "observed_at": NOW.isoformat(),
         "components": [
@@ -663,6 +686,267 @@ def test_telemetry_prevalidates_full_envelope_and_binds_duplicate_sequence_to_bo
         'kuzet_analysis_samples_total{camera_id="cam-01",module="person",'
         'result="scheduled",site_id="site-1"} 4.0'
     ) in rendered
+
+
+def test_telemetry_epoch_and_health_persistence_retry_are_one_atomic_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, metrics = _telemetry_app(tmp_path)
+    headers = {"Authorization": f"Bearer {MACHINE_TOKEN}"}
+    payload = {
+        "publisher": "runtime",
+        "runtime_session_id": "runtime-atomic",
+        "publisher_generation": 7,
+        "sequence": 1,
+        "observed_at": NOW.isoformat(),
+        "components": [
+            {"name": "analytics", "state": "healthy"},
+            {"name": "evidence", "state": "healthy"},
+        ],
+        "health": _health_envelope(runtime_session_id="runtime-atomic"),
+        "candidate_totals": [{"module": "person", "total": 4}],
+    }
+    original = routes_internal._persist_health_samples_in_session
+    attempts = 0
+
+    def fail_first_persistence(*args: object, **kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HTTPException(status_code=503, detail="forced persistence failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_internal,
+        "_persist_health_samples_in_session",
+        fail_first_persistence,
+    )
+    failed = client.post("/api/internal/telemetry", headers=headers, json=payload)
+    retried = client.post("/api/internal/telemetry", headers=headers, json=payload)
+
+    assert failed.status_code == 503
+    assert retried.status_code == 202
+    assert retried.json()["status"] == "accepted"
+    assert (
+        'kuzet_candidates_total{module="person",site_id="site-1"} 4.0'
+        in metrics.render().decode()
+    )
+    session_factory = create_session_factory(
+        create_engine(f"sqlite+pysqlite:///{tmp_path / 'telemetry.db'}")
+    )
+    with session_factory() as session:
+        assert session.query(CameraHealthSampleModel).count() == 20
+        assert session.query(TelemetryPublisherEpochModel).count() == 1
+
+
+def test_retired_runtime_epoch_cannot_resurrect_or_mutate_any_authoritative_state(
+    tmp_path: Path,
+) -> None:
+    client, metrics = _telemetry_app(tmp_path)
+    headers = {"Authorization": f"Bearer {MACHINE_TOKEN}"}
+
+    def publish(
+        session_id: str,
+        *,
+        generation: int,
+        sequence: int,
+        total: int,
+        state: str,
+        component_state: str,
+    ) -> object:
+        return client.post(
+            "/api/internal/telemetry",
+            headers=headers,
+            json={
+                "publisher": "runtime",
+                "runtime_session_id": session_id,
+                "publisher_generation": generation,
+                "sequence": sequence,
+                "observed_at": NOW.isoformat(),
+                "components": [
+                    {"name": "analytics", "state": component_state},
+                    {"name": "evidence", "state": component_state},
+                ],
+                "health": _health_envelope(
+                    runtime_session_id=session_id,
+                    state=state,
+                ),
+                "candidate_totals": [{"module": "person", "total": total}],
+            },
+        )
+
+    assert publish(
+        "runtime-a",
+        generation=1,
+        sequence=1,
+        total=10,
+        state="online",
+        component_state="healthy",
+    ).status_code == 202
+    assert publish(
+        "runtime-b",
+        generation=2,
+        sequence=1,
+        total=1,
+        state="offline",
+        component_state="degraded",
+    ).status_code == 202
+    resurrected = publish(
+        "runtime-a",
+        generation=1,
+        sequence=2,
+        total=11,
+        state="online",
+        component_state="healthy",
+    )
+    legacy_health = client.post(
+        "/api/internal/health",
+        headers=headers,
+        json=_health_envelope(runtime_session_id="runtime-a")[0],
+    )
+
+    assert resurrected.status_code == 422
+    assert legacy_health.status_code == 409
+    assert legacy_health.json()["detail"]["code"] == "authoritative_telemetry_required"
+    assert (
+        'kuzet_candidates_total{module="person",site_id="site-1"} 11.0'
+        in metrics.render().decode()
+    )
+    health = client.get("/internal/health/ready", headers=headers).json()
+    assert health["components"]["analytics"] == "degraded"
+    assert health["components"]["evidence"] == "degraded"
+    session_factory = create_session_factory(
+        create_engine(f"sqlite+pysqlite:///{tmp_path / 'telemetry.db'}")
+    )
+    with session_factory() as session:
+        assert {
+            camera.state for camera in session.query(CameraModel).all()
+        } == {"offline"}
+        assert session.query(CameraHealthSampleModel).count() == 40
+        epochs = session.query(TelemetryPublisherEpochModel).all()
+        assert [(row.publisher, row.runtime_session_id, row.generation) for row in epochs] == [
+            ("runtime", "runtime-b", 2)
+        ]
+
+    restarted_client, restarted_metrics = _telemetry_app(tmp_path)
+    restarted = restarted_client.post(
+        "/api/internal/telemetry",
+        headers=headers,
+        json={
+            "publisher": "runtime",
+            "runtime_session_id": "runtime-a",
+            "publisher_generation": 1,
+            "sequence": 3,
+            "observed_at": NOW.isoformat(),
+            "components": [
+                {"name": "analytics", "state": "healthy"},
+                {"name": "evidence", "state": "healthy"},
+            ],
+            "health": _health_envelope(runtime_session_id="runtime-a"),
+            "candidate_totals": [{"module": "person", "total": 12}],
+        },
+    )
+    assert restarted.status_code == 422
+    assert 'kuzet_candidates_total{module="person"' not in restarted_metrics.render().decode()
+    restarted_health = restarted_client.get(
+        "/internal/health/ready",
+        headers=headers,
+    ).json()
+    assert restarted_health["components"]["analytics"] == "failed"
+    with session_factory() as session:
+        assert {camera.state for camera in session.query(CameraModel).all()} == {"offline"}
+        assert session.query(CameraHealthSampleModel).count() == 40
+
+
+def test_retired_notification_epoch_is_durably_rejected_after_api_restart(
+    tmp_path: Path,
+) -> None:
+    client, _ = _telemetry_app(tmp_path)
+    headers = {"Authorization": f"Bearer {MACHINE_TOKEN}"}
+
+    def publish(
+        target: TestClient,
+        session_id: str,
+        *,
+        generation: int,
+        sequence: int,
+        total: int,
+        component_state: str,
+    ) -> object:
+        return target.post(
+            "/api/internal/telemetry",
+            headers=headers,
+            json={
+                "publisher": "notifications",
+                "runtime_session_id": session_id,
+                "publisher_generation": generation,
+                "sequence": sequence,
+                "observed_at": NOW.isoformat(),
+                "components": [
+                    {"name": "notifications", "state": component_state},
+                ],
+                "notification_results": [{"result": "delivered", "total": total}],
+            },
+        )
+
+    assert publish(
+        client,
+        "worker-a",
+        generation=1,
+        sequence=1,
+        total=10,
+        component_state="healthy",
+    ).status_code == 202
+    assert publish(
+        client,
+        "worker-b",
+        generation=2,
+        sequence=1,
+        total=1,
+        component_state="degraded",
+    ).status_code == 202
+
+    restarted_client, restarted_metrics = _telemetry_app(tmp_path)
+    resurrected = publish(
+        restarted_client,
+        "worker-a",
+        generation=1,
+        sequence=2,
+        total=11,
+        component_state="healthy",
+    )
+    assert resurrected.status_code == 422
+    assert (
+        'kuzet_notification_results_total{result="delivered"'
+        not in restarted_metrics.render().decode()
+    )
+    health = restarted_client.get("/internal/health/ready", headers=headers).json()
+    assert health["components"]["notifications"] == "failed"
+
+    active_duplicate = publish(
+        restarted_client,
+        "worker-b",
+        generation=2,
+        sequence=1,
+        total=1,
+        component_state="degraded",
+    )
+    assert active_duplicate.status_code == 202
+    assert active_duplicate.json()["status"] == "duplicate"
+    assert (
+        'kuzet_notification_results_total{result="delivered"'
+        not in restarted_metrics.render().decode()
+    )
+    session_factory = create_session_factory(
+        create_engine(f"sqlite+pysqlite:///{tmp_path / 'telemetry.db'}")
+    )
+    with session_factory() as session:
+        epochs = session.query(TelemetryPublisherEpochModel).all()
+        assert sorted(
+            (row.publisher, row.runtime_session_id, row.generation)
+            for row in epochs
+        ) == [("notifications", "worker-b", 2)]
 
 
 def test_health_distinguishes_process_database_sources_analytics_storage_and_notifications() -> None:

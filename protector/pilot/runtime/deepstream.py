@@ -308,6 +308,9 @@ class RuntimeModelManifestV1(FrozenModel):
     site_id: str
     artifact: ModelArtifactV1
     artifact_path: Path | None = None
+    registry_entry_sha256: str
+    frozen_workload_sha256: str
+    expected_workload_sha256: str
     engine_sha256: str | None
     engine_path: Path | None = None
     nvinfer_config_path: Path | None = None
@@ -325,6 +328,19 @@ class RuntimeModelManifestV1(FrozenModel):
         if value is not None and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value.lower())):
             raise ValueError("engine_sha256 must be a 64-character hexadecimal digest")
         return value
+
+    @field_validator(
+        "registry_entry_sha256",
+        "frozen_workload_sha256",
+        "expected_workload_sha256",
+    )
+    @classmethod
+    def reviewed_binding_is_digest(cls, value: str) -> str:
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value.lower()
+        ):
+            raise ValueError("reviewed runtime binding must be a SHA-256 digest")
+        return value.lower()
 
     @field_validator("nvinfer_config_sha256")
     @classmethod

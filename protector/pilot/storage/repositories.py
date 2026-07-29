@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from uuid import UUID, uuid4
 
 from sqlalchemy import Select, and_, or_, select, update
@@ -32,6 +33,7 @@ from protector.pilot.storage.models import (
     ObservationModel,
     ReviewModel,
     SiteModel,
+    TelemetryPublisherEpochModel,
     UserModel,
 )
 from protector.pilot.totp_envelope import TOTP_ROTATION_INSTRUCTION, TotpEnvelopeProtector
@@ -328,6 +330,122 @@ class PilotRepository:
             session.add(row)
             session.flush()
             return row
+
+    def authorize_telemetry_epoch(
+        self,
+        *,
+        site_id: str,
+        publisher: Literal["runtime", "notifications"],
+        runtime_session_id: str,
+        publisher_generation: int,
+        sequence: int,
+        observed_at: datetime,
+        payload_digest: str,
+        persist: Callable[[Session], None] | None = None,
+    ) -> bool:
+        """Advance one durable monotonic publisher epoch or reject resurrection."""
+
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", site_id) is None:
+            raise ValueError("telemetry site identity is invalid")
+        if publisher not in {"runtime", "notifications"}:
+            raise ValueError("telemetry publisher is invalid")
+        if (
+            re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}",
+                runtime_session_id,
+            )
+            is None
+        ):
+            raise ValueError("telemetry session identity is invalid")
+        if (
+            not isinstance(publisher_generation, int)
+            or isinstance(publisher_generation, bool)
+            or not 1 <= publisher_generation <= 9_223_372_036_854_775_807
+        ):
+            raise ValueError("telemetry publisher generation is invalid")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+            raise ValueError("telemetry sequence is invalid")
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("telemetry timestamp must be UTC-aware")
+        observed_at = observed_at.astimezone(timezone.utc)
+        if re.fullmatch(r"[a-f0-9]{64}", payload_digest) is None:
+            raise ValueError("telemetry payload digest is invalid")
+        if persist is not None and not callable(persist):
+            raise ValueError("telemetry persistence callback is invalid")
+
+        with self.session_factory.begin() as session:
+            site = session.scalar(
+                select(SiteModel)
+                .where(SiteModel.site_id == site_id)
+                .with_for_update()
+            )
+            if site is None:
+                raise ValueError("telemetry site is unavailable")
+            current = session.get(
+                TelemetryPublisherEpochModel,
+                (site_id, publisher),
+                with_for_update=True,
+            )
+            if current is not None:
+                if publisher_generation < current.generation:
+                    raise ValueError("retired telemetry session cannot regain authority")
+                if publisher_generation == current.generation:
+                    if runtime_session_id != current.runtime_session_id:
+                        raise ValueError(
+                            "telemetry generation is bound to another session"
+                        )
+                    previous_observed_at = _as_utc(current.last_observed_at)
+                    if sequence == current.last_sequence:
+                        if payload_digest != current.last_payload_digest:
+                            raise ValueError(
+                                "telemetry sequence was replayed with a different body"
+                            )
+                        return False
+                    if (
+                        sequence < current.last_sequence
+                        or observed_at < previous_observed_at
+                    ):
+                        raise ValueError("telemetry sequence regressed")
+                    current.last_sequence = sequence
+                    current.last_observed_at = observed_at
+                    current.last_payload_digest = payload_digest
+                    if persist is not None:
+                        persist(session)
+                    session.flush()
+                    return True
+                if runtime_session_id == current.runtime_session_id:
+                    raise ValueError(
+                        "new telemetry generation requires a new session identity"
+                    )
+                if observed_at < _as_utc(current.last_observed_at):
+                    raise ValueError("telemetry session timestamp regressed")
+                current.runtime_session_id = runtime_session_id
+                current.generation = publisher_generation
+                current.last_sequence = sequence
+                current.last_observed_at = observed_at
+                current.last_payload_digest = payload_digest
+                current.activated_at = observed_at
+                if persist is not None:
+                    persist(session)
+                session.flush()
+                return True
+
+            session.add(
+                TelemetryPublisherEpochModel(
+                    site_id=site_id,
+                    publisher=publisher,
+                    runtime_session_id=runtime_session_id,
+                    generation=publisher_generation,
+                    last_sequence=sequence,
+                    last_observed_at=observed_at,
+                    last_payload_digest=payload_digest,
+                    activated_at=observed_at,
+                )
+            )
+            if persist is not None:
+                persist(session)
+            session.flush()
+            return True
 
     def list_cameras(
         self,

@@ -482,6 +482,7 @@ class PilotTelemetryState:
         components: Mapping[str, ComponentState],
         payload_digest: str,
         update: Callable[[], None],
+        authorize: Callable[[], bool] | None = None,
     ) -> bool:
         required_components = _PUBLISHER_COMPONENTS.get(publisher)
         if required_components is None:
@@ -507,12 +508,16 @@ class PilotTelemetryState:
             raise ValueError("component state is not finite")
         if not callable(update):
             raise ValueError("telemetry update must be callable")
+        if authorize is not None and not callable(authorize):
+            raise ValueError("telemetry authority must be callable")
         if len(payload_digest) != 64 or any(
             character not in "0123456789abcdef" for character in payload_digest
         ):
             raise ValueError("telemetry payload digest must be hexadecimal SHA-256")
 
         with self._lock:
+            if authorize is not None and not authorize():
+                return False
             previous = self._publisher_positions.get(publisher)
             if previous is not None:
                 (

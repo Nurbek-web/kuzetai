@@ -46,6 +46,38 @@ def upgrade() -> None:
         unique=False,
     )
     op.create_table(
+        "telemetry_publisher_epochs",
+        sa.Column("site_id", sa.String(length=128), nullable=False),
+        sa.Column("publisher", sa.String(length=32), nullable=False),
+        sa.Column("runtime_session_id", sa.String(length=128), nullable=False),
+        sa.Column("generation", sa.BigInteger(), nullable=False),
+        sa.Column("last_sequence", sa.BigInteger(), nullable=False),
+        sa.Column("last_observed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("last_payload_digest", sa.String(length=64), nullable=False),
+        sa.Column("activated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "publisher IN ('runtime', 'notifications')",
+            name="ck_telemetry_publisher",
+        ),
+        sa.CheckConstraint("generation > 0", name="ck_telemetry_generation"),
+        sa.CheckConstraint(
+            "last_sequence >= 0",
+            name="ck_telemetry_last_sequence",
+        ),
+        sa.CheckConstraint(
+            "length(last_payload_digest) = 64",
+            name="ck_telemetry_payload_digest",
+        ),
+        sa.ForeignKeyConstraint(["site_id"], ["sites.site_id"], ondelete="RESTRICT"),
+        sa.PrimaryKeyConstraint("site_id", "publisher"),
+    )
+    op.create_index(
+        "ix_telemetry_publisher_generation",
+        "telemetry_publisher_epochs",
+        ["site_id", "publisher", "generation"],
+        unique=False,
+    )
+    op.create_table(
         "audit_archive_receipts",
         sa.Column("receipt_id", sa.String(length=36), nullable=False),
         sa.Column("site_id", sa.String(length=128), nullable=False),
@@ -62,7 +94,18 @@ def upgrade() -> None:
             "length(archive_sha256) = 64",
             name="ck_audit_archive_sha256",
         ),
-        sa.CheckConstraint("row_count > 0", name="ck_audit_archive_row_count"),
+        sa.CheckConstraint(
+            "row_count > 0 AND row_count <= 10000",
+            name="ck_audit_archive_row_count",
+        ),
+        sa.CheckConstraint(
+            "length(detached_signature) <= 16384",
+            name="ck_audit_archive_signature_bound",
+        ),
+        sa.CheckConstraint(
+            "length(canonical_receipt) <= 16384",
+            name="ck_audit_archive_receipt_bound",
+        ),
         sa.ForeignKeyConstraint(["site_id"], ["sites.site_id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("receipt_id"),
         sa.UniqueConstraint(
@@ -97,10 +140,20 @@ def upgrade() -> None:
         sa.Column("audit_id", sa.String(length=36), nullable=False),
         sa.PrimaryKeyConstraint("backend_pid", "transaction_id", "audit_id"),
     )
+    op.create_table(
+        "audit_item_compaction_authorizations",
+        sa.Column("backend_pid", sa.Integer(), nullable=False),
+        sa.Column("transaction_id", sa.BigInteger(), nullable=False),
+        sa.Column("receipt_id", sa.String(length=36), nullable=False),
+        sa.PrimaryKeyConstraint("backend_pid", "transaction_id", "receipt_id"),
+    )
 
     if op.get_bind().dialect.name != "postgresql":
         return
     op.execute("REVOKE ALL ON TABLE audit_prune_authorizations FROM PUBLIC")
+    op.execute(
+        "REVOKE ALL ON TABLE audit_item_compaction_authorizations FROM PUBLIC"
+    )
     op.execute(
         """
         CREATE OR REPLACE FUNCTION pilot_reject_audit_archive_receipt_mutation()
@@ -109,6 +162,18 @@ def upgrade() -> None:
         SET search_path = pg_catalog, public
         AS $$
         BEGIN
+            IF TG_TABLE_NAME = 'audit_archive_items'
+               AND TG_OP = 'DELETE'
+               AND EXISTS (
+                   SELECT 1
+                     FROM public.audit_item_compaction_authorizations
+                       AS authorization
+                    WHERE authorization.backend_pid = pg_backend_pid()
+                      AND authorization.transaction_id = txid_current()
+                      AND authorization.receipt_id = OLD.receipt_id
+               ) THEN
+                RETURN OLD;
+            END IF;
             IF TG_TABLE_NAME = 'audit_archive_receipts'
                AND TG_OP = 'UPDATE'
                AND current_user = 'kuzet_owner'
@@ -187,6 +252,7 @@ def upgrade() -> None:
         DECLARE
             expected_count integer;
             deleted_count integer;
+            compacted_count integer;
             receipt_site_id text;
             receipt_cutoff timestamptz;
             site_count integer;
@@ -261,12 +327,36 @@ def upgrade() -> None:
             DELETE FROM public.audit_prune_authorizations AS authorization
              WHERE authorization.backend_pid = pg_backend_pid()
                AND authorization.transaction_id = txid_current();
+
+            INSERT INTO public.audit_item_compaction_authorizations (
+                backend_pid,
+                transaction_id,
+                receipt_id
+            ) VALUES (
+                pg_backend_pid(),
+                txid_current(),
+                p_receipt_id
+            );
+            DELETE FROM public.audit_archive_items AS item
+             WHERE item.receipt_id = p_receipt_id;
+            GET DIAGNOSTICS compacted_count = ROW_COUNT;
+            IF compacted_count <> expected_count THEN
+                RAISE EXCEPTION 'receipt-bound audit staging compaction was incomplete';
+            END IF;
+            DELETE FROM public.audit_item_compaction_authorizations AS authorization
+             WHERE authorization.backend_pid = pg_backend_pid()
+               AND authorization.transaction_id = txid_current()
+               AND authorization.receipt_id = p_receipt_id;
+
             UPDATE public.audit_archive_receipts
                SET pruned_at = transaction_timestamp()
              WHERE receipt_id = p_receipt_id;
             RETURN deleted_count;
         EXCEPTION WHEN OTHERS THEN
             DELETE FROM public.audit_prune_authorizations AS authorization
+             WHERE authorization.backend_pid = pg_backend_pid()
+               AND authorization.transaction_id = txid_current();
+            DELETE FROM public.audit_item_compaction_authorizations AS authorization
              WHERE authorization.backend_pid = pg_backend_pid()
                AND authorization.transaction_id = txid_current();
             RAISE;
@@ -310,6 +400,7 @@ def downgrade() -> None:
             $$;
             """
         )
+    op.drop_table("audit_item_compaction_authorizations")
     op.drop_table("audit_prune_authorizations")
     op.drop_index(
         "ix_audit_archive_items_receipt",
@@ -317,6 +408,11 @@ def downgrade() -> None:
     )
     op.drop_table("audit_archive_items")
     op.drop_table("audit_archive_receipts")
+    op.drop_index(
+        "ix_telemetry_publisher_generation",
+        table_name="telemetry_publisher_epochs",
+    )
+    op.drop_table("telemetry_publisher_epochs")
     op.drop_index("ix_audit_entries_site_occurred", table_name="audit_entries")
     if op.get_bind().dialect.name == "postgresql":
         op.drop_constraint(

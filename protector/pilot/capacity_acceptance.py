@@ -15,6 +15,9 @@ from protector.pilot.gates import (
 class PrimaryRuntimeIdentity(Protocol):
     site_id: str
     artifact: object
+    registry_entry_sha256: str
+    frozen_workload_sha256: str
+    expected_workload_sha256: str
     engine_sha256: str | None
     precision: str
     target_compute_capability: str
@@ -38,6 +41,12 @@ def require_measured_primary_capacity(
         or report.site_id != runtime_manifest.site_id
         or report.artifact_id != getattr(artifact, "artifact_id", None)
         or report.artifact_sha256 != getattr(artifact, "sha256", None)
+        or report.registry_entry_sha256
+        != runtime_manifest.registry_entry_sha256
+        or report.frozen_workload_sha256
+        != runtime_manifest.frozen_workload_sha256
+        or report.expected_workload_sha256
+        != runtime_manifest.expected_workload_sha256
         or report.engine_sha256 != runtime_manifest.engine_sha256
         or report.precision != runtime_manifest.precision
         or report.target_gpu_architecture != PILOT_TARGET_GPU_ARCHITECTURE
