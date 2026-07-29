@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 
+import protector.pilot.runtime.evidence as evidence_runtime
 from protector.pilot.runtime import _limit_exec
 from protector.pilot.runtime.evidence import (
     BoundedMediaDescriptor,
@@ -1232,6 +1233,118 @@ def test_splitmux_packet_probe_and_adoption_hold_the_same_incoming_inode(
     assert fragment.path.read_bytes() == original
     assert part.read_bytes() == replacement
     assert ring.fragments("camera-01") == (fragment,)
+
+
+def test_inflight_adoption_remains_additive_to_visible_writer_staging(
+    tmp_path: Path,
+) -> None:
+    ring = _ring(
+        tmp_path / "inflight-spool",
+        Clock(),
+        max_camera_bytes=160,
+        max_spool_bytes=160,
+    )
+    ring.reserve_staging("camera-01", 80)
+    spec = gstreamer_splitmux_sink_spec(
+        spool_root=ring.root,
+        camera_id="camera-01",
+        codec="h264",
+        fragment_seconds=2,
+        max_fragment_bytes=80,
+        ring_seconds=ring.ring_seconds,
+        max_camera_bytes=ring.max_camera_bytes,
+        writer_generation="inflight",
+    )
+    part = Path(str(spec.properties["location"]).replace("%05d", "00001"))
+    part.parent.mkdir(parents=True)
+    part.write_bytes(b"a" * 80)
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    outcomes: list[object] = []
+
+    def blocking_probe(_source: BoundedMediaDescriptor) -> bool:
+        probe_entered.set()
+        assert release_probe.wait(timeout=2)
+        return True
+
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=80,
+        packet_probe=blocking_probe,
+    )
+
+    def adopt() -> None:
+        try:
+            outcomes.append(
+                factory.commit_closed_fragment(
+                    camera_id="camera-01",
+                    part_path=part,
+                    start_at=NOW,
+                    end_at=NOW + timedelta(seconds=2),
+                    codec="h264",
+                    starts_with_keyframe=True,
+                )
+            )
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    worker = threading.Thread(target=adopt)
+    worker.start()
+    assert probe_entered.wait(timeout=2)
+    next_part = part.with_name("00002.part.mp4")
+    try:
+        assert ring.used_bytes == 160
+        next_part.write_bytes(b"b" * 81)
+        assert ring.used_bytes == 161
+        with pytest.raises(SpoolCapacityError):
+            ring.assert_staging_within_bounds("camera-01")
+        next_part.unlink()
+    finally:
+        release_probe.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(outcomes) == 1
+    assert not isinstance(outcomes[0], BaseException)
+    fragment = outcomes[0]
+    assert fragment.path.read_bytes() == b"a" * 80  # type: ignore[union-attr]
+    assert ring.used_bytes == 160
+
+
+def test_append_reserves_copy_capacity_before_writing_ring_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ring = _ring(
+        tmp_path / "pending-copy-spool",
+        Clock(),
+        max_camera_bytes=150,
+        max_spool_bytes=150,
+    )
+    ring.reserve_staging("camera-01", 80)
+    atomic_writes: list[Path] = []
+    real_atomic_write = evidence_runtime._atomic_write
+
+    def record_atomic_write(path: Path, payload: bytes) -> None:
+        atomic_writes.append(path)
+        real_atomic_write(path, payload)
+
+    monkeypatch.setattr(evidence_runtime, "_atomic_write", record_atomic_write)
+
+    with pytest.raises(SpoolCapacityError):
+        ring.append(
+            camera_id="camera-01",
+            payload=b"c" * 80,
+            start_at=NOW,
+            end_at=NOW + timedelta(seconds=2),
+            codec="h264",
+            starts_with_keyframe=True,
+        )
+
+    assert atomic_writes == []
+    assert ring.fragments("camera-01") == ()
+    assert ring.used_bytes == 80
 
 
 def test_source_time_mapping_keeps_one_canonical_transform_across_rtcp_jitter() -> None:

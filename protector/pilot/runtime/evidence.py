@@ -206,18 +206,28 @@ class EncodedFragmentRing:
         self._lock = threading.RLock()
         self._records: dict[str, _FragmentRecord] = {}
         self._staging_reservations: dict[str, int] = {}
+        self._inflight_adoption_bytes: dict[str, int] = {}
+        self._pending_write_bytes: dict[str, int] = {}
         self._scan()
 
     @property
     def used_bytes(self) -> int:
         with self._lock:
             adopted = sum(record.fragment.size_bytes for record in self._records.values())
+            inflight = sum(self._inflight_adoption_bytes.values())
+            pending = sum(self._pending_write_bytes.values())
             incoming_by_camera = self._incoming_bytes_by_camera()
             staged = sum(
                 max(reserved, incoming_by_camera.pop(camera_id, 0))
                 for camera_id, reserved in self._staging_reservations.items()
             )
-            return adopted + staged + sum(incoming_by_camera.values())
+            return (
+                adopted
+                + inflight
+                + pending
+                + staged
+                + sum(incoming_by_camera.values())
+            )
 
     def reserve_staging(self, camera_id: str, max_fragment_bytes: int) -> None:
         """Reserve one open splitmux fragment before a camera writer is attached."""
@@ -333,14 +343,36 @@ class EncodedFragmentRing:
             ]
             if same_stream and start_at < max(item.end_at for item in same_stream):
                 raise ValueError("fragment interval would overlap or regress within stream epoch")
-            _atomic_write(path, payload)
             record = _FragmentRecord(fragment=fragment, pins={})
-            self._records[fragment_id] = record
+            self._adjust_accounted_bytes(
+                self._pending_write_bytes,
+                camera_id=camera_id,
+                delta=len(payload),
+            )
+            pending_write = True
+            record_added = False
             try:
+                self._enforce_bounds(protected_fragment_id=None)
+                _atomic_write(path, payload)
+                self._records[fragment_id] = record
+                record_added = True
+                self._adjust_accounted_bytes(
+                    self._pending_write_bytes,
+                    camera_id=camera_id,
+                    delta=-len(payload),
+                )
+                pending_write = False
                 self._write_metadata(record)
                 self._enforce_bounds(protected_fragment_id=fragment_id)
             except BaseException:
-                self._records.pop(fragment_id, None)
+                if pending_write:
+                    self._adjust_accounted_bytes(
+                        self._pending_write_bytes,
+                        camera_id=camera_id,
+                        delta=-len(payload),
+                    )
+                if record_added:
+                    self._records.pop(fragment_id, None)
                 self._delete_files(fragment)
                 raise
             return fragment
@@ -470,6 +502,7 @@ class EncodedFragmentRing:
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=directory_descriptor,
             )
+            inflight_bytes = 0
             try:
                 file_stat = os.fstat(descriptor)
                 if not stat.S_ISREG(file_stat.st_mode):
@@ -478,8 +511,17 @@ class EncodedFragmentRing:
                     raise SpoolCapacityError(
                         "closed splitmux fragment exceeds configured byte bound"
                     )
-                os.unlink(relative.parts[-1], dir_fd=directory_descriptor)
-                os.fsync(directory_descriptor)
+                with self._lock:
+                    os.unlink(relative.parts[-1], dir_fd=directory_descriptor)
+                    self._adjust_accounted_bytes(
+                        self._inflight_adoption_bytes,
+                        camera_id=camera_id,
+                        delta=file_stat.st_size,
+                    )
+                    inflight_bytes = file_stat.st_size
+                    os.fsync(directory_descriptor)
+                    self._enforce_bounds(protected_fragment_id=None)
+                    self.assert_staging_within_bounds(camera_id)
                 source = BoundedMediaDescriptor(
                     descriptor=descriptor,
                     max_bytes=max_bytes,
@@ -501,6 +543,13 @@ class EncodedFragmentRing:
                         )
             finally:
                 os.close(descriptor)
+                if inflight_bytes:
+                    with self._lock:
+                        self._adjust_accounted_bytes(
+                            self._inflight_adoption_bytes,
+                            camera_id=camera_id,
+                            delta=-inflight_bytes,
+                        )
             fragment = self.append(
                 camera_id=camera_id,
                 payload=bytes(payload),
@@ -684,9 +733,16 @@ class EncodedFragmentRing:
     def _enforce_bounds(self, *, protected_fragment_id: str | None) -> None:
         self.expire_pins()
         while True:
+            camera_ids = (
+                {record.fragment.camera_id for record in self._records.values()}
+                | set(self._staging_reservations)
+                | set(self._inflight_adoption_bytes)
+                | set(self._pending_write_bytes)
+                | set(self._incoming_bytes_by_camera())
+            )
             camera_over = {
                 camera_id
-                for camera_id in {record.fragment.camera_id for record in self._records.values()}
+                for camera_id in camera_ids
                 if self._camera_duration(camera_id) > self.ring_seconds
                 or self._camera_bytes(camera_id) > self.max_camera_bytes
             }
@@ -717,7 +773,24 @@ class EncodedFragmentRing:
         adopted = sum(fragment.size_bytes for fragment in self.fragments(camera_id))
         incoming = self._incoming_bytes_by_camera().get(camera_id, 0)
         reserved = self._staging_reservations.get(camera_id, 0)
-        return adopted + max(incoming, reserved)
+        inflight = self._inflight_adoption_bytes.get(camera_id, 0)
+        pending = self._pending_write_bytes.get(camera_id, 0)
+        return adopted + inflight + pending + max(incoming, reserved)
+
+    @staticmethod
+    def _adjust_accounted_bytes(
+        accounting: dict[str, int],
+        *,
+        camera_id: str,
+        delta: int,
+    ) -> None:
+        updated = accounting.get(camera_id, 0) + delta
+        if updated < 0:
+            raise RuntimeError("evidence byte accounting underflow")
+        if updated:
+            accounting[camera_id] = updated
+        else:
+            accounting.pop(camera_id, None)
 
     def _incoming_bytes_by_camera(self) -> dict[str, int]:
         incoming_root = self.root / ".incoming"
