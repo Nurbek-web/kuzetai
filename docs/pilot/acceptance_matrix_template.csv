@@ -1,0 +1,5 @@
+site_id,camera_id,event_id,module,view_id,visibility,lighting,occlusion,event_duration_seconds,case_type,expected_candidate_behavior,expected_operator_behavior,evidence_reference,result,exception_id,reviewer,reviewed_at_utc,sign_off
+REQUIRED,REQUIRED,REQUIRED,fire_smoke,REQUIRED,REQUIRED,REQUIRED,REQUIRED,REQUIRED,positive,REQUIRED,confirm_or_reject,REQUIRED,pending,,REQUIRED,,pending
+REQUIRED,REQUIRED,REQUIRED,fire_smoke,REQUIRED,REQUIRED,REQUIRED,REQUIRED,REQUIRED,hard_negative,no_candidate,no_action,REQUIRED,pending,,REQUIRED,,pending
+REQUIRED,REQUIRED,REQUIRED,weapon,REQUIRED,REQUIRED,REQUIRED,REQUIRED,REQUIRED,positive,REQUIRED,confirm_or_reject,REQUIRED,pending,,REQUIRED,,pending
+REQUIRED,REQUIRED,REQUIRED,weapon,REQUIRED,REQUIRED,REQUIRED,REQUIRED,REQUIRED,hard_negative,no_candidate,no_action,REQUIRED,pending,,REQUIRED,,pending
