@@ -1,0 +1,19 @@
+# Fail-closed placeholder only. This is not an approved or deployable model.
+# Populate it from the signed model register, then run model_audit.py.
+# Runtime scheduling remains one shared ~1 Hz full-frame branch behind a bounded,
+# downstream-leaky queue; it must not create one model stack per camera.
+schema_version: model-registry-entry.v1
+site_id: REPLACE_WITH_CUSTOMER_SITE_ID
+module: fire_smoke
+artifact_id: REPLACE_WITH_RIGHTS_CLEARED_FIRE_ARTIFACT_ID
+source_uri: null
+artifact_sha256: null
+commercial_rights:
+  schema_version: commercial-rights-evidence.v1
+  status: unknown
+classes: []
+preprocessing: null
+training_provenance: null
+evaluation_provenance: null
+thresholds: {}
+engine: null

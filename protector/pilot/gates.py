@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Protocol
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from protector.pilot.config import FrozenModel, NonEmptyString
 from protector.pilot.domain import GateMode
@@ -100,6 +100,121 @@ class ShadowStageReportV1(AuditedReportV1):
     schema_version: Literal["shadow-stage-report.v1"]
 
 
+class SiteMatrixSceneV1(FrozenModel):
+    """One immutable positive or hard-negative scene in the signed site corpus."""
+
+    scene_id: NonEmptyString
+    source_sha256: str
+    expected_event: bool
+    result: Literal["pass", "fail"]
+
+    @field_validator("source_sha256")
+    @classmethod
+    def source_hash_is_a_digest(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
+            raise ValueError("source_sha256 must be a 64-character hexadecimal digest")
+        return value.lower()
+
+
+class SignedSiteMatrixV1(AuditedReportV1):
+    """Signed event-level positives and hard negatives for one site and artifact."""
+
+    schema_version: Literal["signed-site-matrix.v1"]
+    site_id: NonEmptyString
+    module: NonEmptyString
+    artifact_sha256: str
+    registry_entry_sha256: str
+    positives: Annotated[tuple[SiteMatrixSceneV1, ...], Field(min_length=1)]
+    hard_negatives: Annotated[tuple[SiteMatrixSceneV1, ...], Field(min_length=1)]
+
+    @field_validator("artifact_sha256", "registry_entry_sha256")
+    @classmethod
+    def artifact_hash_is_a_digest(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
+            raise ValueError("artifact_sha256 must be a 64-character hexadecimal digest")
+        return value.lower()
+
+    @model_validator(mode="after")
+    def scene_groups_match_their_contract(self) -> SignedSiteMatrixV1:
+        if any(not scene.expected_event for scene in self.positives):
+            raise ValueError("positives must contain expected events")
+        if any(scene.expected_event for scene in self.hard_negatives):
+            raise ValueError("hard_negatives must contain expected non-events")
+        scene_ids = [scene.scene_id for scene in (*self.positives, *self.hard_negatives)]
+        if len(scene_ids) != len(set(scene_ids)):
+            raise ValueError("site matrix scene IDs must be unique")
+        return self
+
+
+class ShadowStageEvidenceV1(AuditedReportV1):
+    """Signed completion of the exact artifact's target-site shadow stage."""
+
+    schema_version: Literal["shadow-stage-evidence.v1"]
+    site_id: NonEmptyString
+    artifact_sha256: str
+    registry_entry_sha256: str
+
+    @field_validator("artifact_sha256", "registry_entry_sha256")
+    @classmethod
+    def artifact_hash_is_a_digest(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
+            raise ValueError("artifact_sha256 must be a 64-character hexadecimal digest")
+        return value.lower()
+
+
+class MeasuredCapacityReportV1(AuditedReportV1):
+    """Signed measurements for the frozen 20-stream target workload."""
+
+    schema_version: Literal["measured-capacity-report.v1"]
+    site_id: NonEmptyString
+    artifact_sha256: str
+    registry_entry_sha256: str
+    engine_sha256: str
+    precision: Literal["fp16", "int8"]
+    target_gpu_architecture: NonEmptyString
+    target_compute_capability: NonEmptyString
+    tensorrt_version: NonEmptyString
+    frozen_workload_sha256: str
+    stream_count: Annotated[int, Field(ge=1)]
+    effective_throughput_hz: Annotated[float, Field(gt=0)]
+    required_throughput_hz: Annotated[float, Field(gt=0)]
+    scheduled_drop_fraction: Annotated[float, Field(ge=0, le=1)]
+    queue_age_p95_seconds: Annotated[float, Field(ge=0)]
+    queue_age_p99_seconds: Annotated[float, Field(ge=0)]
+    gpu_utilization_max: Annotated[float, Field(ge=0, le=1)]
+    vram_utilization_max: Annotated[float, Field(ge=0, le=1)]
+
+    @field_validator(
+        "artifact_sha256",
+        "registry_entry_sha256",
+        "engine_sha256",
+        "frozen_workload_sha256",
+    )
+    @classmethod
+    def hashes_are_digests(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
+            raise ValueError("capacity hashes must be 64-character hexadecimal digests")
+        return value.lower()
+
+
+class ConditionalArtifactEvidence(Protocol):
+    """Structural registry input consumed by the single promotion-policy authority."""
+
+    site_id: str
+    module: str
+    artifact_id: str
+    source_uri: str | None
+    artifact_sha256: str | None
+    commercial_rights: Any
+    classes: tuple[str, ...]
+    preprocessing: str | None
+    training_provenance: str | None
+    evaluation_provenance: str | None
+    thresholds: Any
+    engine: Any
+    registry_entry_sha256: str
+
+
 class ModelGateResultV1(FrozenModel):
     """A pure, auditable promotion decision with human-readable evidence gaps."""
 
@@ -107,6 +222,25 @@ class ModelGateResultV1(FrozenModel):
     mode: GateMode
     reasons: tuple[str, ...]
     promotion_path: tuple[GateMode, GateMode, GateMode] = ("disabled", "shadow", "operator")
+
+
+class ConditionalModelGateResultV1(ModelGateResultV1):
+    """Artifact-bound conditional decision consumed by the runtime scheduler."""
+
+    schema_version: Literal["conditional-model-gate-result.v1"] = (
+        "conditional-model-gate-result.v1"
+    )
+    site_id: NonEmptyString
+    module: NonEmptyString
+    artifact_id: NonEmptyString
+    registry_entry_sha256: str
+
+    @field_validator("registry_entry_sha256")
+    @classmethod
+    def registry_hash_is_a_digest(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
+            raise ValueError("registry_entry_sha256 must be a 64-character hexadecimal digest")
+        return value.lower()
 
 
 class ModelGate:
@@ -192,3 +326,183 @@ class ModelGate:
                 reasons=("shadow-stage report did not pass",),
             )
         return ModelGateResultV1(mode="operator", reasons=())
+
+    @staticmethod
+    def conditional_artifact_reasons(
+        artifact: ConditionalArtifactEvidence,
+        *,
+        actual_artifact_sha256: str | None = None,
+        require_engine: bool = True,
+    ) -> tuple[str, ...]:
+        """Return every fail-closed registry gap used by audit, export, and promotion."""
+
+        reasons: list[str] = []
+        if not artifact.source_uri:
+            reasons.append("missing source URI")
+        if not artifact.artifact_sha256:
+            reasons.append("missing artifact sha256")
+        elif (
+            actual_artifact_sha256 is not None
+            and artifact.artifact_sha256.lower() != actual_artifact_sha256.lower()
+        ):
+            reasons.append("artifact sha256 mismatch")
+        rights = artifact.commercial_rights
+        if rights is None:
+            reasons.append("missing commercial rights evidence")
+        elif rights.status != "approved":
+            reasons.append(f"commercial rights status is {rights.status}")
+        elif not all(
+            (
+                rights.evidence_reference,
+                rights.evidence_sha256,
+                rights.approved_by,
+                rights.approved_at,
+            )
+        ):
+            reasons.append("approved commercial rights evidence is incomplete")
+        if not artifact.classes:
+            reasons.append("missing class list")
+        if not artifact.preprocessing:
+            reasons.append("missing preprocessing")
+        if not artifact.training_provenance:
+            reasons.append("missing training provenance")
+        if not artifact.evaluation_provenance:
+            reasons.append("missing evaluation provenance")
+        if not artifact.thresholds:
+            reasons.append("missing thresholds")
+        if require_engine:
+            engine = artifact.engine
+            if engine is None or not engine.engine_sha256:
+                reasons.append("missing engine sha256")
+            elif not all(
+                (
+                    engine.tensorrt_version,
+                    engine.target_gpu_architecture,
+                    engine.target_compute_capability,
+                    engine.precision,
+                )
+            ):
+                reasons.append("engine target identity is incomplete")
+            elif engine.precision == "int8" and not all(
+                (
+                    engine.calibration_corpus_sha256,
+                    engine.no_regression_report_sha256,
+                    engine.no_regression_candidate_engine_sha256
+                    == engine.engine_sha256,
+                )
+            ):
+                reasons.append("INT8 engine evidence is incomplete")
+        return tuple(reasons)
+
+    @staticmethod
+    def evaluate_conditional(
+        artifact: ConditionalArtifactEvidence,
+        *,
+        site_matrix: SignedSiteMatrixV1 | None,
+        shadow_stage: ShadowStageEvidenceV1 | None,
+        capacity_report: MeasuredCapacityReportV1 | None,
+    ) -> ConditionalModelGateResultV1:
+        """Evaluate conditional analytics through one staged, evidence-bound policy."""
+
+        def decision(
+            mode: GateMode,
+            reasons: tuple[str, ...],
+        ) -> ConditionalModelGateResultV1:
+            return ConditionalModelGateResultV1(
+                site_id=artifact.site_id,
+                module=artifact.module,
+                artifact_id=artifact.artifact_id,
+                registry_entry_sha256=artifact.registry_entry_sha256,
+                mode=mode,
+                reasons=reasons,
+            )
+
+        artifact_reasons = ModelGate.conditional_artifact_reasons(artifact)
+        if artifact_reasons:
+            return decision("disabled", artifact_reasons)
+        assert artifact.artifact_sha256 is not None
+
+        if artifact.module in {"fight", "fall"}:
+            return decision(
+                "shadow", (f"{artifact.module} is shadow-only for this pilot",)
+            )
+        if artifact.module not in {"fire_smoke", "weapon"}:
+            return decision(
+                "disabled", ("analytic is not approved for conditional promotion",)
+            )
+
+        if site_matrix is not None and (
+            site_matrix.site_id != artifact.site_id
+            or site_matrix.module != artifact.module
+            or site_matrix.artifact_id != artifact.artifact_id
+            or site_matrix.artifact_sha256 != artifact.artifact_sha256
+            or site_matrix.registry_entry_sha256 != artifact.registry_entry_sha256
+        ):
+            return decision("disabled", ("site matrix binding mismatch",))
+        if shadow_stage is not None and (
+            shadow_stage.site_id != artifact.site_id
+            or shadow_stage.artifact_id != artifact.artifact_id
+            or shadow_stage.artifact_sha256 != artifact.artifact_sha256
+            or shadow_stage.registry_entry_sha256 != artifact.registry_entry_sha256
+        ):
+            return decision("disabled", ("shadow-stage evidence binding mismatch",))
+        if capacity_report is not None and (
+            capacity_report.site_id != artifact.site_id
+            or capacity_report.artifact_id != artifact.artifact_id
+            or capacity_report.artifact_sha256 != artifact.artifact_sha256
+            or capacity_report.registry_entry_sha256 != artifact.registry_entry_sha256
+            or artifact.engine is None
+            or capacity_report.engine_sha256 != artifact.engine.engine_sha256
+            or capacity_report.precision != artifact.engine.precision
+            or capacity_report.target_gpu_architecture
+            != artifact.engine.target_gpu_architecture
+            or capacity_report.target_compute_capability
+            != artifact.engine.target_compute_capability
+            or capacity_report.tensorrt_version != artifact.engine.tensorrt_version
+        ):
+            return decision("disabled", ("capacity report binding mismatch",))
+
+        reasons: list[str] = []
+        if site_matrix is None:
+            reasons.append("missing signed site matrix")
+        else:
+            scenes = (*site_matrix.positives, *site_matrix.hard_negatives)
+            if not site_matrix.passed:
+                reasons.append("signed site matrix did not pass")
+            if any(scene.result != "pass" for scene in scenes):
+                reasons.append("site matrix contains failing scenes")
+
+        if shadow_stage is None:
+            reasons.append("missing successful shadow-stage evidence")
+        elif not shadow_stage.passed:
+            reasons.append("shadow-stage evidence did not pass")
+
+        if capacity_report is None:
+            reasons.append("missing measured capacity report")
+        else:
+            reasons.extend(ModelGate._capacity_reasons(capacity_report))
+
+        if reasons:
+            return decision("shadow", tuple(reasons))
+        return decision("operator", ())
+
+    @staticmethod
+    def _capacity_reasons(report: MeasuredCapacityReportV1) -> tuple[str, ...]:
+        reasons: list[str] = []
+        if not report.passed:
+            reasons.append("measured capacity report did not pass")
+        if report.stream_count != 20:
+            reasons.append("capacity report must cover exactly 20 streams")
+        if report.effective_throughput_hz < report.required_throughput_hz * 1.25:
+            reasons.append("measured throughput headroom is below 25%")
+        if report.scheduled_drop_fraction >= 0.01:
+            reasons.append("scheduled analysis drops must be below 1%")
+        if report.queue_age_p95_seconds >= 1.0:
+            reasons.append("queue age p95 must be below 1 second")
+        if report.queue_age_p99_seconds >= 2.0:
+            reasons.append("queue age p99 must be below 2 seconds")
+        if report.gpu_utilization_max > 0.75:
+            reasons.append("GPU utilization exceeds 75%")
+        if report.vram_utilization_max > 0.80:
+            reasons.append("VRAM utilization exceeds 80%")
+        return tuple(reasons)
