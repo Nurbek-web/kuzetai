@@ -6,7 +6,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from protector.pilot.gates import ConditionalModelGateResultV1
+from protector.pilot.gates import (
+    CameraAnalyticScheduleV1,
+    ExpectedConditionalWorkloadV1,
+)
 from protector.pilot.model_registry import (
     MeasuredCapacityReportV1,
     ModelRegistryEntryV1,
@@ -17,6 +20,7 @@ from protector.pilot.model_registry import (
 )
 from protector.pilot.runtime.conditional import (
     ConditionalAnalyticsScheduler,
+    ConditionalDeploymentV1,
     VerifierCandidateV1,
 )
 
@@ -108,13 +112,38 @@ def _shadow(entry: ModelRegistryEntryV1, *, passed: bool = True) -> ShadowStageE
     )
 
 
+def _workload(entry: ModelRegistryEntryV1) -> ExpectedConditionalWorkloadV1:
+    return ExpectedConditionalWorkloadV1(
+        schema_version="expected-conditional-workload.v1",
+        site_id=entry.site_id,
+        module=entry.module,
+        site_config_sha256="8" * 64,
+        frozen_workload_sha256="5" * 64,
+        cameras=tuple(
+            CameraAnalyticScheduleV1(
+                camera_id=f"camera-{index:02d}",
+                analytics_hz=1.0,
+                inferences_per_sample=1 if entry.module == "fire_smoke" else 2,
+            )
+            for index in range(1, 21)
+        ),
+    )
+
+
 def _capacity(
     entry: ModelRegistryEntryV1,
     *,
-    effective_throughput_hz: float = 50.0,
-    required_throughput_hz: float = 40.0,
+    effective_throughput_hz: float | None = None,
+    required_throughput_hz: float | None = None,
     passed: bool = True,
 ) -> MeasuredCapacityReportV1:
+    workload = _workload(entry)
+    required = (
+        workload.required_throughput_hz
+        if required_throughput_hz is None
+        else required_throughput_hz
+    )
+    effective = required * 1.25 if effective_throughput_hz is None else effective_throughput_hz
     return MeasuredCapacityReportV1(
         schema_version="measured-capacity-report.v1",
         site_id=entry.site_id,
@@ -126,10 +155,12 @@ def _capacity(
         target_gpu_architecture=entry.engine.target_gpu_architecture,
         target_compute_capability=entry.engine.target_compute_capability,
         tensorrt_version=entry.engine.tensorrt_version,
-        frozen_workload_sha256="5" * 64,
+        site_config_sha256=workload.site_config_sha256,
+        frozen_workload_sha256=workload.frozen_workload_sha256,
+        expected_workload_sha256=workload.expected_workload_sha256,
         stream_count=20,
-        effective_throughput_hz=effective_throughput_hz,
-        required_throughput_hz=required_throughput_hz,
+        effective_throughput_hz=effective,
+        required_throughput_hz=required,
         scheduled_drop_fraction=0.005,
         queue_age_p95_seconds=0.5,
         queue_age_p99_seconds=1.2,
@@ -143,19 +174,47 @@ def _capacity(
     )
 
 
-def _gate(
-    artifact_id: str,
-    module: str,
-    mode: str = "shadow",
-) -> ConditionalModelGateResultV1:
-    return ConditionalModelGateResultV1(
-        site_id="school-01",
-        module=module,
-        artifact_id=artifact_id,
-        registry_entry_sha256="7" * 64,
-        mode=mode,
-        reasons=() if mode == "operator" else ("target evidence remains shadow",),
+def _deployment(
+    entry: ModelRegistryEntryV1,
+    *,
+    operator: bool = False,
+    verification_boundary: str | None = None,
+) -> ConditionalDeploymentV1:
+    boundary = verification_boundary or (
+        "human_confirmation"
+        if entry.module == "fire_smoke"
+        else "bounded_shadow_verifier"
     )
+    return ConditionalDeploymentV1(
+        entry=entry,
+        site_matrix=_matrix(entry) if operator else None,
+        shadow_stage=_shadow(entry) if operator else None,
+        capacity_report=_capacity(entry) if operator else None,
+        expected_workload=_workload(entry),
+        verification_boundary=boundary,
+    )
+
+
+def _verifier_entry() -> ModelRegistryEntryV1:
+    base = _entry("weapon")
+    return base.model_copy(
+        update={
+            "artifact_id": "weapon-verifier-artifact-v2",
+            "artifact_sha256": "c" * 64,
+            "engine": base.engine.model_copy(update={"engine_sha256": "d" * 64}),
+        }
+    )
+
+
+def _scheduler_deployments(
+    *,
+    operator: bool = False,
+) -> dict[str, ConditionalDeploymentV1]:
+    return {
+        "fire_deployment": _deployment(_entry("fire_smoke"), operator=operator),
+        "weapon_deployment": _deployment(_entry("weapon"), operator=operator),
+        "verifier_deployment": _deployment(_verifier_entry(), operator=False),
+    }
 
 
 def test_site_matrix_requires_both_positive_and_hard_negative_scenes() -> None:
@@ -175,6 +234,7 @@ def test_operator_promotion_requires_exact_signed_site_shadow_and_capacity_bindi
         site_matrix=_matrix(entry),
         shadow_stage=_shadow(entry),
         capacity_report=_capacity(entry),
+        expected_workload=_workload(entry),
     )
 
     assert decision.mode == "operator"
@@ -188,6 +248,7 @@ def test_operator_promotion_requires_exact_signed_site_shadow_and_capacity_bindi
         site_matrix=wrong_site_matrix,
         shadow_stage=_shadow(entry),
         capacity_report=_capacity(entry),
+        expected_workload=_workload(entry),
     )
     assert mismatch.mode == "disabled"
     assert mismatch.reasons == ("site matrix binding mismatch",)
@@ -207,18 +268,49 @@ def test_signed_reports_bind_threshold_preprocess_and_exact_engine_runtime_ident
         site_matrix=matrix,
         shadow_stage=shadow,
         capacity_report=capacity,
+        expected_workload=_workload(changed_entry),
     )
     changed_engine = evaluate_conditional_promotion(
         entry,
         site_matrix=matrix,
         shadow_stage=shadow,
         capacity_report=capacity.model_copy(update={"engine_sha256": "9" * 64}),
+        expected_workload=_workload(entry),
     )
 
     assert changed_threshold.mode == "disabled"
     assert changed_threshold.reasons == ("site matrix binding mismatch",)
     assert changed_engine.mode == "disabled"
     assert changed_engine.reasons == ("capacity report binding mismatch",)
+
+
+@pytest.mark.parametrize(
+    ("engine_change", "expected_reason"),
+    [
+        ({"target_gpu_architecture": "NVIDIA RTX 4090"}, "pilot target"),
+        ({"target_compute_capability": "9.0"}, "pilot target"),
+        ({"tensorrt_version": "10.8.0.43"}, "pilot target"),
+    ],
+)
+def test_matching_reports_for_a_nonpilot_target_remain_disabled(
+    engine_change: dict[str, str],
+    expected_reason: str,
+) -> None:
+    base = _entry("weapon")
+    entry = base.model_copy(
+        update={"engine": base.engine.model_copy(update=engine_change)}
+    )
+
+    decision = evaluate_conditional_promotion(
+        entry,
+        site_matrix=_matrix(entry),
+        shadow_stage=_shadow(entry),
+        capacity_report=_capacity(entry),
+        expected_workload=_workload(entry),
+    )
+
+    assert decision.mode == "disabled"
+    assert any(expected_reason in reason for reason in decision.reasons)
 
 
 def test_missing_quality_shadow_or_capacity_evidence_stays_shadow_with_explicit_reasons() -> None:
@@ -229,6 +321,7 @@ def test_missing_quality_shadow_or_capacity_evidence_stays_shadow_with_explicit_
         site_matrix=None,
         shadow_stage=None,
         capacity_report=None,
+        expected_workload=_workload(entry),
     )
 
     assert decision.mode == "shadow"
@@ -249,6 +342,7 @@ def test_report_pass_flags_cannot_override_a_failing_site_scene() -> None:
         site_matrix=matrix.model_copy(update={"positives": (failing_positive,)}),
         shadow_stage=_shadow(entry),
         capacity_report=_capacity(entry),
+        expected_workload=_workload(entry),
     )
 
     assert decision.mode == "shadow"
@@ -263,6 +357,7 @@ def test_unapproved_rights_disable_the_module_even_if_other_reports_pass() -> No
         site_matrix=_matrix(entry),
         shadow_stage=_shadow(entry),
         capacity_report=_capacity(entry),
+        expected_workload=_workload(entry),
     )
 
     assert decision.mode == "disabled"
@@ -277,7 +372,8 @@ def test_fight_and_fall_are_always_shadow_only(module: str) -> None:
         entry,
         site_matrix=_matrix(entry),
         shadow_stage=_shadow(entry),
-        capacity_report=_capacity(entry),
+        capacity_report=None,
+        expected_workload=None,
     )
 
     assert decision.mode == "shadow"
@@ -293,9 +389,10 @@ def test_capacity_needs_measured_effective_throughput_with_at_least_twenty_five_
         shadow_stage=_shadow(entry),
         capacity_report=_capacity(
             entry,
-            effective_throughput_hz=49.59,
-            required_throughput_hz=40.0,
+            effective_throughput_hz=24.99,
+            required_throughput_hz=20.0,
         ),
+        expected_workload=_workload(entry),
     )
     exact = evaluate_conditional_promotion(
         entry,
@@ -303,15 +400,35 @@ def test_capacity_needs_measured_effective_throughput_with_at_least_twenty_five_
         shadow_stage=_shadow(entry),
         capacity_report=_capacity(
             entry,
-            effective_throughput_hz=50.0,
-            required_throughput_hz=40.0,
+            effective_throughput_hz=25.0,
+            required_throughput_hz=20.0,
         ),
+        expected_workload=_workload(entry),
     )
 
     assert insufficient.mode == "shadow"
     assert "measured throughput headroom is below 25%" in insufficient.reasons
     assert exact.mode == "operator"
     assert exact.reasons == ()
+
+
+def test_self_declared_near_zero_capacity_denominator_cannot_promote() -> None:
+    entry = _entry()
+
+    decision = evaluate_conditional_promotion(
+        entry,
+        site_matrix=_matrix(entry),
+        shadow_stage=_shadow(entry),
+        capacity_report=_capacity(
+            entry,
+            effective_throughput_hz=0.125,
+            required_throughput_hz=0.1,
+        ),
+        expected_workload=_workload(entry),
+    )
+
+    assert decision.mode == "shadow"
+    assert "configured site workload" in " ".join(decision.reasons)
 
 
 def test_int8_engine_cannot_promote_without_registered_calibration_and_exact_report() -> None:
@@ -324,6 +441,7 @@ def test_int8_engine_cannot_promote_without_registered_calibration_and_exact_rep
         site_matrix=_matrix(entry),
         shadow_stage=_shadow(entry),
         capacity_report=_capacity(entry),
+        expected_workload=_workload(entry),
     )
 
     assert decision.mode == "disabled"
@@ -351,6 +469,7 @@ def test_capacity_pass_flag_cannot_override_measured_gate_failures(
         site_matrix=_matrix(entry),
         shadow_stage=_shadow(entry),
         capacity_report=_capacity(entry).model_copy(update=changes),
+        expected_workload=_workload(entry),
     )
 
     assert decision.mode == "shadow"
@@ -359,14 +478,9 @@ def test_capacity_pass_flag_cannot_override_measured_gate_failures(
 
 def test_conditional_scheduler_runs_shared_fire_full_frame_and_weapon_roi_work_at_one_hz() -> None:
     scheduler = ConditionalAnalyticsScheduler(
-        fire_artifact_id="fire-v7",
-        weapon_artifact_id="weapon-v7",
-        verifier_artifact_id="weapon-verifier-v2",
         queue_capacity=8,
         verifier_queue_capacity=2,
-        fire_gate=_gate("fire-v7", "fire_smoke"),
-        weapon_gate=_gate("weapon-v7", "weapon"),
-        verifier_gate=_gate("weapon-verifier-v2", "weapon"),
+        **_scheduler_deployments(),
     )
     first = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
     rois = ((0.1, 0.2, 0.3, 0.6), (0.5, 0.1, 0.8, 0.9))
@@ -395,17 +509,14 @@ def test_conditional_scheduler_runs_shared_fire_full_frame_and_weapon_roi_work_a
         (first + timedelta(seconds=1), rois[0], "person_roi"),
         (first + timedelta(seconds=1), rois[1], "person_roi"),
     ]
-    assert {item.artifact_id for item in fire} == {"fire-v7"}
-    assert {item.artifact_id for item in weapon} == {"weapon-v7"}
+    assert {item.artifact_id for item in fire} == {"fire_smoke-artifact-v7"}
+    assert {item.artifact_id for item in weapon} == {"weapon-artifact-v7"}
     assert all(item.gate_mode == "shadow" for item in (*fire, *weapon))
 
 
 def test_conditional_scheduler_defaults_disabled_and_uses_explicit_operator_gate_mode() -> None:
     now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
     disabled = ConditionalAnalyticsScheduler(
-        fire_artifact_id="fire-v7",
-        weapon_artifact_id="weapon-v7",
-        verifier_artifact_id="weapon-verifier-v2",
         queue_capacity=4,
         verifier_queue_capacity=1,
     )
@@ -415,14 +526,9 @@ def test_conditional_scheduler_defaults_disabled_and_uses_explicit_operator_gate
     assert disabled.metrics().disabled_work_suppressed_total == 2
 
     operator = ConditionalAnalyticsScheduler(
-        fire_artifact_id="fire-v7",
-        weapon_artifact_id="weapon-v7",
-        verifier_artifact_id="weapon-verifier-v2",
         queue_capacity=4,
         verifier_queue_capacity=1,
-        fire_gate=_gate("fire-v7", "fire_smoke", "operator"),
-        weapon_gate=_gate("weapon-v7", "weapon", "operator"),
-        verifier_gate=_gate("weapon-verifier-v2", "weapon"),
+        **_scheduler_deployments(operator=True),
     )
     operator.schedule_due(camera_id="camera-01", source_time=now, person_rois=())
     assert [item.gate_mode for item in operator.drain("fire_smoke", limit=5)] == [
@@ -433,17 +539,109 @@ def test_conditional_scheduler_defaults_disabled_and_uses_explicit_operator_gate
     ]
 
 
+def test_caller_constructed_wrong_site_and_registry_gate_cannot_schedule_operator_work() -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    entry = _entry("fire_smoke")
+    wrong_site_matrix = _matrix(entry).model_copy(update={"site_id": "wrong-site"})
+    deployment = ConditionalDeploymentV1(
+        entry=entry,
+        site_matrix=wrong_site_matrix,
+        shadow_stage=_shadow(entry),
+        capacity_report=_capacity(entry),
+        expected_workload=_workload(entry),
+        verification_boundary="human_confirmation",
+    )
+    scheduler = ConditionalAnalyticsScheduler(
+        queue_capacity=4,
+        verifier_queue_capacity=1,
+        fire_deployment=deployment,
+    )
+
+    scheduler.schedule_due(camera_id="camera-01", source_time=now, person_rois=())
+
+    assert scheduler.drain("fire_smoke", limit=5) == ()
+
+
+def test_conditional_work_preserves_site_registry_engine_runtime_and_decision_bindings() -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    fire_entry = _entry("fire_smoke")
+    scheduler = ConditionalAnalyticsScheduler(
+        queue_capacity=4,
+        verifier_queue_capacity=1,
+        fire_deployment=_deployment(fire_entry, operator=True),
+    )
+    scheduler.schedule_due(camera_id="camera-01", source_time=now, person_rois=())
+
+    item = scheduler.drain("fire_smoke", limit=1)[0]
+    assert item.site_id == "school-01"
+    assert item.site_config_sha256 == _workload(fire_entry).site_config_sha256
+    assert item.registry_entry_sha256 == fire_entry.registry_entry_sha256
+    assert item.artifact_sha256 == fire_entry.artifact_sha256
+    assert item.engine_sha256 == fire_entry.engine.engine_sha256
+    assert item.target_gpu_architecture == "NVIDIA L4 (Ada)"
+    assert item.target_compute_capability == "8.9"
+    assert item.tensorrt_version == "10.16.0.72"
+    assert item.decision_sha256
+
+
+def test_scheduler_disables_deployments_from_a_different_site_configuration() -> None:
+    fire_entry = _entry("fire_smoke")
+    weapon_entry = _entry("weapon").model_copy(update={"site_id": "another-school"})
+    wrong_site_workload = _workload(_entry("weapon")).model_copy(
+        update={"site_id": "another-school", "site_config_sha256": "9" * 64}
+    )
+    scheduler = ConditionalAnalyticsScheduler(
+        queue_capacity=4,
+        verifier_queue_capacity=1,
+        fire_deployment=_deployment(fire_entry),
+        weapon_deployment=ConditionalDeploymentV1(
+            entry=weapon_entry,
+            expected_workload=wrong_site_workload,
+            verification_boundary="human_confirmation",
+        ),
+    )
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+
+    scheduler.schedule_due(camera_id="camera-01", source_time=now, person_rois=())
+
+    assert len(scheduler.drain("fire_smoke", limit=2)) == 1
+    assert scheduler.drain("weapon", limit=2) == ()
+
+
+def test_verifier_queue_requires_the_bounded_shadow_verification_boundary() -> None:
+    weapon_entry = _entry("weapon")
+    verifier_entry = _verifier_entry()
+    scheduler = ConditionalAnalyticsScheduler(
+        queue_capacity=4,
+        verifier_queue_capacity=1,
+        weapon_deployment=_deployment(weapon_entry),
+        verifier_deployment=_deployment(
+            verifier_entry,
+            verification_boundary="human_confirmation",
+        ),
+    )
+
+    accepted = scheduler.submit_verifier(
+        VerifierCandidateV1(
+            candidate_id="strong",
+            camera_id="camera-01",
+            source_time=datetime(2026, 7, 29, 12, 0, tzinfo=UTC),
+            confidence=0.95,
+            roi=(0.1, 0.1, 0.4, 0.5),
+            detector_artifact_id=weapon_entry.artifact_id,
+        )
+    )
+
+    assert accepted is False
+    assert scheduler.drain_verifier(limit=1) == ()
+
+
 def test_heavy_verifier_accepts_only_strong_candidates_and_drops_overflow_observably() -> None:
     scheduler = ConditionalAnalyticsScheduler(
-        fire_artifact_id="fire-v7",
-        weapon_artifact_id="weapon-v7",
-        verifier_artifact_id="weapon-verifier-v2",
         queue_capacity=2,
         verifier_queue_capacity=1,
         verifier_trigger_confidence=0.8,
-        fire_gate=_gate("fire-v7", "fire_smoke"),
-        weapon_gate=_gate("weapon-v7", "weapon"),
-        verifier_gate=_gate("weapon-verifier-v2", "weapon"),
+        **_scheduler_deployments(),
     )
     now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 
@@ -455,7 +653,7 @@ def test_heavy_verifier_accepts_only_strong_candidates_and_drops_overflow_observ
                 source_time=now,
                 confidence=0.79,
                 roi=(0.1, 0.1, 0.4, 0.5),
-                detector_artifact_id="weapon-v7",
+                detector_artifact_id="weapon-artifact-v7",
             )
         )
         is False
@@ -468,7 +666,7 @@ def test_heavy_verifier_accepts_only_strong_candidates_and_drops_overflow_observ
                 source_time=now,
                 confidence=0.9,
                 roi=(0.1, 0.1, 0.4, 0.5),
-                detector_artifact_id="weapon-v7",
+                detector_artifact_id="weapon-artifact-v7",
             )
         )
         is True
@@ -481,7 +679,7 @@ def test_heavy_verifier_accepts_only_strong_candidates_and_drops_overflow_observ
                 source_time=now,
                 confidence=0.95,
                 roi=(0.2, 0.2, 0.5, 0.6),
-                detector_artifact_id="weapon-v7",
+                detector_artifact_id="weapon-artifact-v7",
             )
         )
         is False
@@ -490,20 +688,35 @@ def test_heavy_verifier_accepts_only_strong_candidates_and_drops_overflow_observ
     metrics = scheduler.metrics()
     assert metrics.verifier_weak_suppressed_total == 1
     assert metrics.verifier_overflow_dropped_total == 1
-    assert [item.candidate_id for item in scheduler.drain_verifier(limit=5)] == ["strong-1"]
+    verifier_work = scheduler.drain_verifier(limit=5)
+    assert [item.candidate_id for item in verifier_work] == ["strong-1"]
+    assert verifier_work[0].site_id == "school-01"
+    assert (
+        verifier_work[0].detector_registry_entry_sha256
+        == _entry("weapon").registry_entry_sha256
+    )
+    assert (
+        verifier_work[0].verifier_registry_entry_sha256
+        == _verifier_entry().registry_entry_sha256
+    )
+    assert (
+        verifier_work[0].detector_expected_workload_sha256
+        == _workload(_entry("weapon")).expected_workload_sha256
+    )
+    assert (
+        verifier_work[0].verifier_expected_workload_sha256
+        == _workload(_verifier_entry()).expected_workload_sha256
+    )
+    assert verifier_work[0].verification_boundary == "bounded_shadow_verifier"
+    assert verifier_work[0].gate_mode == "shadow"
 
 
 def test_scheduler_rejects_regressing_source_time_and_bounds_camera_state() -> None:
     scheduler = ConditionalAnalyticsScheduler(
-        fire_artifact_id="fire-v7",
-        weapon_artifact_id="weapon-v7",
-        verifier_artifact_id="weapon-verifier-v2",
         queue_capacity=10,
         verifier_queue_capacity=1,
         max_camera_states=2,
-        fire_gate=_gate("fire-v7", "fire_smoke"),
-        weapon_gate=_gate("weapon-v7", "weapon"),
-        verifier_gate=_gate("weapon-verifier-v2", "weapon"),
+        **_scheduler_deployments(),
     )
     now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 
@@ -527,15 +740,10 @@ def test_scheduler_rejects_regressing_source_time_and_bounds_camera_state() -> N
 
 def test_weapon_roi_fanout_is_finite_and_excess_work_is_counted() -> None:
     scheduler = ConditionalAnalyticsScheduler(
-        fire_artifact_id="fire-v7",
-        weapon_artifact_id="weapon-v7",
-        verifier_artifact_id="weapon-verifier-v2",
         queue_capacity=10,
         verifier_queue_capacity=1,
-        fire_gate=_gate("fire-v7", "fire_smoke"),
-        weapon_gate=_gate("weapon-v7", "weapon"),
-        verifier_gate=_gate("weapon-verifier-v2", "weapon"),
         max_person_rois_per_sample=2,
+        **_scheduler_deployments(),
     )
     now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
     rois = (
@@ -552,16 +760,11 @@ def test_weapon_roi_fanout_is_finite_and_excess_work_is_counted() -> None:
 
 def test_fight_and_fall_shadow_work_use_separate_artifacts_and_bounded_queues() -> None:
     scheduler = ConditionalAnalyticsScheduler(
-        fire_artifact_id="fire-v7",
-        weapon_artifact_id="weapon-v7",
-        verifier_artifact_id="weapon-verifier-v2",
         queue_capacity=2,
         verifier_queue_capacity=1,
-        fire_gate=_gate("fire-v7", "fire_smoke"),
-        weapon_gate=_gate("weapon-v7", "weapon"),
-        verifier_gate=_gate("weapon-verifier-v2", "weapon"),
         shadow_artifacts={"fight": "fight-x3d-shadow-v1", "fall": "fall-tao-shadow-v3"},
         shadow_queue_capacity=1,
+        **_scheduler_deployments(),
     )
     now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 
@@ -584,33 +787,66 @@ def test_fight_and_fall_shadow_work_use_separate_artifacts_and_bounded_queues() 
 
     with pytest.raises(ValueError, match="separate artifact"):
         ConditionalAnalyticsScheduler(
-            fire_artifact_id="fire-v7",
-            weapon_artifact_id="weapon-v7",
-            verifier_artifact_id="weapon-verifier-v2",
             queue_capacity=2,
             verifier_queue_capacity=1,
-            fire_gate=_gate("fire-v7", "fire_smoke"),
-            weapon_gate=_gate("weapon-v7", "weapon"),
-            verifier_gate=_gate("weapon-verifier-v2", "weapon"),
-            shadow_artifacts={"fight": "weapon-v7"},
+            shadow_artifacts={"fight": "weapon-artifact-v7"},
+            **_scheduler_deployments(),
         )
 
-    with pytest.raises(ValueError, match="gate binding"):
+    with pytest.raises(ValueError, match="deployment module"):
         ConditionalAnalyticsScheduler(
-            fire_artifact_id="fire-v7",
-            weapon_artifact_id="weapon-v7",
-            verifier_artifact_id="weapon-verifier-v2",
             queue_capacity=2,
             verifier_queue_capacity=1,
-            fire_gate=_gate("another-fire", "fire_smoke"),
+            fire_deployment=_deployment(_entry("weapon")),
         )
 
 
 def test_capacity_report_binds_a_frozen_workload_hash_not_a_gpu_coefficient() -> None:
     entry = _entry()
     report = _capacity(entry)
+    workload = _workload(entry)
 
     payload = report.model_dump(mode="json")
     assert payload["frozen_workload_sha256"] == "5" * 64
+    assert payload["site_config_sha256"] == "8" * 64
+    assert payload["expected_workload_sha256"] == workload.expected_workload_sha256
+    assert workload.required_throughput_hz == 20.0
+    assert len({camera.camera_id for camera in workload.cameras}) == 20
     assert "cameras_per_gpu" not in payload
     assert hashlib.sha256(b"twenty-feed-frozen-workload").hexdigest() != ""
+
+
+def test_expected_weapon_throughput_includes_frozen_roi_inference_fanout() -> None:
+    entry = _entry("weapon")
+    workload = ExpectedConditionalWorkloadV1(
+        schema_version="expected-conditional-workload.v1",
+        site_id=entry.site_id,
+        module="weapon",
+        site_config_sha256="8" * 64,
+        frozen_workload_sha256="5" * 64,
+        cameras=tuple(
+            CameraAnalyticScheduleV1(
+                camera_id=f"camera-{index:02d}",
+                analytics_hz=1.0,
+                inferences_per_sample=3,
+            )
+            for index in range(1, 21)
+        ),
+    )
+
+    assert workload.required_throughput_hz == 60.0
+
+
+def test_signed_report_references_reject_query_fragment_and_control_characters() -> None:
+    entry = _entry()
+
+    with pytest.raises(ValidationError, match="credential-free"):
+        SignedSiteMatrixV1.model_validate(
+            _matrix(entry).model_dump()
+            | {"report_reference": "https://reports.example.kz/site.json?token=secret"}
+        )
+    with pytest.raises(ValidationError, match="credential-free"):
+        MeasuredCapacityReportV1.model_validate(
+            _capacity(entry).model_dump()
+            | {"report_reference": "reports/capacity/result.json#signed-secret"}
+        )

@@ -1,8 +1,11 @@
 """Fail-closed, evidence-based promotion decisions for conditional analytics."""
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Protocol
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
@@ -13,12 +16,43 @@ _OPERATOR_ELIGIBLE_ANALYTICS = frozenset(
     {"person", "zone", "loitering", "line_crossing", "weapon", "fire_smoke"}
 )
 _SHADOW_ONLY_ANALYTICS = frozenset({"violence", "xclip", "vit", "fight", "fall"})
+PILOT_TARGET_GPU_ARCHITECTURE = "NVIDIA L4 (Ada)"
+PILOT_TARGET_COMPUTE_CAPABILITY = "8.9"
+PILOT_TENSORRT_VERSION = "10.16.0.72"
+_HEX = frozenset("0123456789abcdef")
 
 
 def _require_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("signed_at must be UTC-aware")
     return value.astimezone(timezone.utc)
+
+
+def _digest(value: str, *, field_name: str) -> str:
+    normalized = value.lower()
+    if len(normalized) != 64 or any(character not in _HEX for character in normalized):
+        raise ValueError(f"{field_name} must be a 64-character hexadecimal digest")
+    return normalized
+
+
+def validate_credential_free_reference(value: str) -> str:
+    """Accept canonical opaque references while refusing embedded access material."""
+
+    if value != value.strip() or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("reference must be canonical and credential-free")
+    if any(encoded in value.lower() for encoded in ("%3f", "%23", "%40", "%0a", "%0d")):
+        raise ValueError("reference must be canonical and credential-free")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError("reference must be canonical and credential-free") from exc
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("reference must be canonical and credential-free")
+    if parsed.query or parsed.fragment:
+        raise ValueError("reference must be canonical and credential-free")
+    if parsed.scheme and parsed.scheme != parsed.scheme.lower():
+        raise ValueError("reference must be canonical and credential-free")
+    return value
 
 
 class CommercialRightsRecordV1(FrozenModel):
@@ -75,6 +109,11 @@ class AuditedReportV1(FrozenModel):
     @classmethod
     def signed_at_is_utc(cls, value: datetime) -> datetime:
         return _require_utc(value)
+
+    @field_validator("report_reference")
+    @classmethod
+    def report_reference_is_credential_free(cls, value: str) -> str:
+        return validate_credential_free_reference(value)
 
 
 class TargetSiteReportV1(AuditedReportV1):
@@ -174,7 +213,9 @@ class MeasuredCapacityReportV1(AuditedReportV1):
     target_gpu_architecture: NonEmptyString
     target_compute_capability: NonEmptyString
     tensorrt_version: NonEmptyString
+    site_config_sha256: str
     frozen_workload_sha256: str
+    expected_workload_sha256: str
     stream_count: Annotated[int, Field(ge=1)]
     effective_throughput_hz: Annotated[float, Field(gt=0)]
     required_throughput_hz: Annotated[float, Field(gt=0)]
@@ -188,13 +229,69 @@ class MeasuredCapacityReportV1(AuditedReportV1):
         "artifact_sha256",
         "registry_entry_sha256",
         "engine_sha256",
+        "site_config_sha256",
         "frozen_workload_sha256",
+        "expected_workload_sha256",
     )
     @classmethod
     def hashes_are_digests(cls, value: str) -> str:
         if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
             raise ValueError("capacity hashes must be 64-character hexadecimal digests")
         return value.lower()
+
+
+class CameraAnalyticScheduleV1(FrozenModel):
+    """One named camera's approved schedule for a single conditional module."""
+
+    camera_id: NonEmptyString
+    analytics_hz: Annotated[float, Field(gt=0, le=2)]
+    inferences_per_sample: Annotated[int, Field(ge=1, le=256)]
+
+
+class ExpectedConditionalWorkloadV1(FrozenModel):
+    """Canonical site-owned workload used independently of measured capacity."""
+
+    schema_version: Literal["expected-conditional-workload.v1"]
+    site_id: NonEmptyString
+    module: Literal["fire_smoke", "weapon"]
+    site_config_sha256: str
+    frozen_workload_sha256: str
+    cameras: Annotated[
+        tuple[CameraAnalyticScheduleV1, ...],
+        Field(min_length=20, max_length=20),
+    ]
+
+    @field_validator("site_config_sha256", "frozen_workload_sha256")
+    @classmethod
+    def hashes_are_digests(cls, value: str) -> str:
+        return _digest(value, field_name="expected workload hash")
+
+    @model_validator(mode="after")
+    def camera_identities_are_unique(self) -> ExpectedConditionalWorkloadV1:
+        camera_ids = tuple(camera.camera_id for camera in self.cameras)
+        if len(camera_ids) != len(set(camera_ids)):
+            raise ValueError("expected workload camera IDs must be unique")
+        if self.module == "fire_smoke" and any(
+            camera.inferences_per_sample != 1 for camera in self.cameras
+        ):
+            raise ValueError("fire workload must use one full-frame inference per sample")
+        return self
+
+    @property
+    def required_throughput_hz(self) -> float:
+        return sum(
+            camera.analytics_hz * camera.inferences_per_sample
+            for camera in self.cameras
+        )
+
+    @property
+    def expected_workload_sha256(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 class ConditionalArtifactEvidence(Protocol):
@@ -241,6 +338,15 @@ class ConditionalModelGateResultV1(ModelGateResultV1):
         if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
             raise ValueError("registry_entry_sha256 must be a 64-character hexadecimal digest")
         return value.lower()
+
+    @property
+    def decision_sha256(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 class ModelGate:
@@ -401,6 +507,7 @@ class ModelGate:
         site_matrix: SignedSiteMatrixV1 | None,
         shadow_stage: ShadowStageEvidenceV1 | None,
         capacity_report: MeasuredCapacityReportV1 | None,
+        expected_workload: ExpectedConditionalWorkloadV1 | None,
     ) -> ConditionalModelGateResultV1:
         """Evaluate conditional analytics through one staged, evidence-bound policy."""
 
@@ -429,6 +536,17 @@ class ModelGate:
         if artifact.module not in {"fire_smoke", "weapon"}:
             return decision(
                 "disabled", ("analytic is not approved for conditional promotion",)
+            )
+        engine = artifact.engine
+        if (
+            engine is None
+            or engine.target_gpu_architecture != PILOT_TARGET_GPU_ARCHITECTURE
+            or engine.target_compute_capability != PILOT_TARGET_COMPUTE_CAPABILITY
+            or engine.tensorrt_version != PILOT_TENSORRT_VERSION
+        ):
+            return decision(
+                "disabled",
+                ("engine does not match the exact NVIDIA L4 pilot target",),
             )
 
         if site_matrix is not None and (
@@ -461,6 +579,24 @@ class ModelGate:
             or capacity_report.tensorrt_version != artifact.engine.tensorrt_version
         ):
             return decision("disabled", ("capacity report binding mismatch",))
+        if expected_workload is not None and (
+            expected_workload.site_id != artifact.site_id
+            or expected_workload.module != artifact.module
+        ):
+            return decision("disabled", ("expected workload binding mismatch",))
+        if (
+            capacity_report is not None
+            and expected_workload is not None
+            and (
+                capacity_report.site_config_sha256
+                != expected_workload.site_config_sha256
+                or capacity_report.frozen_workload_sha256
+                != expected_workload.frozen_workload_sha256
+                or capacity_report.expected_workload_sha256
+                != expected_workload.expected_workload_sha256
+            )
+        ):
+            return decision("disabled", ("capacity report workload binding mismatch",))
 
         reasons: list[str] = []
         if site_matrix is None:
@@ -479,20 +615,41 @@ class ModelGate:
 
         if capacity_report is None:
             reasons.append("missing measured capacity report")
+        elif expected_workload is None:
+            reasons.append("missing configured site workload")
         else:
-            reasons.extend(ModelGate._capacity_reasons(capacity_report))
+            reasons.extend(
+                ModelGate._capacity_reasons(
+                    capacity_report,
+                    expected_workload=expected_workload,
+                )
+            )
 
         if reasons:
             return decision("shadow", tuple(reasons))
         return decision("operator", ())
 
     @staticmethod
-    def _capacity_reasons(report: MeasuredCapacityReportV1) -> tuple[str, ...]:
+    def _capacity_reasons(
+        report: MeasuredCapacityReportV1,
+        *,
+        expected_workload: ExpectedConditionalWorkloadV1,
+    ) -> tuple[str, ...]:
         reasons: list[str] = []
         if not report.passed:
             reasons.append("measured capacity report did not pass")
         if report.stream_count != 20:
             reasons.append("capacity report must cover exactly 20 streams")
+        if (
+            abs(
+                report.required_throughput_hz
+                - expected_workload.required_throughput_hz
+            )
+            > 1e-9
+        ):
+            reasons.append(
+                "capacity required throughput does not match configured site workload"
+            )
         if report.effective_throughput_hz < report.required_throughput_hz * 1.25:
             reasons.append("measured throughput headroom is below 25%")
         if report.scheduled_drop_fraction >= 0.01:

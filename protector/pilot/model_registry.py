@@ -8,6 +8,7 @@ import os
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,18 +24,23 @@ from pydantic import Field, field_serializer, field_validator
 
 from protector.pilot.config import FrozenModel, NonEmptyString
 from protector.pilot.gates import (
+    PILOT_TARGET_COMPUTE_CAPABILITY,
+    PILOT_TARGET_GPU_ARCHITECTURE,
+    PILOT_TENSORRT_VERSION,
     ConditionalModelGateResultV1,
+    ExpectedConditionalWorkloadV1,
     MeasuredCapacityReportV1,
     ModelGate,
     ShadowStageEvidenceV1,
     SignedSiteMatrixV1,
     SiteMatrixSceneV1,
+    validate_credential_free_reference,
 )
 
 _HEX = frozenset("0123456789abcdef")
-_L4_ARCHITECTURE = "NVIDIA L4 (Ada)"
-_L4_COMPUTE_CAPABILITY = "8.9"
-_DEEPSTREAM_91_TENSORRT = "10.16.0.72"
+_L4_ARCHITECTURE = PILOT_TARGET_GPU_ARCHITECTURE
+_L4_COMPUTE_CAPABILITY = PILOT_TARGET_COMPUTE_CAPABILITY
+_DEEPSTREAM_91_TENSORRT = PILOT_TENSORRT_VERSION
 
 
 def _digest(value: str, *, field_name: str) -> str:
@@ -69,6 +75,11 @@ class CommercialRightsEvidenceV1(FrozenModel):
     @classmethod
     def approval_time_is_utc(cls, value: datetime | None) -> datetime | None:
         return None if value is None else _utc(value, field_name="approved_at")
+
+    @field_validator("evidence_reference")
+    @classmethod
+    def evidence_reference_is_credential_free(cls, value: str | None) -> str | None:
+        return None if value is None else validate_credential_free_reference(value)
 
 
 class EngineRecordV1(FrozenModel):
@@ -118,6 +129,15 @@ class ModelRegistryEntryV1(FrozenModel):
     @classmethod
     def artifact_hash_is_a_digest(cls, value: str | None) -> str | None:
         return None if value is None else _digest(value, field_name="artifact_sha256")
+
+    @field_validator(
+        "source_uri",
+        "training_provenance",
+        "evaluation_provenance",
+    )
+    @classmethod
+    def references_are_credential_free(cls, value: str | None) -> str | None:
+        return None if value is None else validate_credential_free_reference(value)
 
     @field_validator("classes")
     @classmethod
@@ -178,6 +198,11 @@ class CalibrationCorpusV1(FrozenModel):
     def corpus_hash_is_a_digest(cls, value: str) -> str:
         return _digest(value, field_name="calibration corpus sha256")
 
+    @field_validator("reference")
+    @classmethod
+    def reference_is_credential_free(cls, value: str) -> str:
+        return validate_credential_free_reference(value)
+
 
 class NoRegressionEventReportV1(FrozenModel):
     schema_version: Literal["no-regression-event-report.v1"]
@@ -213,6 +238,11 @@ class NoRegressionEventReportV1(FrozenModel):
     @classmethod
     def signature_time_is_utc(cls, value: datetime) -> datetime:
         return _utc(value, field_name="signed_at")
+
+    @field_validator("report_reference")
+    @classmethod
+    def report_reference_is_credential_free(cls, value: str) -> str:
+        return validate_credential_free_reference(value)
 
 
 class EngineBuildSpecV1(FrozenModel):
@@ -377,6 +407,7 @@ def evaluate_conditional_promotion(
     site_matrix: SignedSiteMatrixV1 | None,
     shadow_stage: ShadowStageEvidenceV1 | None,
     capacity_report: MeasuredCapacityReportV1 | None,
+    expected_workload: ExpectedConditionalWorkloadV1 | None,
 ) -> ConditionalModelGateResultV1:
     """Thin registry wrapper around the single policy authority in ``gates.py``."""
 
@@ -385,7 +416,25 @@ def evaluate_conditional_promotion(
         site_matrix=site_matrix,
         shadow_stage=shadow_stage,
         capacity_report=capacity_report,
+        expected_workload=expected_workload,
     )
+
+
+def _validate_build_binding(
+    entry: ModelRegistryEntryV1,
+    spec: EngineBuildSpecV1,
+) -> None:
+    engine = entry.engine
+    if engine is None:
+        raise EngineBuildError("registry engine target is required before export")
+    if engine.precision != spec.precision:
+        raise EngineBuildError("registry precision does not match build specification")
+    if (
+        engine.target_gpu_architecture != spec.target_gpu_architecture
+        or engine.target_compute_capability != spec.target_compute_capability
+        or engine.tensorrt_version != spec.tensorrt_version
+    ):
+        raise EngineBuildError("registry target identity does not match build specification")
 
 
 def _validate_int8_evidence(
@@ -413,6 +462,12 @@ def _validate_int8_evidence(
         or report.calibration_corpus_id != corpus.corpus_id
         or report.calibration_corpus_version != corpus.version
         or report.calibration_corpus_sha256 != corpus.sha256
+        or entry.engine is None
+        or entry.engine.calibration_corpus_sha256 != corpus.sha256
+        or entry.engine.no_regression_report_sha256 != report.report_sha256
+        or entry.engine.no_regression_candidate_engine_sha256
+        != report.candidate_engine_sha256
+        or entry.engine.engine_sha256 != report.candidate_engine_sha256
     ):
         raise EngineBuildError(
             "INT8 evidence does not match artifact, registry identity, and calibration corpus"
@@ -426,6 +481,7 @@ def build_engine(
     output_path: Path,
     build_spec: EngineBuildSpecV1,
     trtexec_path: Path,
+    calibration_path: Path | None = None,
     runtime_probe: Callable[[Path], TargetRuntimeIdentityV1] | None = None,
     timeout_seconds: float = 1_800,
     max_output_bytes: int = 1_000_000,
@@ -438,9 +494,13 @@ def build_engine(
     the central promotion gate.
     """
 
-    audit = audit_model_entry(entry, artifact_path)
-    if not audit.approved_for_export:
-        raise EngineBuildError("; ".join(audit.export_reasons))
+    preflight_reasons = ModelGate.conditional_artifact_reasons(
+        entry,
+        require_engine=False,
+    )
+    if preflight_reasons:
+        raise EngineBuildError("; ".join(preflight_reasons))
+    _validate_build_binding(entry, build_spec)
     _validate_int8_evidence(entry, build_spec)
     if timeout_seconds <= 0:
         raise EngineBuildError("export timeout must be positive")
@@ -448,88 +508,214 @@ def build_engine(
         raise EngineBuildError("export output limit must be positive")
     if max_engine_bytes <= 0:
         raise EngineBuildError("engine byte limit must be positive")
-    if not trtexec_path.is_file() or not os.access(trtexec_path, os.X_OK):
-        raise EngineBuildError("TensorRT trtexec executable is unavailable")
-    measured_runtime = (
-        probe_target_runtime(trtexec_path)
-        if runtime_probe is None
-        else runtime_probe(trtexec_path)
-    )
-    _require_target_compatibility(build_spec, measured_runtime)
-    if output_path.exists():
-        raise EngineBuildError("refusing to overwrite an existing engine")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".engine-build-", dir=output_path.parent) as temporary:
-        temporary_engine = Path(temporary) / output_path.name
-        argv = [
-            str(trtexec_path),
-            f"--onnx={artifact_path}",
-            f"--saveEngine={temporary_engine}",
-            "--skipInference",
-            "--fp16" if build_spec.precision == "fp16" else "--int8",
-        ]
-        launch_argv = [
-            sys.executable,
-            "-m",
-            "protector.pilot.runtime._limit_exec",
-            str(max_engine_bytes + 1),
-            "--",
-            *argv,
-        ]
-        return_code, exporter_output = _run_bounded(
-            launch_argv,
-            timeout_seconds=timeout_seconds,
-            max_output_bytes=max_output_bytes,
+    with tempfile.TemporaryDirectory(prefix=".model-inputs-") as input_staging:
+        staged_artifact = Path(input_staging) / "attested-model.onnx"
+        actual_artifact_sha256, _ = _stage_attested_file(
+            artifact_path,
+            staged_artifact,
+            label="model artifact",
         )
-        if temporary_engine.exists() and temporary_engine.stat().st_size > max_engine_bytes:
-            raise EngineBuildError("TensorRT exporter exceeded engine byte limit")
-        if return_code != 0:
-            raise EngineBuildError(f"TensorRT exporter exited with status {return_code}")
-        if not temporary_engine.is_file() or temporary_engine.stat().st_size <= 0:
-            raise EngineBuildError("TensorRT exporter did not produce an engine")
-        engine_sha256 = _sha256_file(temporary_engine)
-        if (
-            build_spec.precision == "int8"
-            and build_spec.no_regression_report is not None
-            and build_spec.no_regression_report.candidate_engine_sha256 != engine_sha256
-        ):
-            raise EngineBuildError(
-                "INT8 candidate engine does not match the no-regression event report"
-            )
-        with temporary_engine.open("rb") as engine:
-            os.fsync(engine.fileno())
-        try:
-            os.link(temporary_engine, output_path)
-        except FileExistsError as exc:
-            raise EngineBuildError("concurrent engine publication refused") from exc
-        _fsync_directory(output_path.parent)
+        if actual_artifact_sha256 != entry.artifact_sha256:
+            raise EngineBuildError("artifact sha256 mismatch")
 
-    assert entry.artifact_sha256 is not None
-    return EngineBuildResultV1(
-        artifact_id=entry.artifact_id,
-        artifact_sha256=entry.artifact_sha256,
-        engine_sha256=engine_sha256,
-        precision=build_spec.precision,
-        target_gpu_architecture=build_spec.target_gpu_architecture,
-        target_compute_capability=build_spec.target_compute_capability,
-        tensorrt_version=build_spec.tensorrt_version,
-        observed_tensorrt_runtime_version=measured_runtime.tensorrt_runtime_version,
-        raw_tensorrt_banner=measured_runtime.raw_tensorrt_banner,
-        argv=tuple(argv),
-        exporter_output=exporter_output,
-        registry_record=_audit_record(entry),
-        calibration_corpus_sha256=(
-            build_spec.calibration_corpus.sha256
-            if build_spec.calibration_corpus is not None
-            else None
-        ),
-        no_regression_report_sha256=(
-            build_spec.no_regression_report.report_sha256
-            if build_spec.no_regression_report is not None
-            else None
-        ),
-    )
+        staged_calibration: Path | None = None
+        if build_spec.precision == "int8":
+            if calibration_path is None:
+                raise EngineBuildError(
+                    "INT8 requires exact local calibration cache bytes"
+                )
+            assert build_spec.calibration_corpus is not None
+            staged_calibration = Path(input_staging) / "attested-calibration.cache"
+            calibration_sha256, _ = _stage_attested_file(
+                calibration_path,
+                staged_calibration,
+                label="calibration cache",
+            )
+            if calibration_sha256 != build_spec.calibration_corpus.sha256:
+                raise EngineBuildError("calibration cache sha256 mismatch")
+
+        if not trtexec_path.is_file() or not os.access(trtexec_path, os.X_OK):
+            raise EngineBuildError("TensorRT trtexec executable is unavailable")
+        measured_runtime = (
+            probe_target_runtime(trtexec_path)
+            if runtime_probe is None
+            else runtime_probe(trtexec_path)
+        )
+        _require_target_compatibility(build_spec, measured_runtime)
+        if output_path.exists():
+            raise EngineBuildError("refusing to overwrite an existing engine")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".engine-build-",
+            dir=output_path.parent,
+        ) as temporary:
+            temporary_directory = Path(temporary)
+            temporary_engine = temporary_directory / "exporter-output.engine"
+            private_publication = temporary_directory / "publication.engine"
+            argv = [
+                str(trtexec_path),
+                f"--onnx={staged_artifact}",
+                f"--saveEngine={temporary_engine}",
+                "--skipInference",
+                "--fp16" if build_spec.precision == "fp16" else "--int8",
+            ]
+            if staged_calibration is not None:
+                argv.append(f"--calib={staged_calibration}")
+            launch_argv = [
+                sys.executable,
+                "-m",
+                "protector.pilot.runtime._limit_exec",
+                str(max_engine_bytes + 1),
+                "--",
+                *argv,
+            ]
+            return_code, exporter_output = _run_bounded(
+                launch_argv,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+            )
+            try:
+                exporter_output_stat = os.lstat(temporary_engine)
+            except FileNotFoundError:
+                exporter_output_stat = None
+            if (
+                exporter_output_stat is not None
+                and stat.S_ISREG(exporter_output_stat.st_mode)
+                and exporter_output_stat.st_size > max_engine_bytes
+            ):
+                raise EngineBuildError(
+                    "TensorRT exporter exceeded engine byte limit"
+                )
+            if return_code != 0:
+                raise EngineBuildError(
+                    f"TensorRT exporter exited with status {return_code}"
+                )
+            if not os.path.lexists(temporary_engine):
+                raise EngineBuildError(
+                    "TensorRT exporter did not produce an engine"
+                )
+            engine_sha256, engine_size = _stage_attested_file(
+                temporary_engine,
+                private_publication,
+                label="TensorRT exporter output",
+                max_bytes=max_engine_bytes,
+            )
+            if engine_size <= 0:
+                raise EngineBuildError("TensorRT exporter did not produce an engine")
+            if (
+                build_spec.precision == "int8"
+                and build_spec.no_regression_report is not None
+                and build_spec.no_regression_report.candidate_engine_sha256
+                != engine_sha256
+            ):
+                raise EngineBuildError(
+                    "INT8 candidate engine does not match the no-regression event report"
+                )
+            os.chmod(private_publication, 0o444)
+
+            assert entry.artifact_sha256 is not None
+            result = EngineBuildResultV1(
+                artifact_id=entry.artifact_id,
+                artifact_sha256=entry.artifact_sha256,
+                engine_sha256=engine_sha256,
+                precision=build_spec.precision,
+                target_gpu_architecture=build_spec.target_gpu_architecture,
+                target_compute_capability=build_spec.target_compute_capability,
+                tensorrt_version=build_spec.tensorrt_version,
+                observed_tensorrt_runtime_version=(
+                    measured_runtime.tensorrt_runtime_version
+                ),
+                raw_tensorrt_banner=measured_runtime.raw_tensorrt_banner,
+                argv=tuple(argv),
+                exporter_output=exporter_output,
+                registry_record=_audit_record(entry),
+                calibration_corpus_sha256=(
+                    build_spec.calibration_corpus.sha256
+                    if build_spec.calibration_corpus is not None
+                    else None
+                ),
+                no_regression_report_sha256=(
+                    build_spec.no_regression_report.report_sha256
+                    if build_spec.no_regression_report is not None
+                    else None
+                ),
+            )
+            _publish_engine(private_publication, output_path)
+            return result
+
+
+def _stage_attested_file(
+    source: Path,
+    destination: Path,
+    *,
+    label: str,
+    max_bytes: int | None = None,
+) -> tuple[str, int]:
+    """Copy one opened regular inode into a private file while hashing its bytes."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise EngineBuildError(f"{label} must be an available regular file") from exc
+    try:
+        source_stat = os.fstat(source_descriptor)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise EngineBuildError(f"{label} must be an available regular file")
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o400,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            while chunk := os.read(source_descriptor, 1_048_576):
+                copied += len(chunk)
+                if max_bytes is not None and copied > max_bytes:
+                    raise EngineBuildError(
+                        "TensorRT exporter exceeded engine byte limit"
+                    )
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_descriptor, view)
+                    view = view[written:]
+            os.fsync(destination_descriptor)
+        except BaseException:
+            os.close(destination_descriptor)
+            destination.unlink(missing_ok=True)
+            raise
+        else:
+            os.close(destination_descriptor)
+        return digest.hexdigest(), copied
+    finally:
+        os.close(source_descriptor)
+
+
+def _publish_engine(private_publication: Path, output_path: Path) -> None:
+    """No-clobber publish with compensating durable cleanup on fsync failure."""
+
+    published = False
+    try:
+        os.link(private_publication, output_path)
+        published = True
+        _fsync_directory(output_path.parent)
+    except FileExistsError as exc:
+        raise EngineBuildError("concurrent engine publication refused") from exc
+    except OSError as exc:
+        if published:
+            try:
+                output_path.unlink(missing_ok=True)
+            finally:
+                try:
+                    _fsync_directory(output_path.parent)
+                except OSError:
+                    pass
+        raise EngineBuildError(
+            "engine publication durability failed; destination was removed"
+        ) from exc
 
 
 def _require_target_compatibility(
@@ -674,8 +860,7 @@ def _run_bounded(
     finally:
         selector.close()
         process.stdout.close()
-        if process.poll() is None:
-            _kill_process_group(process)
+        _kill_process_group(process)
     return return_code, captured.decode("utf-8", errors="replace")
 
 

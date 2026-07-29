@@ -30,6 +30,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        help="Exact local INT8 calibration cache; required for INT8 builds.",
+    )
     parser.add_argument("--engine", type=Path, required=True)
     parser.add_argument(
         "--trtexec",
@@ -71,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
             output_path=arguments.engine,
             build_spec=spec,
             trtexec_path=arguments.trtexec,
+            calibration_path=arguments.calibration,
             timeout_seconds=arguments.timeout_seconds,
             max_output_bytes=arguments.max_output_bytes,
             max_engine_bytes=arguments.max_engine_bytes,
