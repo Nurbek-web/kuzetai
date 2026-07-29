@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 import threading
+import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -20,13 +21,20 @@ from protector.pilot.domain import (
     NormalisedBoundingBox,
     ObservationV1,
 )
-from protector.pilot.storage.journal import JournalFullError
+from protector.pilot.storage.journal import (
+    JournalFullError,
+    is_retryable_database_error,
+)
 from protector.pilot.storage.repositories import EvidenceInput, EvidenceIntent
 
 UTC = timezone.utc
 _EVENT_NAMESPACE = uuid5(NAMESPACE_URL, "kuzet-ai/pilot/candidate-event/v1")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _MAX_FRAGMENT_BOUNDARY_TOLERANCE_SECONDS = 2.0
+
+
+class _RetryablePendingEvidenceError(RuntimeError):
+    """A valid finite lifecycle row must remain live until control-plane recovery."""
 
 
 def _utc(value: datetime, *, field: str) -> datetime:
@@ -872,6 +880,9 @@ class SiteEventStatus:
     journal_quarantine_depth: int
     processing_claims: int
     pending_evidence_work: int
+    pending_evidence_memory_work: int
+    pending_evidence_retry_attempts: int
+    pending_evidence_next_retry_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -879,6 +890,117 @@ class SiteEventResult:
     engine_result: EngineIngestResult | None
     durable_candidates: tuple[DurableCandidate, ...]
     status: SiteEventStatus
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingEvidenceSeed:
+    """Finite recovery identity persisted before candidate replay may ACK."""
+
+    trigger: CandidateTrigger
+    reservation_id: str
+    event_at: datetime
+    target_start_at: datetime
+    target_end_at: datetime
+    expires_at: datetime
+    source_reference: str
+    pre_roll_seconds: float
+    post_roll_seconds: float
+    pending_timeout_seconds: float
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": "pending-evidence-seed.v1",
+            "trigger": {
+                "event": self.trigger.event.model_dump(mode="json"),
+                "stream_epoch": str(self.trigger.stream_epoch),
+                "track_id": self.trigger.track_id,
+                "rule_id": self.trigger.rule_id,
+            },
+            "reservation_id": self.reservation_id,
+            "event_at": self.event_at.isoformat(),
+            "target_start_at": self.target_start_at.isoformat(),
+            "target_end_at": self.target_end_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+            "source_reference": self.source_reference,
+            "pre_roll_seconds": self.pre_roll_seconds,
+            "post_roll_seconds": self.post_roll_seconds,
+            "pending_timeout_seconds": self.pending_timeout_seconds,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> _PendingEvidenceSeed:
+        expected_fields = {
+            "schema_version",
+            "trigger",
+            "reservation_id",
+            "event_at",
+            "target_start_at",
+            "target_end_at",
+            "expires_at",
+            "source_reference",
+            "pre_roll_seconds",
+            "post_roll_seconds",
+            "pending_timeout_seconds",
+        }
+        if (
+            set(payload) != expected_fields
+            or payload.get("schema_version") != "pending-evidence-seed.v1"
+        ):
+            raise ValueError("pending evidence seed schema is invalid")
+        trigger_payload = payload["trigger"]
+        if not isinstance(trigger_payload, dict) or set(trigger_payload) != {
+            "event",
+            "stream_epoch",
+            "track_id",
+            "rule_id",
+        }:
+            raise ValueError("pending evidence seed trigger identity is invalid")
+        trigger = CandidateTrigger(
+            event=CandidateEventV1.model_validate(trigger_payload["event"]),
+            stream_epoch=UUID(trigger_payload["stream_epoch"]),
+            track_id=trigger_payload["track_id"],
+            rule_id=trigger_payload["rule_id"],
+        )
+        seed = cls(
+            trigger=trigger,
+            reservation_id=payload["reservation_id"],
+            event_at=_utc(
+                datetime.fromisoformat(payload["event_at"]),
+                field="pending seed event_at",
+            ),
+            target_start_at=_utc(
+                datetime.fromisoformat(payload["target_start_at"]),
+                field="pending seed target_start_at",
+            ),
+            target_end_at=_utc(
+                datetime.fromisoformat(payload["target_end_at"]),
+                field="pending seed target_end_at",
+            ),
+            expires_at=_utc(
+                datetime.fromisoformat(payload["expires_at"]),
+                field="pending seed expires_at",
+            ),
+            source_reference=payload["source_reference"],
+            pre_roll_seconds=float(payload["pre_roll_seconds"]),
+            post_roll_seconds=float(payload["post_roll_seconds"]),
+            pending_timeout_seconds=float(payload["pending_timeout_seconds"]),
+        )
+        if (
+            seed.reservation_id != f"event-{trigger.event.event_id}"
+            or seed.event_at != trigger.event.last_seen_at
+            or seed.target_start_at
+            != seed.event_at - timedelta(seconds=seed.pre_roll_seconds)
+            or seed.target_end_at
+            != seed.event_at + timedelta(seconds=seed.post_roll_seconds)
+            or seed.expires_at
+            != seed.target_end_at
+            + timedelta(seconds=seed.pending_timeout_seconds)
+            or not 4.0 <= seed.pre_roll_seconds + seed.post_roll_seconds <= 10.0
+            or not math.isfinite(seed.pending_timeout_seconds)
+            or seed.pending_timeout_seconds <= 0
+        ):
+            raise ValueError("pending evidence seed identity is inconsistent")
+        return seed
 
 
 @dataclass(frozen=True, slots=True)
@@ -977,7 +1099,16 @@ class SiteEventService:
         mark_evidence_pending: Callable[[UUID], CandidateEventV1],
         mark_evidence_failed: Callable[[UUID], CandidateEventV1],
         evidence_policy: EvidencePolicy,
+        pending_recovery_backoff_seconds: float = 1.0,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
+        if (
+            not math.isfinite(pending_recovery_backoff_seconds)
+            or pending_recovery_backoff_seconds <= 0
+        ):
+            raise ValueError(
+                "pending recovery backoff must be finite and positive"
+            )
         self.engine = engine
         self._journal = journal
         self._replay_worker = replay_worker
@@ -994,6 +1125,10 @@ class SiteEventService:
         self._completed: OrderedDict[UUID, None] = OrderedDict()
         self._pending_work: OrderedDict[UUID, _PendingEvidenceWork] = OrderedDict()
         self._pending_processing: set[UUID] = set()
+        self._pending_recovery_backoff_seconds = pending_recovery_backoff_seconds
+        self._monotonic = monotonic_clock or time.monotonic
+        self._pending_recovery_attempts = 0
+        self._pending_retry_at: float | None = None
 
     @property
     def status(self) -> SiteEventStatus:
@@ -1033,7 +1168,23 @@ class SiteEventService:
                 reasons = list(self._reasons)
         with self._state_lock:
             processing_claims = len(self._processing)
-            pending_evidence_work = len(self._pending_work)
+            pending_evidence_memory_work = len(self._pending_work)
+            retry_attempts = self._pending_recovery_attempts
+            retry_at = self._pending_retry_at
+        try:
+            pending_evidence_work = int(
+                self._journal.pending_evidence_work_depth()
+            )
+        except AttributeError:
+            pending_evidence_work = pending_evidence_memory_work
+        except Exception:
+            pending_evidence_work = -1
+            self._degrade("pending_evidence_depth_failed")
+        next_retry = (
+            None
+            if retry_at is None
+            else max(0.0, retry_at - self._monotonic())
+        )
         return SiteEventStatus(
             degraded=bool(reasons) or replay_degraded,
             reasons=tuple(reasons),
@@ -1041,14 +1192,19 @@ class SiteEventService:
             journal_quarantine_depth=quarantine_depth,
             processing_claims=processing_claims,
             pending_evidence_work=pending_evidence_work,
+            pending_evidence_memory_work=pending_evidence_memory_work,
+            pending_evidence_retry_attempts=retry_attempts,
+            pending_evidence_next_retry_seconds=next_retry,
         )
 
     def start(self) -> SiteEventStatus:
         try:
-            self._replay_worker.startup_drain()
+            self._run_candidate_safe_replay(startup=True)
         except Exception:
             self._degrade("journal_startup_replay_failed")
+            self._schedule_pending_evidence_recovery()
         self._recover_pending_evidence_work()
+        self._reconcile_terminal_memory_without_rows()
         return self.status
 
     def process(self, observation: ObservationV1) -> SiteEventResult:
@@ -1063,6 +1219,7 @@ class SiteEventService:
         stream_epoch: UUID,
         source_time: datetime,
     ) -> SiteEventResult:
+        self._retry_pending_evidence_recovery()
         triggers = self.engine.advance(
             camera_id=camera_id,
             stream_epoch=stream_epoch,
@@ -1075,9 +1232,10 @@ class SiteEventService:
             source_time=_utc(source_time, field="source_time"),
         )
         try:
-            self._replay_worker.run_periodic_batch()
+            self._run_candidate_safe_replay(startup=False)
         except Exception:
             self._degrade("journal_periodic_replay_failed")
+            self._schedule_pending_evidence_recovery()
         return SiteEventResult(None, durable, self.status)
 
     def _process_triggers(
@@ -1089,7 +1247,16 @@ class SiteEventService:
             claim = self._claim(original_trigger.event.event_id)
             if claim == "duplicate":
                 continue
+            try:
+                seed = self._make_pending_seed(original_trigger)
+                seed_persisted = self._persist_pending_seed(seed)
+            except (TypeError, ValueError):
+                seed = None
+                seed_persisted = False
+                self._degrade("pending_evidence_seed_invalid")
             if not self._journal_candidate(original_trigger.event):
+                if seed_persisted:
+                    self._schedule_pending_evidence_recovery()
                 if claim == "claimed":
                     self._finish_claim(
                         original_trigger.event.event_id,
@@ -1097,13 +1264,23 @@ class SiteEventService:
                     )
                 continue
             if claim == "capacity":
+                if seed_persisted:
+                    self._schedule_pending_evidence_recovery()
+                continue
+            if not seed_persisted or seed is None:
+                self._finish_claim(
+                    original_trigger.event.event_id,
+                    completed=False,
+                )
                 continue
             completed = False
             try:
-                candidate = self._process_trigger(original_trigger)
+                candidate = self._process_trigger(original_trigger, seed=seed)
                 if candidate is not None:
                     durable.append(candidate)
                     completed = True
+                else:
+                    self._schedule_pending_evidence_recovery()
             finally:
                 self._finish_claim(original_trigger.event.event_id, completed=completed)
         return tuple(durable)
@@ -1111,15 +1288,18 @@ class SiteEventService:
     def _process_trigger(
         self,
         original_trigger: CandidateTrigger,
+        *,
+        seed: _PendingEvidenceSeed,
     ) -> DurableCandidate | None:
         trigger = original_trigger
         reservation: Any | None = None
         reservation_id = f"event-{trigger.event.event_id}"
 
         try:
-            self._replay_worker.run_periodic_batch()
+            self._run_candidate_safe_replay(startup=False)
         except Exception:
             self._degrade("journal_replay_failed")
+            self._schedule_pending_evidence_recovery()
         try:
             replay_degraded = bool(self._replay_worker.status.degraded)
         except Exception:
@@ -1136,9 +1316,11 @@ class SiteEventService:
             self._degrade("candidate_persistence_check_failed")
         if persisted is None:
             self._degrade("candidate_persistence_pending")
+            self._schedule_pending_evidence_recovery()
             return None
         if not self._same_candidate(persisted, trigger.event):
             self._degrade("candidate_persistence_identity_mismatch")
+            self._schedule_pending_evidence_recovery()
             return None
 
         try:
@@ -1152,33 +1334,41 @@ class SiteEventService:
             )
         except Exception:
             self._degrade("evidence_reservation_unavailable")
+            if not self._ack_pending_identity(
+                event_id=trigger.event.event_id,
+                reservation_id=reservation_id,
+            ):
+                self._degrade("pending_evidence_ack_failed")
             return DurableCandidate(trigger, None, None)
 
         try:
+            self._validate_seed_reservation(seed, reservation)
             pending = self._make_evidence_intent(trigger, reservation)
         except Exception:
             self._degrade("evidence_processing_failed")
             self._terminalize_candidate(trigger.event)
             self._safe_release(reservation_id)
+            if not self._ack_pending_identity(
+                event_id=trigger.event.event_id,
+                reservation_id=reservation_id,
+            ):
+                self._degrade("pending_evidence_ack_failed")
             return None
         pending_work = _PendingEvidenceWork(
             trigger=trigger,
             reservation_id=reservation_id,
             intent=pending,
-            event_at=trigger.event.last_seen_at,
-            expires_at=reservation.target_end_at
-            + timedelta(seconds=self._evidence_policy.pending_timeout_seconds),
+            event_at=seed.event_at,
+            expires_at=seed.expires_at,
         )
-        if not self._register_pending_work(pending_work):
-            self._degrade("pending_evidence_capacity_reached")
-            self._terminalize_candidate(trigger.event)
-            self._safe_release(reservation_id)
-            return None
         if not self._persist_pending_work(pending_work):
             self._degrade("pending_evidence_persistence_failed")
-            self._drop_pending_memory(trigger.event.event_id)
-            self._terminalize_candidate(trigger.event)
             self._safe_release(reservation_id)
+            self._schedule_pending_evidence_recovery()
+            return None
+        if not self._register_pending_work(pending_work):
+            self._degrade("pending_evidence_capacity_reached")
+            self._fail_pending_work(pending_work)
             return None
         pending_transition_verified = False
         try:
@@ -1193,6 +1383,14 @@ class SiteEventService:
             )
             pending_transition_verified = True
             trigger = replace(trigger, event=pending_event)
+            pending_work = replace(
+                pending_work,
+                trigger=trigger,
+                drain_ready=True,
+            )
+            if not self._activate_pending_work(pending_work):
+                raise RuntimeError("pending evidence activation was not durable")
+            self._replace_pending_memory(pending_work)
             evidence = (
                 self._evidence_coordinator.complete(reservation, pending)
                 if reservation.status == "ready"
@@ -1200,32 +1398,18 @@ class SiteEventService:
             )
             if evidence is not None:
                 self._validate_ready_evidence(pending, evidence)
-                active_epoch = self.engine.active_epoch(trigger.event.camera_id)
-                if active_epoch is not None and active_epoch != trigger.stream_epoch:
-                    self._degrade("evidence_pending_epoch_changed")
-                    raise RuntimeError("stream epoch changed during evidence completion")
-                trigger = replace(
-                    trigger,
-                    event=trigger.event.model_copy(
-                        update={"evidence_status": evidence.status}
-                    ),
+                trigger = self._ready_trigger_after_completion(
+                    pending_work,
+                    evidence,
                 )
                 if not self._ack_pending_work(pending_work):
                     self._degrade("pending_evidence_ack_failed")
                     return None
                 self._drop_pending_memory(trigger.event.event_id)
-            else:
-                pending_work = replace(
-                    pending_work,
-                    trigger=trigger,
-                    drain_ready=True,
-                )
-                if not self._activate_pending_work(pending_work):
-                    raise RuntimeError("pending evidence activation was not durable")
-                with self._state_lock:
-                    current = self._pending_work.get(trigger.event.event_id)
-                    if current is not None:
-                        self._pending_work[trigger.event.event_id] = pending_work
+        except _RetryablePendingEvidenceError:
+            self._degrade("pending_evidence_recovery_retryable")
+            self._schedule_pending_evidence_recovery()
+            return None
         except Exception:
             self._degrade("evidence_processing_failed")
             if not pending_transition_verified:
@@ -1233,6 +1417,98 @@ class SiteEventService:
             self._fail_pending_work(pending_work)
             return None
         return DurableCandidate(trigger, pending, evidence)
+
+    def _make_pending_seed(
+        self,
+        trigger: CandidateTrigger,
+    ) -> _PendingEvidenceSeed:
+        event_at = trigger.event.last_seen_at
+        pre_roll = self._evidence_policy.pre_roll_seconds
+        post_roll = self._evidence_policy.post_roll_seconds
+        target_end = event_at + timedelta(seconds=post_roll)
+        return _PendingEvidenceSeed(
+            trigger=trigger,
+            reservation_id=f"event-{trigger.event.event_id}",
+            event_at=event_at,
+            target_start_at=event_at - timedelta(seconds=pre_roll),
+            target_end_at=target_end,
+            expires_at=target_end
+            + timedelta(seconds=self._evidence_policy.pending_timeout_seconds),
+            source_reference=self._evidence_policy.source_references.get(
+                trigger.event.camera_id,
+                "",
+            ),
+            pre_roll_seconds=pre_roll,
+            post_roll_seconds=post_roll,
+            pending_timeout_seconds=self._evidence_policy.pending_timeout_seconds,
+        )
+
+    def _persist_pending_seed(self, seed: _PendingEvidenceSeed) -> bool:
+        try:
+            record = self._journal.seed_pending_evidence_work(
+                event_id=str(seed.trigger.event.event_id),
+                reservation_id=seed.reservation_id,
+                payload=seed.to_payload(),
+            )
+            return (
+                record.event_id == str(seed.trigger.event.event_id)
+                and record.reservation_id == seed.reservation_id
+                and record.phase in ("seed", "reserved", "active")
+                and (
+                    record.phase != "seed"
+                    or record.payload == seed.to_payload()
+                )
+            )
+        except JournalFullError:
+            self._degrade("pending_evidence_seed_capacity_reached")
+            return False
+        except Exception:
+            self._degrade("pending_evidence_seed_write_failed")
+            return False
+
+    @staticmethod
+    def _validate_seed_reservation(
+        seed: _PendingEvidenceSeed,
+        reservation: Any,
+    ) -> None:
+        if (
+            reservation.reservation_id != seed.reservation_id
+            or reservation.camera_id != seed.trigger.event.camera_id
+            or reservation.target_start_at != seed.target_start_at
+            or reservation.target_end_at != seed.target_end_at
+        ):
+            raise ValueError("evidence reservation conflicts with its recovery seed")
+
+    def _ready_trigger_after_completion(
+        self,
+        work: _PendingEvidenceWork,
+        evidence: EvidenceInput,
+    ) -> CandidateTrigger:
+        active_epoch = self.engine.active_epoch(work.trigger.event.camera_id)
+        if active_epoch is None or active_epoch == work.trigger.stream_epoch:
+            return replace(
+                work.trigger,
+                event=work.trigger.event.model_copy(
+                    update={"evidence_status": evidence.status}
+                ),
+            )
+        self._degrade("evidence_pending_epoch_changed")
+        try:
+            candidate = self._load_candidate(work.trigger.event.event_id)
+        except Exception as exc:
+            if is_retryable_database_error(exc):
+                raise _RetryablePendingEvidenceError(
+                    "ready publication fence could not load its candidate"
+                ) from exc
+            raise
+        if (
+            isinstance(candidate, CandidateEventV1)
+            and candidate.evidence_status == "ready"
+            and self._same_candidate_material(candidate, work.trigger.event)
+        ):
+            self._degrade("evidence_ready_won_epoch_fence")
+            return replace(work.trigger, event=candidate)
+        raise RuntimeError("stream epoch changed before evidence became durable")
 
     def _journal_candidate(self, event: CandidateEventV1) -> bool:
         """Durably retain one-shot candidate metadata before evidence admission."""
@@ -1318,6 +1594,11 @@ class SiteEventService:
             self._pending_work[event_id] = work
             return True
 
+    def _replace_pending_memory(self, work: _PendingEvidenceWork) -> None:
+        with self._state_lock:
+            if work.trigger.event.event_id in self._pending_work:
+                self._pending_work[work.trigger.event.event_id] = work
+
     def _persist_pending_work(self, work: _PendingEvidenceWork) -> bool:
         try:
             record = self._journal.reserve_pending_evidence_work(
@@ -1356,14 +1637,29 @@ class SiteEventService:
             return False
 
     def _ack_pending_work(self, work: _PendingEvidenceWork) -> bool:
+        return self._ack_pending_identity(
+            event_id=work.trigger.event.event_id,
+            reservation_id=work.reservation_id,
+        )
+
+    def _ack_pending_identity(
+        self,
+        *,
+        event_id: UUID,
+        reservation_id: str,
+    ) -> bool:
         try:
-            return bool(
+            acknowledged = bool(
                 self._journal.acknowledge_pending_evidence_work(
-                    event_id=str(work.trigger.event.event_id),
-                    reservation_id=work.reservation_id,
+                    event_id=str(event_id),
+                    reservation_id=reservation_id,
                 )
             )
+            if not acknowledged:
+                self._schedule_pending_evidence_recovery()
+            return acknowledged
         except Exception:
+            self._schedule_pending_evidence_recovery()
             return False
 
     def _drop_pending_memory(self, event_id: UUID) -> None:
@@ -1382,12 +1678,70 @@ class SiteEventService:
             return
         except Exception:
             self._degrade("pending_evidence_recovery_read_failed")
+            self._schedule_pending_evidence_recovery()
             return
         capacity = self.engine.limits.max_pending_events
         if len(records) > capacity:
             self._degrade("pending_evidence_recovery_capacity_exceeded")
         for index, record in enumerate(records):
             try:
+                if record.phase == "seed":
+                    seed = _PendingEvidenceSeed.from_payload(record.payload)
+                    self._validate_recovered_seed_policy(seed)
+                    if (
+                        record.event_id != str(seed.trigger.event.event_id)
+                        or record.reservation_id != seed.reservation_id
+                    ):
+                        raise ValueError("pending evidence seed identity changed")
+                    try:
+                        candidate = self._load_recovery_candidate(
+                            seed.trigger.event.event_id
+                        )
+                    except _RetryablePendingEvidenceError as exc:
+                        if not isinstance(exc.__cause__, KeyError):
+                            raise
+                        if not self._journal_candidate(seed.trigger.event):
+                            raise
+                        try:
+                            self._run_candidate_safe_replay(startup=False)
+                        except Exception as replay_error:
+                            raise _RetryablePendingEvidenceError(
+                                "seed candidate replay is unavailable"
+                            ) from replay_error
+                        candidate = self._load_recovery_candidate(
+                            seed.trigger.event.event_id
+                        )
+                    if not self._same_candidate_material(
+                        candidate,
+                        seed.trigger.event,
+                    ):
+                        raise ValueError("pending evidence seed candidate identity changed")
+                    if candidate.evidence_status in ("ready", "failed"):
+                        self._ack_recovered_identity(
+                            event_id=seed.trigger.event.event_id,
+                            reservation_id=seed.reservation_id,
+                        )
+                        continue
+                    if index >= capacity:
+                        if not self._terminalize_candidate(candidate):
+                            raise _RetryablePendingEvidenceError(
+                                "seed capacity reconciliation is not durable"
+                            )
+                        self._ack_recovered_identity(
+                            event_id=seed.trigger.event.event_id,
+                            reservation_id=seed.reservation_id,
+                        )
+                        continue
+                    if candidate.evidence_status != "unavailable":
+                        raise ValueError(
+                            "pending evidence seed candidate state is inconsistent"
+                        )
+                    recovered_trigger = replace(seed.trigger, event=candidate)
+                    self._process_trigger(
+                        recovered_trigger,
+                        seed=replace(seed, trigger=recovered_trigger),
+                    )
+                    continue
                 work = _PendingEvidenceWork.from_payload(
                     record.payload,
                     drain_ready=record.phase == "active",
@@ -1398,18 +1752,13 @@ class SiteEventService:
                     or record.reservation_id != work.reservation_id
                 ):
                     raise ValueError("pending evidence journal identity changed")
-                candidate = self._load_candidate(work.trigger.event.event_id)
-                if not isinstance(candidate, CandidateEventV1):
-                    raise ValueError("pending evidence candidate receipt is invalid")
+                candidate = self._load_recovery_candidate(
+                    work.trigger.event.event_id
+                )
                 if not self._same_candidate_material(candidate, work.trigger.event):
                     raise ValueError("pending evidence candidate identity changed")
                 if candidate.evidence_status == "ready":
-                    if not self._ack_pending_work(work):
-                        raise RuntimeError("ready pending evidence acknowledgement failed")
-                    continue
-                if candidate.evidence_status == "failed":
-                    if not self._ack_pending_work(work):
-                        raise RuntimeError("terminal pending evidence acknowledgement failed")
+                    self._ack_recovered_work(work)
                     continue
                 work = replace(
                     work,
@@ -1417,19 +1766,171 @@ class SiteEventService:
                 )
                 if index >= capacity:
                     if not self._fail_pending_work(work):
-                        self._quarantine_pending_record(
-                            record,
-                            error_type="RecoveryCapacityExceeded",
+                        raise _RetryablePendingEvidenceError(
+                            "pending evidence capacity reconciliation is not durable"
+                        )
+                    continue
+                if record.phase == "active" and candidate.evidence_status in (
+                    "pending",
+                    "failed",
+                ):
+                    if not self._register_pending_work(work):
+                        raise _RetryablePendingEvidenceError(
+                            "recovered pending evidence capacity reached"
                         )
                     continue
                 if record.phase != "active" or candidate.evidence_status != "pending":
                     if not self._fail_pending_work(work):
-                        raise RuntimeError("reserved pending evidence reconciliation failed")
+                        raise _RetryablePendingEvidenceError(
+                            "reserved pending evidence reconciliation failed"
+                        )
                     continue
-                if not self._register_pending_work(work):
-                    raise RuntimeError("recovered pending evidence capacity reached")
+            except _RetryablePendingEvidenceError:
+                self._degrade("pending_evidence_recovery_retryable")
+                self._schedule_pending_evidence_recovery()
             except Exception as exc:
                 self._reconcile_corrupt_pending_record(record, error=exc)
+
+    def _retry_pending_evidence_recovery(self) -> None:
+        with self._state_lock:
+            retry_at = self._pending_retry_at
+            if retry_at is None or self._monotonic() < retry_at:
+                return
+            self._pending_retry_at = None
+        self._recover_pending_evidence_work()
+        self._reconcile_terminal_memory_without_rows()
+
+    def _run_candidate_safe_replay(self, *, startup: bool) -> int:
+        try:
+            missing_items = tuple(
+                self._journal.candidate_items_without_pending_evidence()
+            )
+        except AttributeError:
+            try:
+                missing_seed = int(
+                    self._journal.candidate_events_without_pending_evidence()
+                )
+            except AttributeError:
+                missing_seed = 0
+            if missing_seed:
+                self._degrade("candidate_replay_missing_recovery_seed")
+                return 0
+            missing_items = ()
+        if missing_items:
+            self._degrade("candidate_replay_missing_recovery_seed")
+            try:
+                for item in missing_items:
+                    self._journal.quarantine(
+                        item,
+                        error_type="MissingEvidenceRecoverySeed",
+                    )
+            except Exception:
+                self._degrade("candidate_replay_seed_quarantine_failed")
+                self._schedule_pending_evidence_recovery()
+                return 0
+            self._degrade("candidate_replay_seed_quarantined")
+        if startup:
+            return int(self._replay_worker.startup_drain())
+        return int(self._replay_worker.run_periodic_batch())
+
+    def _reconcile_terminal_memory_without_rows(self) -> None:
+        """Release capacity after an ACK committed but its caller crashed."""
+        try:
+            durable_ids = {
+                record.event_id
+                for record in self._journal.pending_evidence_work_items(
+                    limit=max(
+                        self.engine.limits.max_pending_events + 1,
+                        int(getattr(self._journal, "max_items", 0)) + 1,
+                    )
+                )
+            }
+        except AttributeError:
+            return
+        except Exception:
+            self._degrade("pending_evidence_recovery_read_failed")
+            self._schedule_pending_evidence_recovery()
+            return
+        with self._state_lock:
+            orphaned_memory = tuple(
+                work
+                for work in self._pending_work.values()
+                if str(work.trigger.event.event_id) not in durable_ids
+            )
+        for work in orphaned_memory:
+            try:
+                candidate = self._load_recovery_candidate(
+                    work.trigger.event.event_id
+                )
+            except _RetryablePendingEvidenceError:
+                self._degrade("pending_evidence_recovery_retryable")
+                self._schedule_pending_evidence_recovery()
+                continue
+            if (
+                candidate.evidence_status == "ready"
+                and self._same_candidate_material(candidate, work.trigger.event)
+            ):
+                self._drop_pending_memory(work.trigger.event.event_id)
+
+    def _schedule_pending_evidence_recovery(self) -> None:
+        retry_at = self._monotonic() + self._pending_recovery_backoff_seconds
+        with self._state_lock:
+            self._pending_recovery_attempts += 1
+            if self._pending_retry_at is None:
+                self._pending_retry_at = retry_at
+
+    def _load_recovery_candidate(self, event_id: UUID) -> CandidateEventV1:
+        try:
+            candidate = self._load_candidate(event_id)
+        except KeyError as exc:
+            raise _RetryablePendingEvidenceError(
+                "pending evidence candidate has not replayed yet"
+            ) from exc
+        except Exception as exc:
+            if is_retryable_database_error(exc):
+                raise _RetryablePendingEvidenceError(
+                    "pending evidence candidate repository is unavailable"
+                ) from exc
+            raise
+        if not isinstance(candidate, CandidateEventV1):
+            raise ValueError("pending evidence candidate receipt is invalid")
+        return candidate
+
+    def _ack_recovered_identity(
+        self,
+        *,
+        event_id: UUID,
+        reservation_id: str,
+    ) -> None:
+        if not self._ack_pending_identity(
+            event_id=event_id,
+            reservation_id=reservation_id,
+        ):
+            raise _RetryablePendingEvidenceError(
+                "pending evidence acknowledgement is not durable"
+            )
+        self._drop_pending_memory(event_id)
+
+    def _ack_recovered_work(self, work: _PendingEvidenceWork) -> None:
+        self._ack_recovered_identity(
+            event_id=work.trigger.event.event_id,
+            reservation_id=work.reservation_id,
+        )
+
+    def _validate_recovered_seed_policy(
+        self,
+        seed: _PendingEvidenceSeed,
+    ) -> None:
+        event = seed.trigger.event
+        if (
+            seed.source_reference
+            != self._evidence_policy.source_references.get(event.camera_id, "")
+            or seed.pre_roll_seconds != self._evidence_policy.pre_roll_seconds
+            or seed.post_roll_seconds != self._evidence_policy.post_roll_seconds
+            or seed.pending_timeout_seconds
+            != self._evidence_policy.pending_timeout_seconds
+        ):
+            raise ValueError("pending evidence seed conflicts with configured policy")
 
     def _validate_recovered_work_policy(self, work: _PendingEvidenceWork) -> None:
         event = work.trigger.event
@@ -1461,6 +1962,7 @@ class SiteEventService:
         *,
         error: Exception,
     ) -> None:
+        cleanup_ok = True
         try:
             self._evidence_coordinator.cancel(
                 record.reservation_id,
@@ -1469,13 +1971,26 @@ class SiteEventService:
         except Exception:
             self._degrade("pending_evidence_recovery_cleanup_failed")
             self._safe_release(record.reservation_id)
+            cleanup_ok = False
+        if not cleanup_ok:
+            self._degrade("pending_evidence_recovery_retryable")
+            self._schedule_pending_evidence_recovery()
+            return
         try:
             event_id = UUID(record.event_id)
-            candidate = self._load_candidate(event_id)
-            if isinstance(candidate, CandidateEventV1):
-                self._terminalize_candidate(candidate)
+            candidate = self._load_recovery_candidate(event_id)
+            if not self._terminalize_candidate(candidate):
+                self._degrade("pending_evidence_recovery_retryable")
+                self._schedule_pending_evidence_recovery()
+                return
+        except _RetryablePendingEvidenceError:
+            self._degrade("pending_evidence_recovery_retryable")
+            self._schedule_pending_evidence_recovery()
+            return
         except Exception:
             self._degrade("pending_evidence_recovery_transition_failed")
+            self._schedule_pending_evidence_recovery()
+            return
         self._quarantine_pending_record(
             record,
             error_type=type(error).__name__,
@@ -1499,6 +2014,7 @@ class SiteEventService:
             self._degrade("pending_evidence_recovery_quarantined")
         else:
             self._degrade("pending_evidence_recovery_failed")
+            self._schedule_pending_evidence_recovery()
 
     def _drain_pending_evidence(
         self,
@@ -1520,6 +2036,27 @@ class SiteEventService:
             if not self._claim_pending(event_id):
                 continue
             try:
+                try:
+                    candidate = self._load_recovery_candidate(event_id)
+                    if not self._same_candidate_material(
+                        candidate,
+                        work.trigger.event,
+                    ):
+                        raise ValueError(
+                            "pending evidence candidate identity changed"
+                        )
+                    if candidate.evidence_status == "ready":
+                        self._ack_recovered_work(work)
+                        continue
+                    work = replace(
+                        work,
+                        trigger=replace(work.trigger, event=candidate),
+                    )
+                    self._replace_pending_memory(work)
+                except _RetryablePendingEvidenceError:
+                    self._degrade("pending_evidence_recovery_retryable")
+                    self._schedule_pending_evidence_recovery()
+                    continue
                 active_epoch = self.engine.active_epoch(
                     work.trigger.event.camera_id
                 )
@@ -1564,15 +2101,16 @@ class SiteEventService:
                         work.intent,
                     )
                     self._validate_ready_evidence(work.intent, evidence)
+                    ready_trigger = self._ready_trigger_after_completion(
+                        work,
+                        evidence,
+                    )
+                except _RetryablePendingEvidenceError:
+                    self._degrade("pending_evidence_recovery_retryable")
+                    self._schedule_pending_evidence_recovery()
+                    continue
                 except Exception:
                     self._degrade("evidence_pending_completion_failed")
-                    self._fail_pending_work(work)
-                    continue
-                if (
-                    self.engine.active_epoch(work.trigger.event.camera_id)
-                    != work.trigger.stream_epoch
-                ):
-                    self._degrade("evidence_pending_epoch_changed")
                     self._fail_pending_work(work)
                     continue
                 if not self._ack_pending_work(work):
@@ -1581,12 +2119,7 @@ class SiteEventService:
                 self._drop_pending_memory(event_id)
                 completed.append(
                     DurableCandidate(
-                        replace(
-                            work.trigger,
-                            event=work.trigger.event.model_copy(
-                                update={"evidence_status": "ready"}
-                            ),
-                        ),
+                        ready_trigger,
                         work.intent,
                         evidence,
                     )
@@ -1678,6 +2211,8 @@ class SiteEventService:
                 self._degrade("pending_evidence_ack_failed")
                 return False
             self._drop_pending_memory(work.trigger.event.event_id)
+        else:
+            self._schedule_pending_evidence_recovery()
         return cleaned
 
     def _cancel_intent(

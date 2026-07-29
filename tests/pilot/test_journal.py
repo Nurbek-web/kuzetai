@@ -834,6 +834,166 @@ def test_postgresql_concurrency_states_stay_live_with_bounded_backoff(
     assert worker.status.retry_attempts_total == 1
 
 
+def test_pending_evidence_seed_is_promoted_atomically_to_reserved_work(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteWALJournal(tmp_path / "pending-seed.sqlite3", max_items=2)
+    event_id = str(uuid4())
+    reservation_id = f"event-{event_id}"
+    seed = {
+        "schema_version": "pending-evidence-seed.v1",
+        "event_id": event_id,
+        "reservation_id": reservation_id,
+        "stream_epoch": str(uuid4()),
+        "event_at": NOW.isoformat(),
+        "target_start_at": (NOW - timedelta(seconds=2)).isoformat(),
+        "target_end_at": (NOW + timedelta(seconds=2)).isoformat(),
+        "expires_at": (NOW + timedelta(seconds=17)).isoformat(),
+        "source_reference": "nvr://cam-01",
+        "pre_roll_seconds": 2.0,
+        "post_roll_seconds": 2.0,
+        "pending_timeout_seconds": 15.0,
+    }
+    full = {**seed, "schema_version": "pending-evidence-work.v1", "intent": {}}
+
+    seeded = journal.seed_pending_evidence_work(
+        event_id=event_id,
+        reservation_id=reservation_id,
+        payload=seed,
+    )
+    promoted = journal.reserve_pending_evidence_work(
+        event_id=event_id,
+        reservation_id=reservation_id,
+        payload=full,
+    )
+
+    assert seeded.phase == "seed"
+    assert seeded.payload == seed
+    assert promoted.phase == "reserved"
+    assert promoted.payload == full
+    assert journal.pending_evidence_work_items(limit=2) == (promoted,)
+
+
+def test_pending_evidence_quarantine_refuses_overflow_without_eviction(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteWALJournal(
+        tmp_path / "pending-quarantine-bound.sqlite3",
+        max_items=3,
+        max_quarantine_items=1,
+    )
+
+    def reserve(event_id: str) -> None:
+        journal.reserve_pending_evidence_work(
+            event_id=event_id,
+            reservation_id=f"event-{event_id}",
+            payload={"schema_version": "pending-evidence-work.v1", "event_id": event_id},
+        )
+
+    reserve("event-1")
+    assert journal.quarantine_pending_evidence_work(
+        event_id="event-1",
+        reservation_id="event-event-1",
+        error_type="FirstPoison",
+    )
+    reserve("event-2")
+
+    with pytest.raises(JournalFullError, match="quarantine capacity"):
+        journal.quarantine_pending_evidence_work(
+            event_id="event-2",
+            reservation_id="event-event-2",
+            error_type="SecondPoison",
+        )
+
+    assert journal.pending_evidence_quarantine_depth() == 1
+    assert journal.pending_evidence_work_depth() == 1
+
+
+def test_pending_evidence_ack_rolls_back_abort_and_is_idempotent_after_commit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pending-ack-transaction.sqlite3"
+    journal = SQLiteWALJournal(path, max_items=2)
+    event_id = str(uuid4())
+    reservation_id = f"event-{event_id}"
+    journal.reserve_pending_evidence_work(
+        event_id=event_id,
+        reservation_id=reservation_id,
+        payload={"schema_version": "pending-evidence-work.v1"},
+    )
+    journal._connection.execute(
+        """
+        CREATE TRIGGER abort_pending_ack
+        BEFORE DELETE ON pending_evidence_work
+        BEGIN
+            SELECT RAISE(ABORT, 'forced pending ACK abort');
+        END
+        """
+    )
+    journal._connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced pending ACK abort"):
+        journal.acknowledge_pending_evidence_work(
+            event_id=event_id,
+            reservation_id=reservation_id,
+        )
+
+    assert journal._connection.in_transaction is False
+    assert journal.pending_evidence_work_depth() == 1
+    journal._connection.execute("DROP TRIGGER abort_pending_ack")
+    journal._connection.commit()
+    assert journal.acknowledge_pending_evidence_work(
+        event_id=event_id,
+        reservation_id=reservation_id,
+    )
+    journal.close()
+
+    restarted = SQLiteWALJournal(path, max_items=2)
+    assert restarted.acknowledge_pending_evidence_work(
+        event_id=event_id,
+        reservation_id=reservation_id,
+    )
+    assert restarted.pending_evidence_work_depth() == 0
+
+
+def test_existing_pending_lifecycle_table_migrates_to_seed_phase(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pending-phase-migration.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE pending_evidence_work (
+            event_id TEXT PRIMARY KEY,
+            reservation_id TEXT NOT NULL UNIQUE,
+            phase TEXT NOT NULL CHECK (phase IN ('reserved', 'active')),
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO pending_evidence_work
+            (event_id, reservation_id, phase, payload_json, created_at)
+        VALUES ('legacy-event', 'event-legacy-event', 'active', '{}', ?)
+        """,
+        (NOW.isoformat(),),
+    )
+    connection.commit()
+    connection.close()
+
+    journal = SQLiteWALJournal(path, max_items=2)
+    seeded = journal.seed_pending_evidence_work(
+        event_id="new-event",
+        reservation_id="event-new-event",
+        payload={"schema_version": "pending-evidence-seed.v1"},
+    )
+
+    assert journal.pending_evidence_work_items(limit=2)[0].phase == "active"
+    assert seeded.phase == "seed"
+
+
 @pytest.mark.skipif(
     os.getenv("PILOT_TEST_DATABASE_URL") is None,
     reason="requires disposable PostgreSQL *_test database",

@@ -173,7 +173,7 @@ class PendingEvidenceJournalItem:
 
     event_id: str
     reservation_id: str
-    phase: Literal["reserved", "active"]
+    phase: Literal["seed", "reserved", "active"]
     payload: dict[str, Any]
     created_at: datetime
 
@@ -257,12 +257,20 @@ class SQLiteWALJournal:
             CREATE TABLE IF NOT EXISTS pending_evidence_work (
                 event_id TEXT PRIMARY KEY,
                 reservation_id TEXT NOT NULL UNIQUE,
-                phase TEXT NOT NULL CHECK (phase IN ('reserved', 'active')),
+                phase TEXT NOT NULL CHECK (phase IN ('seed', 'reserved', 'active')),
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
             """
         )
+        pending_table_sql = self._connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type='table' AND name='pending_evidence_work'
+            """
+        ).fetchone()[0]
+        if "'seed'" not in str(pending_table_sql):
+            self._migrate_pending_evidence_phase_constraint()
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS pending_evidence_quarantine (
@@ -281,6 +289,41 @@ class SQLiteWALJournal:
             rebuild_kind_constraint=needs_kind_migration
         )
         self._connection.commit()
+
+    def _migrate_pending_evidence_phase_constraint(self) -> None:
+        """Add the crash-safe seed phase without changing existing rows."""
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute("DROP TABLE IF EXISTS pending_evidence_work_v2")
+            self._connection.execute(
+                """
+                CREATE TABLE pending_evidence_work_v2 (
+                    event_id TEXT PRIMARY KEY,
+                    reservation_id TEXT NOT NULL UNIQUE,
+                    phase TEXT NOT NULL CHECK (
+                        phase IN ('seed', 'reserved', 'active')
+                    ),
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                INSERT INTO pending_evidence_work_v2
+                    (event_id, reservation_id, phase, payload_json, created_at)
+                SELECT event_id, reservation_id, phase, payload_json, created_at
+                FROM pending_evidence_work
+                """
+            )
+            self._connection.execute("DROP TABLE pending_evidence_work")
+            self._connection.execute(
+                "ALTER TABLE pending_evidence_work_v2 RENAME TO pending_evidence_work"
+            )
+            self._connection.commit()
+        except BaseException:
+            self._connection.rollback()
+            raise
 
     def _normalise_candidate_identities(
         self,
@@ -417,6 +460,75 @@ class SQLiteWALJournal:
             payload=event.model_dump(mode="json"),
         )
 
+    def seed_pending_evidence_work(
+        self,
+        *,
+        event_id: str,
+        reservation_id: str,
+        payload: dict[str, Any],
+    ) -> PendingEvidenceJournalItem:
+        """Persist recovery identity before candidate replay or fragment pinning."""
+        if not event_id or not reservation_id:
+            raise ValueError("pending evidence identities must be non-empty")
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if len(payload_json.encode("utf-8")) > self.max_payload_bytes:
+            raise ValueError(
+                f"pending evidence payload exceeds {self.max_payload_bytes} bytes"
+            )
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._connection.execute(
+                    """
+                    SELECT event_id, reservation_id, phase, payload_json, created_at
+                    FROM pending_evidence_work WHERE event_id = ? OR reservation_id = ?
+                    """,
+                    (event_id, reservation_id),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["event_id"] != event_id
+                        or existing["reservation_id"] != reservation_id
+                        or (
+                            existing["phase"] == "seed"
+                            and existing["payload_json"] != payload_json
+                        )
+                    ):
+                        raise JournalPayloadConflictError(
+                            "pending evidence seed identity was reused with different data"
+                        )
+                    self._connection.commit()
+                    return self._row_to_pending_evidence(existing)
+                count = self._connection.execute(
+                    "SELECT count(*) FROM pending_evidence_work"
+                ).fetchone()[0]
+                if count >= self.max_items:
+                    raise JournalFullError(
+                        f"pending evidence capacity {self.max_items} reached"
+                    )
+                self._connection.execute(
+                    """
+                    INSERT INTO pending_evidence_work
+                        (event_id, reservation_id, phase, payload_json, created_at)
+                    VALUES (?, ?, 'seed', ?, ?)
+                    """,
+                    (event_id, reservation_id, payload_json, created_at),
+                )
+                row = self._connection.execute(
+                    """
+                    SELECT event_id, reservation_id, phase, payload_json, created_at
+                    FROM pending_evidence_work WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+                self._connection.commit()
+                assert row is not None
+                return self._row_to_pending_evidence(row)
+            except BaseException:
+                self._connection.rollback()
+                raise
+
     def reserve_pending_evidence_work(
         self,
         *,
@@ -447,12 +559,32 @@ class SQLiteWALJournal:
                     if (
                         existing["event_id"] != event_id
                         or existing["reservation_id"] != reservation_id
-                        or existing["payload_json"] != payload_json
                     ):
                         raise JournalPayloadConflictError(
                             "pending evidence identity was reused with different data"
                         )
+                    if existing["phase"] == "seed":
+                        self._connection.execute(
+                            """
+                            UPDATE pending_evidence_work
+                            SET phase = 'reserved', payload_json = ?
+                            WHERE event_id = ? AND reservation_id = ? AND phase = 'seed'
+                            """,
+                            (payload_json, event_id, reservation_id),
+                        )
+                        existing = self._connection.execute(
+                            """
+                            SELECT event_id, reservation_id, phase, payload_json, created_at
+                            FROM pending_evidence_work WHERE event_id = ?
+                            """,
+                            (event_id,),
+                        ).fetchone()
+                    elif existing["payload_json"] != payload_json:
+                        raise JournalPayloadConflictError(
+                            "pending evidence identity was reused with different data"
+                        )
                     self._connection.commit()
+                    assert existing is not None
                     return self._row_to_pending_evidence(existing)
                 count = self._connection.execute(
                     "SELECT count(*) FROM pending_evidence_work"
@@ -561,15 +693,37 @@ class SQLiteWALJournal:
         reservation_id: str,
     ) -> bool:
         with self._lock:
-            cursor = self._connection.execute(
-                """
-                DELETE FROM pending_evidence_work
-                WHERE event_id = ? AND reservation_id = ?
-                """,
-                (event_id, reservation_id),
-            )
-            self._connection.commit()
-            return cursor.rowcount == 1
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT event_id, reservation_id
+                    FROM pending_evidence_work
+                    WHERE event_id = ? OR reservation_id = ?
+                    """,
+                    (event_id, reservation_id),
+                ).fetchone()
+                if row is None:
+                    self._connection.commit()
+                    return True
+                if (
+                    row["event_id"] != event_id
+                    or row["reservation_id"] != reservation_id
+                ):
+                    self._connection.rollback()
+                    return False
+                cursor = self._connection.execute(
+                    """
+                    DELETE FROM pending_evidence_work
+                    WHERE event_id = ? AND reservation_id = ?
+                    """,
+                    (event_id, reservation_id),
+                )
+                self._connection.commit()
+                return cursor.rowcount == 1
+            except BaseException:
+                self._connection.rollback()
+                raise
 
     def pending_evidence_work_depth(self) -> int:
         with self._lock:
@@ -578,6 +732,38 @@ class SQLiteWALJournal:
                     "SELECT count(*) FROM pending_evidence_work"
                 ).fetchone()[0]
             )
+
+    def candidate_events_without_pending_evidence(self) -> int:
+        """Count valid candidate rows that have no crash-recovery seed."""
+        return len(self.candidate_items_without_pending_evidence())
+
+    def candidate_items_without_pending_evidence(self) -> tuple[JournalItem, ...]:
+        """Return bounded candidate metadata that cannot safely create evidence."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT item_id, kind, schema_version, idempotency_key,
+                       payload_json, created_at
+                FROM journal_items
+                WHERE kind = 'candidate_event'
+                ORDER BY item_id
+                """
+            ).fetchall()
+            pending_ids = {
+                str(row["event_id"])
+                for row in self._connection.execute(
+                    "SELECT event_id FROM pending_evidence_work"
+                ).fetchall()
+            }
+        missing: list[JournalItem] = []
+        for row in rows:
+            try:
+                event = CandidateEventV1.model_validate_json(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            if str(event.event_id) not in pending_ids:
+                missing.append(self._row_to_item(row))
+        return tuple(missing)
 
     def quarantine_pending_evidence_work(
         self,
@@ -606,14 +792,9 @@ class SQLiteWALJournal:
                     "SELECT count(*) FROM pending_evidence_quarantine"
                 ).fetchone()[0]
                 if count >= self.max_quarantine_items:
-                    self._connection.execute(
-                        """
-                        DELETE FROM pending_evidence_quarantine
-                        WHERE quarantine_id = (
-                            SELECT quarantine_id FROM pending_evidence_quarantine
-                            ORDER BY quarantine_id LIMIT 1
-                        )
-                        """
+                    raise JournalFullError(
+                        "pending evidence quarantine capacity "
+                        f"{self.max_quarantine_items} reached"
                     )
                 self._connection.execute(
                     """
