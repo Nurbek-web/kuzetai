@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +17,7 @@ from protector.pilot.runtime.evidence import (
     ClipAssemblyError,
     EncodedFragmentRing,
     FfmpegCodecTool,
+    FfprobeMediaProbe,
     MediaInfo,
     NvencCapacityError,
     SourceTimeMapper,
@@ -22,6 +26,7 @@ from protector.pilot.runtime.evidence import (
     SpoolCapacityError,
     gstreamer_splitmux_sink_spec,
 )
+from protector.pilot.storage.object_store import PreviewWorkspace
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 
@@ -40,7 +45,7 @@ class Clock:
 class RecordingCodecTool:
     def __init__(self, *, nvenc_available: bool = True) -> None:
         self.nvenc_available = nvenc_available
-        self.calls: list[tuple[str, tuple[Path, ...], Path, tuple[int, ...]]] = []
+        self.calls: list[tuple[str, tuple[Path, ...], object, tuple[int, ...]]] = []
         self.entered = threading.Event()
         self.release = threading.Event()
         self.block = False
@@ -48,17 +53,17 @@ class RecordingCodecTool:
     def remux_h264(
         self,
         inputs: tuple[Path, ...],
-        output: Path,
+        output: object,
         *,
         pass_fds: tuple[int, ...],
     ) -> None:
         self.calls.append(("remux", inputs, output, pass_fds))
-        output.write_bytes(b"browser-h264-remux")
+        output.write_bytes(b"browser-h264-remux")  # type: ignore[attr-defined]
 
     def transcode_h265_nvenc(
         self,
         inputs: tuple[Path, ...],
-        output: Path,
+        output: object,
         *,
         pass_fds: tuple[int, ...],
     ) -> None:
@@ -68,7 +73,7 @@ class RecordingCodecTool:
         self.entered.set()
         if self.block:
             assert self.release.wait(timeout=2)
-        output.write_bytes(b"browser-h264-nvenc")
+        output.write_bytes(b"browser-h264-nvenc")  # type: ignore[attr-defined]
 
 
 class RecordingMediaProbe:
@@ -81,8 +86,8 @@ class RecordingMediaProbe:
         self.source_compatible = source_compatible
         self.output_duration = output_duration
 
-    def probe(self, path: Path, *, pass_fds: tuple[int, ...] = ()) -> MediaInfo:
-        is_output = ".part.mp4" in path.name
+    def probe(self, path: object, *, pass_fds: tuple[int, ...] = ()) -> MediaInfo:
+        is_output = not isinstance(path, Path) or ".part.mp4" in path.name
         return MediaInfo(
             duration_seconds=self.output_duration if is_output else 2.0,
             codec="h264",
@@ -512,30 +517,153 @@ def test_pending_h265_reservation_produces_browser_playable_preview(tmp_path: Pa
 def test_ffmpeg_commands_keep_h264_copy_only_and_h265_target_only_nvenc() -> None:
     h264 = FfmpegCodecTool.remux_command(Path("concat.txt"), Path("clip.part"))
     h265 = FfmpegCodecTool.nvenc_command(Path("concat.txt"), Path("clip.part"))
+    descriptor_output = SimpleNamespace(
+        descriptor=41,
+        max_bytes=1_000,
+        descriptor_path=Path("/dev/fd/41"),
+    )
+    descriptor_h264 = FfmpegCodecTool.remux_command(
+        Path("concat.txt"),
+        descriptor_output,
+    )
 
     assert h264 == (
         "ffmpeg",
         "-nostdin",
+        "-y",
         "-v",
         "error",
         "-f",
         "concat",
         "-safe",
         "0",
+        "-protocol_whitelist",
+        "file,pipe,crypto,data",
         "-i",
         "concat.txt",
         "-map",
         "0",
         "-c",
         "copy",
+        "-f",
+        "mp4",
         "-movflags",
         "+faststart",
         "clip.part",
     )
+    assert descriptor_h264[-5:] == ("-f", "mp4", "-fd", "41", "fd:")
+    assert "+faststart" not in descriptor_h264
     assert "h264_nvenc" in h265
     assert "yuv420p" in h265
     assert "high" in h265
     assert "videotoolbox" not in h265
+
+
+def test_ffprobe_rejects_zero_exit_media_with_invalid_nal_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "streams": [
+            {
+                "codec_name": "h264",
+                "profile": "High",
+                "pix_fmt": "yuv420p",
+            }
+        ],
+        "format": {"duration": "6.0"},
+        "packets": [{"size": "128", "flags": "K_"}],
+    }
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=(),
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="[h264] Invalid NAL unit size",
+        ),
+    )
+
+    with pytest.raises(ClipAssemblyError, match="probe failed"):
+        FfprobeMediaProbe().probe(tmp_path / "partial.mp4")
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="portable FFmpeg descriptor smoke requires local ffmpeg and ffprobe",
+)
+def test_real_ffmpeg_assembles_and_probes_seekable_workspace_descriptor(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        (
+            shutil.which("ffmpeg") or "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=160x120:r=12:d=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(source),
+        ),
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    ring = _ring(
+        tmp_path / "real-spool",
+        Clock(),
+        max_camera_bytes=source.stat().st_size * 4,
+        max_spool_bytes=source.stat().st_size * 4,
+    )
+    payload = source.read_bytes()
+    for offset in (0, 2, 4):
+        _append(ring, offset=offset, payload=payload)
+    reservation = ring.reserve(
+        reservation_id="real-descriptor",
+        camera_id="camera-01",
+        stream_epoch="default",
+        event_at=NOW + timedelta(seconds=3),
+        pre_roll=3,
+        post_roll=3,
+    )
+    workspace = PreviewWorkspace(
+        tmp_path / "real-previews",
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=source.stat().st_size * 6,
+        clock=lambda: NOW,
+    )
+    target = workspace.prepare("real-descriptor", kind="final")
+    descriptor = target.descriptor
+
+    assembled = ClipAssembler(
+        FfmpegCodecTool(),
+        FfprobeMediaProbe(),
+        max_nvenc_jobs=1,
+    ).assemble(reservation, target)
+    registered = workspace.register(
+        "real-descriptor",
+        kind="final",
+        path=assembled.path,  # type: ignore[arg-type]
+    )
+
+    assert registered.sha256 == assembled.sha256
+    assert registered.size_bytes > 0
+    assert workspace.path_for("real-descriptor", kind="final").is_file()
+    assert workspace.cleanup("real-descriptor") == []
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_splitmux_contract_is_encoded_bounded_and_uses_incomplete_paths(tmp_path: Path) -> None:

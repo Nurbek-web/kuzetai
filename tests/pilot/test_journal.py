@@ -554,12 +554,15 @@ def test_postgresql_concurrency_states_stay_live_with_bounded_backoff(
     assert worker.status.quarantine_depth == 0
     assert worker.status.degraded is True
     assert worker.status.next_retry_in_seconds == 3
+    assert worker.status.retry_attempts_total == 1
     assert worker.run_periodic_batch() == 0
+    assert worker.status.retry_attempts_total == 1
     clock.now = 3
     assert worker.run_periodic_batch() == 1
     assert attempts == [item.item_id, item.item_id]
     assert worker.status.depth == 0
     assert worker.status.quarantine_depth == 0
+    assert worker.status.retry_attempts_total == 1
 
 
 @pytest.mark.skipif(

@@ -14,13 +14,14 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 Codec = Literal["h264", "h265"]
@@ -1202,7 +1203,7 @@ class CodecTool(Protocol):
     def remux_h264(
         self,
         inputs: tuple[Path, ...],
-        output: Path,
+        output: Path | AssemblyOutput,
         *,
         pass_fds: tuple[int, ...],
     ) -> None: ...
@@ -1210,7 +1211,7 @@ class CodecTool(Protocol):
     def transcode_h265_nvenc(
         self,
         inputs: tuple[Path, ...],
-        output: Path,
+        output: Path | AssemblyOutput,
         *,
         pass_fds: tuple[int, ...],
     ) -> None: ...
@@ -1228,7 +1229,23 @@ class MediaInfo:
 
 
 class MediaProbe(Protocol):
-    def probe(self, path: Path, *, pass_fds: tuple[int, ...] = ()) -> MediaInfo: ...
+    def probe(
+        self,
+        path: Path | AssemblyOutput,
+        *,
+        pass_fds: tuple[int, ...] = (),
+    ) -> MediaInfo: ...
+
+
+@runtime_checkable
+class AssemblyOutput(Protocol):
+    """Seekable pre-opened output supplied by a descriptor-pinned workspace."""
+
+    descriptor: int
+    max_bytes: int
+
+    @property
+    def descriptor_path(self) -> Path: ...
 
 
 class FfprobeMediaProbe:
@@ -1237,7 +1254,17 @@ class FfprobeMediaProbe:
     def __init__(self, executable: str | None = None) -> None:
         self.executable = executable or shutil.which("ffprobe") or "ffprobe"
 
-    def probe(self, path: Path, *, pass_fds: tuple[int, ...] = ()) -> MediaInfo:
+    def probe(
+        self,
+        path: Path | AssemblyOutput,
+        *,
+        pass_fds: tuple[int, ...] = (),
+    ) -> MediaInfo:
+        source_arguments = (
+            ("-fd", str(path.descriptor), "fd:")
+            if isinstance(path, AssemblyOutput)
+            else (str(path),)
+        )
         try:
             result = subprocess.run(
                 (
@@ -1247,10 +1274,12 @@ class FfprobeMediaProbe:
                     "-select_streams",
                     "v:0",
                     "-show_entries",
-                    "format=duration:stream=codec_name,profile,pix_fmt",
+                    "format=duration:stream=codec_name,profile,pix_fmt:"
+                    "packet=size,flags",
+                    "-show_packets",
                     "-of",
                     "json",
-                    str(path),
+                    *source_arguments,
                 ),
                 check=True,
                 capture_output=True,
@@ -1259,11 +1288,21 @@ class FfprobeMediaProbe:
                 pass_fds=pass_fds,
             )
             payload = json.loads(result.stdout)
+            if result.stderr.strip():
+                raise ValueError("ffprobe reported media errors")
             stream = payload["streams"][0]
             duration = float(payload["format"]["duration"])
             codec = str(stream["codec_name"]).lower()
             profile = str(stream.get("profile", ""))
             pixel_format = str(stream.get("pix_fmt", "")).lower()
+            packets = payload["packets"]
+            if (
+                not isinstance(packets, list)
+                or not packets
+                or any(int(packet["size"]) <= 0 for packet in packets)
+                or not any("K" in str(packet.get("flags", "")) for packet in packets)
+            ):
+                raise ValueError("media packet structure is invalid")
         except (
             IndexError,
             KeyError,
@@ -1298,38 +1337,52 @@ class FfmpegCodecTool:
         self.nvenc_available = self._detect_nvenc()
 
     @staticmethod
-    def remux_command(concat_file: Path, output: Path) -> tuple[str, ...]:
-        return (
+    def remux_command(
+        concat_file: Path,
+        output: Path | AssemblyOutput,
+    ) -> tuple[str, ...]:
+        prefix = (
             "ffmpeg",
             "-nostdin",
+            "-y",
             "-v",
             "error",
             "-f",
             "concat",
             "-safe",
             "0",
+            "-protocol_whitelist",
+            "file,pipe,crypto,data",
             "-i",
             str(concat_file),
             "-map",
             "0",
             "-c",
             "copy",
-            "-movflags",
-            "+faststart",
-            str(output),
+            "-f",
+            "mp4",
         )
+        if isinstance(output, AssemblyOutput):
+            return (*prefix, "-fd", str(output.descriptor), "fd:")
+        return (*prefix, "-movflags", "+faststart", str(output))
 
     @staticmethod
-    def nvenc_command(concat_file: Path, output: Path) -> tuple[str, ...]:
-        return (
+    def nvenc_command(
+        concat_file: Path,
+        output: Path | AssemblyOutput,
+    ) -> tuple[str, ...]:
+        prefix = (
             "ffmpeg",
             "-nostdin",
+            "-y",
             "-v",
             "error",
             "-f",
             "concat",
             "-safe",
             "0",
+            "-protocol_whitelist",
+            "file,pipe,crypto,data",
             "-i",
             str(concat_file),
             "-map",
@@ -1346,15 +1399,17 @@ class FfmpegCodecTool:
             "yuv420p",
             "-c:a",
             "aac",
-            "-movflags",
-            "+faststart",
-            str(output),
+            "-f",
+            "mp4",
         )
+        if isinstance(output, AssemblyOutput):
+            return (*prefix, "-fd", str(output.descriptor), "fd:")
+        return (*prefix, "-movflags", "+faststart", str(output))
 
     def remux_h264(
         self,
         inputs: tuple[Path, ...],
-        output: Path,
+        output: Path | AssemblyOutput,
         *,
         pass_fds: tuple[int, ...],
     ) -> None:
@@ -1363,7 +1418,7 @@ class FfmpegCodecTool:
     def transcode_h265_nvenc(
         self,
         inputs: tuple[Path, ...],
-        output: Path,
+        output: Path | AssemblyOutput,
         *,
         pass_fds: tuple[int, ...],
     ) -> None:
@@ -1387,40 +1442,50 @@ class FfmpegCodecTool:
     def _run(
         self,
         inputs: tuple[Path, ...],
-        output: Path,
+        output: Path | AssemblyOutput,
         *,
         nvenc: bool,
         pass_fds: tuple[int, ...],
     ) -> None:
-        concat_file = output.with_name(f".{output.name}.{uuid4().hex}.concat")
         try:
-            lines = []
-            for path in inputs:
-                escaped = str(path).replace("'", "'\\''")
-                lines.append(f"file '{escaped}'")
-            _atomic_write(concat_file, ("\n".join(lines) + "\n").encode())
-            command = (
-                self.nvenc_command(concat_file, output)
-                if nvenc
-                else self.remux_command(concat_file, output)
-            )
-            command = (self.executable, *command[1:])
-            subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                timeout=120,
-                pass_fds=pass_fds,
-            )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            with tempfile.TemporaryDirectory(
+                prefix="kuzet-ffmpeg-concat-"
+            ) as directory:
+                concat_file = Path(directory) / "fragments.concat"
+                lines = []
+                for path in inputs:
+                    reference = (
+                        f"file:{path}"
+                        if str(path).startswith("/dev/fd/")
+                        else str(path)
+                    )
+                    escaped = reference.replace("'", "'\\''")
+                    lines.append(f"file '{escaped}'")
+                _atomic_write(concat_file, ("\n".join(lines) + "\n").encode())
+                command = (
+                    self.nvenc_command(concat_file, output)
+                    if nvenc
+                    else self.remux_command(concat_file, output)
+                )
+                command = (self.executable, *command[1:])
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    timeout=120,
+                    pass_fds=pass_fds,
+                )
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             raise ClipAssemblyError("ffmpeg evidence assembly failed") from exc
-        finally:
-            concat_file.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True, slots=True)
 class AssembledEvidence:
-    path: Path
+    path: Path | AssemblyOutput
     sha256: str
     codec: Literal["h264"]
     start_at: datetime
@@ -1444,7 +1509,11 @@ class ClipAssembler:
         self._media_probe = media_probe
         self._nvenc_slots = threading.BoundedSemaphore(max_nvenc_jobs)
 
-    def assemble(self, reservation: EvidenceReservation, output: str | Path) -> AssembledEvidence:
+    def assemble(
+        self,
+        reservation: EvidenceReservation,
+        output: str | Path | AssemblyOutput,
+    ) -> AssembledEvidence:
         """Build the final, duration-attested evidence clip."""
         if reservation.status != "ready":
             raise ClipAssemblyError("post-roll is still pending")
@@ -1453,7 +1522,7 @@ class ClipAssembler:
     def assemble_preview(
         self,
         reservation: EvidenceReservation,
-        output: str | Path,
+        output: str | Path | AssemblyOutput,
     ) -> AssembledEvidence:
         """Build a browser-playable pending preview without releasing its pins."""
         return self._assemble(reservation, output, final=False)
@@ -1461,7 +1530,7 @@ class ClipAssembler:
     def _assemble(
         self,
         reservation: EvidenceReservation,
-        output: str | Path,
+        output: str | Path | AssemblyOutput,
         *,
         final: bool,
     ) -> AssembledEvidence:
@@ -1477,17 +1546,29 @@ class ClipAssembler:
         if len(codecs) != 1:
             raise ClipAssemblyError("evidence fragments use mixed codecs")
         source_codec = next(iter(codecs))
-        output_path = Path(output).absolute()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output_path.with_name(f".{output_path.stem}.{uuid4().hex}.part.mp4")
+        descriptor_output = output if isinstance(output, AssemblyOutput) else None
+        if descriptor_output is None:
+            output_path = Path(output).absolute()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = output_path.with_name(
+                f".{output_path.stem}.{uuid4().hex}.part.mp4"
+            )
+            output_fds: tuple[int, ...] = ()
+        else:
+            output_path = descriptor_output.descriptor_path
+            temporary = output_path
+            output_fds = (descriptor_output.descriptor,)
+            os.ftruncate(descriptor_output.descriptor, 0)
+            os.lseek(descriptor_output.descriptor, 0, os.SEEK_SET)
         acquired = False
         try:
             with self._attested_inputs(reservation) as (inputs, pass_fds):
+                codec_fds = (*pass_fds, *output_fds)
                 media_items: list[MediaInfo] = []
-                for path in inputs:
-                    self._rewind_descriptors(pass_fds)
+                for path, descriptor in zip(inputs, pass_fds, strict=True):
+                    os.lseek(descriptor, 0, os.SEEK_SET)
                     media_items.append(
-                        self._media_probe.probe(path, pass_fds=pass_fds)
+                        self._media_probe.probe(path, pass_fds=(descriptor,))
                     )
                 media = tuple(media_items)
                 self._rewind_descriptors(pass_fds)
@@ -1498,8 +1579,12 @@ class ClipAssembler:
                 if source_is_browser_compatible:
                     self._codec_tool.remux_h264(
                         inputs,
-                        temporary,
-                        pass_fds=pass_fds,
+                        (
+                            temporary
+                            if descriptor_output is None
+                            else descriptor_output
+                        ),
+                        pass_fds=codec_fds,
                     )
                 else:
                     if not self._codec_tool.nvenc_available:
@@ -1509,12 +1594,34 @@ class ClipAssembler:
                         raise NvencCapacityError("NVENC evidence transcode capacity is full")
                     self._codec_tool.transcode_h265_nvenc(
                         inputs,
-                        temporary,
-                        pass_fds=pass_fds,
+                        (
+                            temporary
+                            if descriptor_output is None
+                            else descriptor_output
+                        ),
+                        pass_fds=codec_fds,
                     )
-            if not temporary.is_file() or temporary.stat().st_size <= 0:
-                raise ClipAssemblyError("codec tool did not produce a playable clip")
-            output_media = self._media_probe.probe(temporary)
+            if descriptor_output is None:
+                if not temporary.is_file() or temporary.stat().st_size <= 0:
+                    raise ClipAssemblyError("codec tool did not produce a playable clip")
+            else:
+                os.fsync(descriptor_output.descriptor)
+                output_stat = os.fstat(descriptor_output.descriptor)
+                if (
+                    not stat.S_ISREG(output_stat.st_mode)
+                    or output_stat.st_uid != os.getuid()
+                    or output_stat.st_mode & 0o022
+                    or output_stat.st_size <= 0
+                    or output_stat.st_size > descriptor_output.max_bytes
+                ):
+                    raise ClipAssemblyError(
+                        "codec tool output failed finite descriptor validation"
+                    )
+                os.lseek(descriptor_output.descriptor, 0, os.SEEK_SET)
+            output_media = self._media_probe.probe(
+                temporary if descriptor_output is None else descriptor_output,
+                pass_fds=output_fds,
+            )
             if not output_media.browser_compatible or output_media.codec != "h264":
                 raise ClipAssemblyError("assembled evidence is not browser-compatible H.264")
             if abs(output_media.duration_seconds - expected_duration) > 0.25:
@@ -1523,22 +1630,46 @@ class ClipAssembler:
                 raise ClipAssemblyError("assembled evidence duration is outside 4-10 seconds")
             if not final and not 0.0 < output_media.duration_seconds <= 10.0:
                 raise ClipAssemblyError("assembled preview duration is outside its finite bound")
-            os.replace(temporary, output_path)
-            _fsync_directory(output_path.parent)
+            if descriptor_output is None:
+                os.replace(temporary, output_path)
+                _fsync_directory(output_path.parent)
         finally:
             if acquired:
                 self._nvenc_slots.release()
-            temporary.unlink(missing_ok=True)
+            if descriptor_output is None:
+                temporary.unlink(missing_ok=True)
         assert reservation.start_at is not None
         assert reservation.end_at is not None
         return AssembledEvidence(
-            path=output_path,
-            sha256=_sha256_file(output_path),
+            path=output_path if descriptor_output is None else descriptor_output,
+            sha256=(
+                _sha256_file(output_path)
+                if descriptor_output is None
+                else self._sha256_descriptor(
+                    descriptor_output.descriptor,
+                    max_bytes=descriptor_output.max_bytes,
+                )
+            ),
             codec="h264",
             start_at=reservation.start_at,
             end_at=reservation.end_at,
             source_codec=source_codec,
         )
+
+    @staticmethod
+    def _sha256_descriptor(descriptor: int, *, max_bytes: int) -> str:
+        digest = hashlib.sha256()
+        total = 0
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while block := os.read(descriptor, min(1024 * 1024, max_bytes + 1 - total)):
+            total += len(block)
+            if total > max_bytes:
+                raise ClipAssemblyError(
+                    "assembled evidence exceeds its finite byte bound"
+                )
+            digest.update(block)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return digest.hexdigest()
 
     @staticmethod
     def _rewind_descriptors(descriptors: tuple[int, ...]) -> None:

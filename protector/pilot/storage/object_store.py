@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -50,6 +50,16 @@ class EvidencePublicationFailure(ExceptionGroup):
     """Object publication failed and the durable failed transition also failed."""
 
 
+class EvidenceReadyTransitionFailure(RuntimeError):
+    """Object exists but the ready transition was not committed or journaled."""
+
+    def __init__(self, stored: StoredObject, cause: Exception) -> None:
+        super().__init__("evidence object is durable but ready transition failed")
+        self.stored = stored
+        self.transition_durable = False
+        self.cause = cause
+
+
 def validate_object_key(key: str) -> str:
     """Reject absolute, ambiguous, traversal, and reserved temporary keys."""
     if not key or len(key) > 1024 or "\\" in key or "\x00" in key:
@@ -79,18 +89,29 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+@runtime_checkable
+class DescriptorEvidenceSource(Protocol):
+    def duplicate_descriptor(self) -> int: ...
+
+
+EvidenceSource = Path | DescriptorEvidenceSource
+
+
 def _read_attested_source(
-    source: Path,
+    source: EvidenceSource,
     *,
     expected_sha256: str,
     max_object_bytes: int,
 ) -> bytes:
     """Read, bound, and hash one no-follow descriptor so pathname swaps cannot alter bytes."""
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(source, flags)
+        if isinstance(source, DescriptorEvidenceSource):
+            descriptor = source.duplicate_descriptor()
+        else:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(source, flags)
         try:
             source_stat = os.fstat(descriptor)
             if not stat.S_ISREG(source_stat.st_mode):
@@ -132,7 +153,21 @@ class StoredObject:
 
 
 class EvidenceObjectStore(Protocol):
-    def publish(self, source: Path, key: str, *, sha256: str) -> StoredObject: ...
+    def publish(
+        self,
+        source: EvidenceSource,
+        key: str,
+        *,
+        sha256: str,
+    ) -> StoredObject: ...
+
+    def verify(
+        self,
+        key: str,
+        *,
+        sha256: str,
+        size_bytes: int,
+    ) -> StoredObject | None: ...
 
     def delete(self, key: str) -> None: ...
 
@@ -206,11 +241,17 @@ class S3CompatibleObjectStore:
         self.server_side_encryption = server_side_encryption
         self.kms_key_id = kms_key_id
 
-    def publish(self, source: Path, key: str, *, sha256: str) -> StoredObject:
+    def publish(
+        self,
+        source: EvidenceSource,
+        key: str,
+        *,
+        sha256: str,
+    ) -> StoredObject:
         key = validate_object_key(key)
         sha256 = _validate_digest(sha256)
         payload = _read_attested_source(
-            Path(source),
+            source,
             expected_sha256=sha256,
             max_object_bytes=self.max_object_bytes,
         )
@@ -243,6 +284,24 @@ class S3CompatibleObjectStore:
         if final is None:
             raise ObjectPublishError("final object was not durable after conditional create")
         return self._validated_object(key, sha256, size, final)
+
+    def verify(
+        self,
+        key: str,
+        *,
+        sha256: str,
+        size_bytes: int,
+    ) -> StoredObject | None:
+        key = validate_object_key(key)
+        sha256 = _validate_digest(sha256)
+        if size_bytes <= 0 or size_bytes > self.max_object_bytes:
+            raise ObjectIntegrityError(
+                "remote evidence size is outside the configured bound"
+            )
+        head = self._head(self._remote_key(key))
+        if head is None:
+            return None
+        return self._validated_object(key, sha256, size_bytes, head)
 
     def delete(self, key: str) -> None:
         try:
@@ -416,11 +475,17 @@ class EncryptedLocalObjectStore:
         incomplete.mkdir(mode=0o700)
         self._incomplete_root = incomplete
 
-    def publish(self, source: Path, key: str, *, sha256: str) -> StoredObject:
+    def publish(
+        self,
+        source: EvidenceSource,
+        key: str,
+        *,
+        sha256: str,
+    ) -> StoredObject:
         key = validate_object_key(key)
         sha256 = _validate_digest(sha256)
         payload = _read_attested_source(
-            Path(source),
+            source,
             expected_sha256=sha256,
             max_object_bytes=self.max_object_bytes,
         )
@@ -498,6 +563,45 @@ class EncryptedLocalObjectStore:
             if parent_descriptor >= 0:
                 os.close(parent_descriptor)
         return StoredObject(key=key, sha256=sha256, size_bytes=size, path=destination)
+
+    def verify(
+        self,
+        key: str,
+        *,
+        sha256: str,
+        size_bytes: int,
+    ) -> StoredObject | None:
+        key = validate_object_key(key)
+        sha256 = _validate_digest(sha256)
+        if size_bytes <= 0 or size_bytes > self.max_object_bytes:
+            raise ObjectIntegrityError(
+                "local evidence size is outside the configured bound"
+            )
+        parent_descriptor = -1
+        try:
+            parent_descriptor, final_name = self._open_parent(key, create=False)
+            payload = self._read_existing(
+                parent_descriptor,
+                final_name,
+                max_bytes=self.max_object_bytes,
+            )
+        except FileNotFoundError:
+            return None
+        finally:
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+        if payload is None:
+            return None
+        if len(payload) != size_bytes or hashlib.sha256(payload).hexdigest() != sha256:
+            raise ObjectIntegrityError(
+                "local evidence object identity does not match ready intent"
+            )
+        return StoredObject(
+            key=key,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            path=self._prefix_root / key,
+        )
 
     def delete(self, key: str) -> None:
         key = validate_object_key(key)
@@ -621,7 +725,11 @@ class EvidencePublisher:
         self._repository = repository
         self._journal = journal
 
-    def publish(self, source: Path, evidence: EvidenceInput) -> EvidenceInput:
+    def publish(
+        self,
+        source: EvidenceSource,
+        evidence: EvidenceInput,
+    ) -> EvidenceInput:
         if evidence.status not in ("pending", "failed"):
             raise ValueError("evidence publication must begin from pending or failed")
         try:
@@ -635,9 +743,33 @@ class EvidencePublisher:
                 ),
                 evidence,
             )
+        try:
+            return self.mark_ready(evidence)
+        except Exception as exc:
+            try:
+                exc.evidence_object_durable = True  # type: ignore[attr-defined]
+                exc.ready_transition_durable = False  # type: ignore[attr-defined]
+                exc.stored_object = stored  # type: ignore[attr-defined]
+            except Exception:
+                raise EvidenceReadyTransitionFailure(stored, exc) from exc
+            raise
+
+    def mark_ready(self, evidence: EvidenceInput) -> EvidenceInput:
         ready = replace(evidence, status="ready")
         self._finalize_or_journal(ready, status="ready")
         return ready
+
+    def verify_ready_object(
+        self,
+        evidence: EvidenceInput,
+        *,
+        size_bytes: int,
+    ) -> StoredObject | None:
+        return self._store.verify(
+            evidence.object_key,
+            sha256=evidence.sha256,
+            size_bytes=size_bytes,
+        )
 
     def mark_failed(self, evidence: EvidenceInput) -> EvidenceInput:
         failed = replace(evidence, status="failed")
@@ -693,6 +825,190 @@ class PreviewWorkspaceCapacityError(RuntimeError):
     """The finite preview workspace cannot accept another temporary clip."""
 
 
+@dataclass(frozen=True, slots=True)
+class RegisteredWorkspaceOutput:
+    """Immutable identity measured from the pinned assembly descriptor."""
+
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceRecoveryRecord:
+    """Bounded durable intent used to reconcile abandoned evidence work."""
+
+    reservation_id: str
+    evidence: EvidenceInput | None
+    intent: Literal["ready"] | None
+    size_bytes: int | None
+
+
+class WorkspaceEvidenceSource:
+    """Read-only evidence source pinned to an attested workspace inode."""
+
+    def __init__(
+        self,
+        *,
+        workspace: PreviewWorkspace,
+        descriptor: int,
+        max_bytes: int,
+    ) -> None:
+        self.workspace = workspace
+        self.descriptor = descriptor
+        self.max_bytes = max_bytes
+
+    def duplicate_descriptor(self) -> int:
+        if self.descriptor < 0:
+            raise ObjectPublishError("workspace evidence source is closed")
+        self.workspace._assert_root_attested()
+        duplicate = os.dup(self.descriptor)
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        return duplicate
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+    def __enter__(self) -> WorkspaceEvidenceSource:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+class WorkspaceAssemblyTarget:
+    """Pre-opened seekable output pinned to one attested preview workspace."""
+
+    def __init__(
+        self,
+        *,
+        workspace: PreviewWorkspace,
+        reservation_id: str,
+        kind: Literal["preview", "final"],
+        temporary_name: str,
+        final_name: str,
+        descriptor: int,
+    ) -> None:
+        self.workspace = workspace
+        self.reservation_id = reservation_id
+        self.kind = kind
+        self.temporary_name = temporary_name
+        self.final_name = final_name
+        self.descriptor = descriptor
+        self.max_bytes = workspace.max_file_bytes
+        self.promoted = False
+
+    @property
+    def descriptor_path(self) -> Path:
+        self._require_open()
+        return Path(f"/dev/fd/{self.descriptor}")
+
+    def write_bytes(self, payload: bytes) -> int:
+        self._require_open()
+        if not payload or len(payload) > self.max_bytes:
+            raise PreviewWorkspaceCapacityError(
+                "assembled evidence output exceeds its finite byte bound"
+            )
+        self.workspace._assert_root_attested()
+        os.ftruncate(self.descriptor, 0)
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        view = memoryview(payload)
+        while view:
+            written = os.write(self.descriptor, view)
+            view = view[written:]
+        os.fsync(self.descriptor)
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        return len(payload)
+
+    def read_bytes(self) -> bytes:
+        duplicate = self.duplicate_descriptor()
+        try:
+            payload = bytearray()
+            while block := os.read(
+                duplicate,
+                min(1024 * 1024, self.max_bytes + 1 - len(payload)),
+            ):
+                payload.extend(block)
+                if len(payload) > self.max_bytes:
+                    raise PreviewWorkspaceCapacityError(
+                        "assembled evidence output exceeds its finite byte bound"
+                    )
+            return bytes(payload)
+        finally:
+            os.close(duplicate)
+
+    def duplicate_descriptor(self) -> int:
+        self._require_open()
+        self.workspace._assert_root_attested()
+        duplicate = os.dup(self.descriptor)
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        return duplicate
+
+    def validate(self) -> tuple[int, str]:
+        self._require_open()
+        self.workspace._assert_root_attested()
+        output_stat = os.fstat(self.descriptor)
+        if (
+            not stat.S_ISREG(output_stat.st_mode)
+            or output_stat.st_uid != os.getuid()
+            or output_stat.st_mode & 0o022
+            or output_stat.st_size <= 0
+            or output_stat.st_size > self.max_bytes
+        ):
+            raise PreviewWorkspaceCapacityError(
+                "assembled evidence output failed descriptor validation"
+            )
+        digest = hashlib.sha256()
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        remaining = self.max_bytes + 1
+        while remaining > 0:
+            block = os.read(self.descriptor, min(1024 * 1024, remaining))
+            if not block:
+                break
+            digest.update(block)
+            remaining -= len(block)
+        if remaining == 0 and os.read(self.descriptor, 1):
+            raise PreviewWorkspaceCapacityError(
+                "assembled evidence output exceeds its finite byte bound"
+            )
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        return output_stat.st_size, digest.hexdigest()
+
+    def exists(self) -> bool:
+        name = self.final_name if self.promoted else self.temporary_name
+        try:
+            os.stat(
+                name,
+                dir_fd=self.workspace._root_fd,
+                follow_symlinks=False,
+            )
+        except (FileNotFoundError, OSError):
+            return False
+        return True
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+        self.workspace._open_targets.discard(self)
+
+    def _require_open(self) -> None:
+        if self.descriptor < 0:
+            raise PreviewWorkspaceCapacityError(
+                "assembled evidence output descriptor is closed"
+            )
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "descriptor", -1)
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self.descriptor = -1
+
+
 class PreviewWorkspace:
     """Owned finite workspace for preview/final temporary media only."""
 
@@ -710,12 +1026,20 @@ class PreviewWorkspace:
         ttl: timedelta,
         max_items: int,
         max_bytes: int,
+        max_file_bytes: int | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if ttl <= timedelta(0):
             raise ValueError("preview workspace TTL must be positive")
         if max_items < 1 or max_bytes < 1:
             raise ValueError("preview workspace bounds must be positive")
+        if (
+            max_file_bytes is not None
+            and (max_file_bytes < 1 or max_file_bytes > max_bytes)
+        ):
+            raise ValueError(
+                "preview workspace file bound must fit within its total byte bound"
+            )
         self.root = Path(os.path.abspath(os.fspath(root)))
         if self.root == Path(self.root.anchor):
             raise ValueError("preview workspace must be a dedicated directory")
@@ -725,8 +1049,12 @@ class PreviewWorkspace:
         self.ttl = ttl
         self.max_items = max_items
         self.max_bytes = max_bytes
+        self.max_file_bytes = (
+            max_bytes if max_file_bytes is None else max_file_bytes
+        )
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
+        self._open_targets: set[WorkspaceAssemblyTarget] = set()
         flags = (
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
@@ -771,6 +1099,8 @@ class PreviewWorkspace:
 
     def close(self) -> None:
         with self._lock:
+            for target in tuple(self._open_targets):
+                target.close()
             if self._root_fd >= 0:
                 os.close(self._root_fd)
                 self._root_fd = -1
@@ -819,7 +1149,7 @@ class PreviewWorkspace:
         *,
         kind: Literal["preview", "final"],
         evidence: EvidenceInput | None = None,
-    ) -> Path:
+    ) -> WorkspaceAssemblyTarget:
         with self._lock:
             self._assert_path_attested()
             key = self._key(reservation_id)
@@ -847,37 +1177,67 @@ class PreviewWorkspace:
                     if evidence is not None
                     else None if current is None else current["evidence"]
                 ),
+                intent=None if current is None else current["intent"],
+                size_bytes=None if current is None else current["size_bytes"],
             )
             self._assert_path_attested()
-            return self.root / f"{key}.{kind}.mp4"
+            temporary_name = f".kuzet-preview-{uuid4().hex}.tmp"
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=self._root_fd,
+            )
+            target = WorkspaceAssemblyTarget(
+                workspace=self,
+                reservation_id=reservation_id,
+                kind=kind,
+                temporary_name=temporary_name,
+                final_name=f"{key}.{kind}.mp4",
+                descriptor=descriptor,
+            )
+            self._open_targets.add(target)
+            return target
 
     def register(
         self,
         reservation_id: str,
         *,
         kind: Literal["preview", "final"],
-        path: Path,
+        path: WorkspaceAssemblyTarget,
         evidence: EvidenceInput | None = None,
-    ) -> None:
+    ) -> RegisteredWorkspaceOutput:
         self._assert_path_attested()
         key = self._key(reservation_id)
         expected_name = f"{key}.{kind}.mp4"
-        expected = self.root / expected_name
-        if Path(path).absolute() != expected:
+        if (
+            not isinstance(path, WorkspaceAssemblyTarget)
+            or path.workspace is not self
+            or path.reservation_id != reservation_id
+            or path.kind != kind
+            or path.final_name != expected_name
+        ):
             raise ValueError("temporary evidence path escaped the preview workspace")
         with self._lock:
             self._assert_path_attested()
-            file_stat = os.stat(
+            size_bytes, digest = path.validate()
+            self._assert_target_name_bound(path, path.temporary_name)
+            os.replace(
+                path.temporary_name,
                 expected_name,
-                dir_fd=self._root_fd,
-                follow_symlinks=False,
+                src_dir_fd=self._root_fd,
+                dst_dir_fd=self._root_fd,
             )
-            if (
-                not stat.S_ISREG(file_stat.st_mode)
-                or file_stat.st_uid != os.getuid()
-                or file_stat.st_mode & 0o022
-            ):
-                raise ValueError("temporary evidence must be a regular owned file")
+            self._assert_target_name_bound(path, expected_name)
+            path.promoted = True
+            self._fsync_root()
             records = self._records()
             current = records.get(key)
             created_at = (
@@ -897,6 +1257,8 @@ class PreviewWorkspace:
                     if evidence is not None
                     else None if current is None else current["evidence"]
                 ),
+                intent=None if current is None else current["intent"],
+                size_bytes=None if current is None else current["size_bytes"],
             )
             if self.item_count > self.max_items or self.used_bytes > self.max_bytes:
                 cleanup_errors = self.cleanup(reservation_id)
@@ -914,22 +1276,129 @@ class PreviewWorkspace:
                     "preview workspace bound reached"
                 )
             self._assert_path_attested()
+            return RegisteredWorkspaceOutput(
+                size_bytes=size_bytes,
+                sha256=digest,
+            )
 
     def abandoned_records(
         self,
-    ) -> tuple[tuple[str, EvidenceInput | None], ...]:
+    ) -> tuple[WorkspaceRecoveryRecord, ...]:
         return tuple(
             sorted(
                 [
-                    (
-                        str(record["reservation_id"]),
-                        record["evidence"],
+                    WorkspaceRecoveryRecord(
+                        reservation_id=str(record["reservation_id"]),
+                        evidence=record["evidence"],
+                        intent=record["intent"],
+                        size_bytes=record["size_bytes"],
                     )
                     for record in self._records().values()
                 ],
-                key=lambda item: item[0],
+                key=lambda item: item.reservation_id,
             )
         )
+
+    def persist_ready_intent(
+        self,
+        reservation_id: str,
+        *,
+        evidence: EvidenceInput,
+        size_bytes: int,
+    ) -> None:
+        if evidence.status != "pending":
+            raise ValueError("ready intent evidence must remain pending")
+        if size_bytes <= 0 or size_bytes > self.max_file_bytes:
+            raise PreviewWorkspaceCapacityError(
+                "ready intent size is outside the finite workspace bound"
+            )
+        with self._lock:
+            self._assert_path_attested()
+            key = self._key(reservation_id)
+            current = self._records().get(key)
+            final_name = f"{key}.final.mp4"
+            if current is None or final_name not in current["paths"]:
+                raise PreviewWorkspaceCapacityError(
+                    "ready intent requires a registered final evidence object"
+                )
+            self._write_record(
+                key=key,
+                reservation_id=reservation_id,
+                created_at=datetime.fromisoformat(str(current["created_at"])),
+                paths=current["paths"],
+                evidence=evidence,
+                intent="ready",
+                size_bytes=size_bytes,
+            )
+
+    def open_final_source(
+        self,
+        reservation_id: str,
+        *,
+        evidence: EvidenceInput,
+        size_bytes: int,
+    ) -> WorkspaceEvidenceSource | None:
+        with self._lock:
+            self._assert_path_attested()
+            key = self._key(reservation_id)
+            current = self._records().get(key)
+            if (
+                current is None
+                or current["intent"] != "ready"
+                or current["evidence"] != evidence
+                or current["size_bytes"] != size_bytes
+            ):
+                raise PreviewWorkspaceCapacityError(
+                    "workspace ready intent identity changed"
+                )
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(
+                    f"{key}.final.mp4",
+                    flags,
+                    dir_fd=self._root_fd,
+                )
+            except FileNotFoundError:
+                return None
+            try:
+                file_stat = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(file_stat.st_mode)
+                    or file_stat.st_uid != os.getuid()
+                    or file_stat.st_mode & 0o022
+                    or file_stat.st_size != size_bytes
+                    or file_stat.st_size > self.max_file_bytes
+                ):
+                    raise ObjectIntegrityError(
+                        "local recovery evidence identity is unsafe"
+                    )
+                digest = hashlib.sha256()
+                remaining = self.max_bytes + 1
+                while remaining > 0:
+                    block = os.read(descriptor, min(1024 * 1024, remaining))
+                    if not block:
+                        break
+                    digest.update(block)
+                    remaining -= len(block)
+                if remaining == 0 and os.read(descriptor, 1):
+                    raise ObjectIntegrityError(
+                        "local recovery evidence exceeds its finite bound"
+                    )
+                if digest.hexdigest() != evidence.sha256:
+                    raise ObjectIntegrityError(
+                        "local recovery evidence SHA-256 changed"
+                    )
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                return WorkspaceEvidenceSource(
+                    workspace=self,
+                    descriptor=descriptor,
+                    max_bytes=self.max_file_bytes,
+                )
+            except BaseException:
+                os.close(descriptor)
+                raise
 
     def expired_reservation_ids(self) -> tuple[str, ...]:
         now = self._now()
@@ -959,6 +1428,13 @@ class PreviewWorkspace:
             self._assert_root_attested()
         except Exception as exc:
             return [exc]
+        for target in tuple(self._open_targets):
+            if target.reservation_id == reservation_id:
+                try:
+                    self._unlink_bound_target(target)
+                except Exception as exc:
+                    errors.append(exc)
+                target.close()
         names = [f"{key}.preview.mp4", f"{key}.final.mp4"]
         if not preserve_record:
             names.append(f"{key}.json")
@@ -1034,6 +1510,21 @@ class PreviewWorkspace:
                     if evidence_payload is None
                     else EvidenceInput.from_payload(evidence_payload)
                 )
+                intent = raw.get("intent")
+                size_bytes = raw.get("size_bytes")
+                if intent not in (None, "ready"):
+                    raise ValueError("unsupported workspace recovery intent")
+                if intent == "ready" and (
+                    evidence is None
+                    or evidence.status != "pending"
+                    or not isinstance(size_bytes, int)
+                    or isinstance(size_bytes, bool)
+                    or size_bytes <= 0
+                    or size_bytes > self.max_file_bytes
+                ):
+                    raise ValueError("invalid ready recovery identity")
+                if intent is None and size_bytes is not None:
+                    raise ValueError("workspace size requires a recovery intent")
             except (OSError, TypeError, ValueError, KeyError) as exc:
                 raise PreviewWorkspaceCapacityError(
                     "preview workspace contains invalid bounded metadata"
@@ -1043,6 +1534,8 @@ class PreviewWorkspace:
                 "created_at": created_at.astimezone(UTC).isoformat(),
                 "paths": paths,
                 "evidence": evidence,
+                "intent": intent,
+                "size_bytes": size_bytes,
             }
         return records
 
@@ -1081,11 +1574,15 @@ class PreviewWorkspace:
         created_at: datetime,
         paths: list[str],
         evidence: EvidenceInput | None,
+        intent: Literal["ready"] | None = None,
+        size_bytes: int | None = None,
     ) -> None:
         payload = {
             "reservation_id": reservation_id,
             "created_at": created_at.isoformat(),
             "paths": paths,
+            "intent": intent,
+            "size_bytes": size_bytes,
             "evidence": (
                 None
                 if evidence is None
@@ -1110,6 +1607,57 @@ class PreviewWorkspace:
         if len(encoded_payload) > self._MAX_METADATA_BYTES:
             raise ValueError("preview workspace metadata exceeds finite bound")
         self._atomic_write_name(f"{key}.json", encoded_payload)
+
+    def _assert_target_name_bound(
+        self,
+        target: WorkspaceAssemblyTarget,
+        name: str,
+    ) -> None:
+        descriptor_stat = os.fstat(target.descriptor)
+        try:
+            name_stat = os.stat(
+                name,
+                dir_fd=self._root_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise PreviewWorkspaceCapacityError(
+                "assembly target basename inode is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(name_stat.st_mode)
+            or (name_stat.st_dev, name_stat.st_ino)
+            != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+        ):
+            raise PreviewWorkspaceCapacityError(
+                "assembly target basename inode changed"
+            )
+
+    def _unlink_bound_target(self, target: WorkspaceAssemblyTarget) -> None:
+        if target.descriptor < 0:
+            return
+        descriptor_stat = os.fstat(target.descriptor)
+        for name in os.listdir(self._root_fd):
+            if (
+                self._TEMP_PATTERN.fullmatch(name) is None
+                and name != target.final_name
+            ):
+                continue
+            try:
+                name_stat = os.stat(
+                    name,
+                    dir_fd=self._root_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if (name_stat.st_dev, name_stat.st_ino) == (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            ):
+                os.unlink(name, dir_fd=self._root_fd)
+                self._fsync_root()
+                return
 
     def _read_private_name(self, name: str, *, max_bytes: int) -> bytes:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -1280,10 +1828,16 @@ class EvidenceCoordinator:
         self._publisher = publisher
         self.preview_workspace = preview_workspace
         startup_errors: list[Exception] = []
-        for reservation_id, evidence in preview_workspace.abandoned_records():
-            startup_errors.extend(
-                self._reconcile_terminal(reservation_id, evidence=evidence)
-            )
+        for record in preview_workspace.abandoned_records():
+            if record.intent == "ready":
+                startup_errors.extend(self._recover_ready_intent(record))
+            else:
+                startup_errors.extend(
+                    self._reconcile_terminal(
+                        record.reservation_id,
+                        evidence=record.evidence,
+                    )
+                )
         startup_errors.extend(preview_workspace.cleanup_orphans())
         if startup_errors:
             raise ExceptionGroup(
@@ -1304,10 +1858,14 @@ class EvidenceCoordinator:
                 evidence=evidence,
             )
             preview = self._assembler.assemble_preview(reservation, output_path)
+            if preview.path is not output_path:
+                raise ObjectIntegrityError(
+                    "preview assembler returned a different workspace target"
+                )
             self.preview_workspace.register(
                 reservation.reservation_id,
                 kind="preview",
-                path=preview.path,
+                path=output_path,
                 evidence=evidence,
             )
             return preview
@@ -1333,22 +1891,35 @@ class EvidenceCoordinator:
                 evidence=evidence,
             )
             assembled = self._assembler.assemble(reservation, output_path)
-            self.preview_workspace.register(
+            if assembled.path is not output_path:
+                raise ObjectIntegrityError(
+                    "final assembler returned a different workspace target"
+                )
+            registered = self.preview_workspace.register(
                 reservation.reservation_id,
                 kind="final",
-                path=assembled.path,
+                path=output_path,
                 evidence=evidence,
             )
+            if assembled.sha256 != registered.sha256:
+                raise ObjectIntegrityError(
+                    "assembler identity does not match the pinned final descriptor"
+                )
             bounded = replace(
                 evidence,
-                sha256=assembled.sha256,
+                sha256=registered.sha256,
                 codec="h264",
                 start_at=assembled.start_at,
                 end_at=assembled.end_at,
                 status="pending",
             )
+            self.preview_workspace.persist_ready_intent(
+                reservation.reservation_id,
+                evidence=bounded,
+                size_bytes=registered.size_bytes,
+            )
             phase = "publish"
-            result = self._publisher.publish(assembled.path, bounded)
+            result = self._publisher.publish(output_path, bounded)
         except Exception as exc:
             primary = exc
         cleanup_errors: list[Exception] = []
@@ -1361,7 +1932,11 @@ class EvidenceCoordinator:
             )
         elif primary is not None and isinstance(
             primary,
-            EvidencePublicationFailure,
+            (EvidencePublicationFailure, EvidenceReadyTransitionFailure),
+        ) or (
+            primary is not None
+            and getattr(primary, "evidence_object_durable", False) is True
+            and getattr(primary, "ready_transition_durable", True) is False
         ):
             cleanup_errors.extend(
                 self._release_media_preserving_record(reservation.reservation_id)
@@ -1417,6 +1992,53 @@ class EvidenceCoordinator:
         if errors:
             raise ExceptionGroup("expired preview cleanup failed", errors)
         return expired
+
+    def _recover_ready_intent(
+        self,
+        record: WorkspaceRecoveryRecord,
+    ) -> list[Exception]:
+        evidence = record.evidence
+        size_bytes = record.size_bytes
+        if evidence is None or size_bytes is None:
+            return [
+                PreviewWorkspaceCapacityError(
+                    "ready recovery record omitted immutable evidence identity"
+                )
+            ]
+        try:
+            stored = self._publisher.verify_ready_object(
+                evidence,
+                size_bytes=size_bytes,
+            )
+            if stored is None:
+                source = self.preview_workspace.open_final_source(
+                    record.reservation_id,
+                    evidence=evidence,
+                    size_bytes=size_bytes,
+                )
+                if source is None:
+                    self._publisher.mark_failed(evidence)
+                else:
+                    with source:
+                        self._publisher.publish(source, evidence)
+            else:
+                self._publisher.mark_ready(evidence)
+        except ObjectIntegrityError:
+            try:
+                self._publisher.mark_failed(evidence)
+            except Exception as transition_error:
+                errors: list[Exception] = [transition_error]
+                errors.extend(
+                    self._release_media_preserving_record(record.reservation_id)
+                )
+                return errors
+        except Exception as primary:
+            errors = [primary]
+            errors.extend(
+                self._release_media_preserving_record(record.reservation_id)
+            )
+            return errors
+        return self._release_and_cleanup(record.reservation_id)
 
     def _release_and_cleanup(self, reservation_id: str) -> list[Exception]:
         errors = self._release_media_preserving_record(reservation_id)
@@ -1535,6 +2157,7 @@ def build_s3_evidence_delivery(
             if preview_max_bytes is None
             else preview_max_bytes
         ),
+        max_file_bytes=storage.max_evidence_object_bytes,
     )
     coordinator = EvidenceCoordinator(
         ring=ring,

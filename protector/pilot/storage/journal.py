@@ -160,6 +160,7 @@ class EvidenceJournalReplayStatus:
     degraded: bool
     last_error: str | None
     processed_total: int
+    retry_attempts_total: int
     next_retry_in_seconds: float | None
 
 
@@ -469,6 +470,7 @@ class EvidenceJournalReplayWorker:
         self.retry_backoff_seconds = retry_backoff_seconds
         self._monotonic = monotonic_clock or time.monotonic
         self._processed_total = 0
+        self._retry_attempts_total = 0
         self._last_error: str | None = None
         self._retry_at: float | None = None
         self._retry_degraded = False
@@ -484,6 +486,7 @@ class EvidenceJournalReplayWorker:
             degraded=self._retry_degraded or quarantine_depth > 0,
             last_error=self._last_error,
             processed_total=self._processed_total,
+            retry_attempts_total=self._retry_attempts_total,
             next_retry_in_seconds=(
                 None
                 if self._retry_at is None
@@ -513,6 +516,7 @@ class EvidenceJournalReplayWorker:
                 except Exception as exc:
                     self._last_error = type(exc).__name__
                     if is_retryable_database_error(exc):
+                        self._retry_attempts_total += 1
                         self._retry_degraded = True
                         self._retry_at = now + self.retry_backoff_seconds
                         break

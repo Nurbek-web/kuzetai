@@ -223,6 +223,29 @@ def _evidence(event: CandidateEventV1, path: Path, *, status: str = "pending") -
     )
 
 
+class _RecordingRing:
+    def __init__(self) -> None:
+        self.released: list[str] = []
+
+    def release(self, reservation_id: str) -> int:
+        self.released.append(reservation_id)
+        return 1
+
+
+class _FinalBytesAssembler:
+    def __init__(self, payload: bytes = b"final-browser-evidence") -> None:
+        self.payload = payload
+
+    def assemble(self, _: object, output: object) -> object:
+        output.write_bytes(self.payload)  # type: ignore[attr-defined]
+        return SimpleNamespace(
+            path=output,
+            sha256=hashlib.sha256(self.payload).hexdigest(),
+            start_at=NOW - timedelta(seconds=2),
+            end_at=NOW + timedelta(seconds=4),
+        )
+
+
 @pytest.mark.parametrize(
     "key",
     (
@@ -902,7 +925,9 @@ def test_cleanup_attestation_failure_preserves_primary_order_and_reconciliation(
     ]
     assert Ring.released == [reservation_id]
     assert (root / f"{key}.json").exists()
-    assert (root / f"{key}.final.mp4").read_bytes() == b"partial"
+    staging = tuple(root.glob(".kuzet-preview-*.tmp"))
+    assert len(staging) == 1
+    assert staging[0].read_bytes() == b"partial"
 
 
 def test_preview_workspace_expiry_cancel_restart_and_churn_stay_bounded(
@@ -1189,6 +1214,497 @@ def test_preview_cleanup_cannot_touch_another_valid_workspace_after_swap(
     assert not (original / f"{key}.json").exists()
 
 
+def test_preview_assembly_root_swap_never_writes_unmarked_replacement(
+    tmp_path: Path,
+) -> None:
+    class Ring:
+        def release(self, _: str) -> int:
+            return 1
+
+    root = tmp_path / "preview-output-root"
+    original = tmp_path / "preview-output-original"
+
+    class SwappingAssembler:
+        def assemble_preview(self, _: object, output: object) -> object:
+            root.rename(original)
+            root.mkdir(mode=0o700)
+            output.write_bytes(b"preview")  # type: ignore[attr-defined]
+            return SimpleNamespace(path=output)
+
+    coordinator = EvidenceCoordinator(
+        ring=Ring(),
+        assembler=SwappingAssembler(),
+        publisher=SimpleNamespace(),  # type: ignore[arg-type]
+        preview_workspace=PreviewWorkspace(
+            root,
+            ttl=timedelta(minutes=5),
+            max_items=2,
+            max_bytes=100,
+            clock=lambda: NOW,
+        ),
+    )
+
+    with pytest.raises(PreviewWorkspaceCapacityError, match="pathname"):
+        coordinator.create_preview(SimpleNamespace(reservation_id="preview-swap"))
+
+    assert tuple(root.iterdir()) == ()
+    assert not tuple(original.glob("*.mp4"))
+    assert not tuple(original.glob(".kuzet-preview-*.tmp"))
+
+
+def test_final_assembly_root_swap_never_writes_another_valid_workspace(
+    tmp_path: Path,
+) -> None:
+    class Ring:
+        def release(self, _: str) -> int:
+            return 1
+
+    class Publisher:
+        def mark_failed(self, evidence: EvidenceInput) -> EvidenceInput:
+            return replace(evidence, status="failed")
+
+    first_root = tmp_path / "final-output-first"
+    second_root = tmp_path / "final-output-second"
+    moved_first = tmp_path / "final-output-first-original"
+    first_workspace = PreviewWorkspace(
+        first_root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=100,
+        clock=lambda: NOW,
+    )
+    second_workspace = PreviewWorkspace(
+        second_root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=100,
+        clock=lambda: NOW,
+    )
+    second_workspace.prepare("second-owned", kind="preview")
+    names_before = set(os.listdir(second_workspace._root_fd))
+
+    class SwappingAssembler:
+        def assemble(self, _: object, output: object) -> object:
+            first_root.rename(moved_first)
+            second_root.rename(first_root)
+            output.write_bytes(b"final")  # type: ignore[attr-defined]
+            return SimpleNamespace(
+                path=output,
+                sha256=hashlib.sha256(b"final").hexdigest(),
+                start_at=NOW,
+                end_at=NOW + timedelta(seconds=4),
+            )
+
+    coordinator = EvidenceCoordinator(
+        ring=Ring(),
+        assembler=SwappingAssembler(),
+        publisher=Publisher(),  # type: ignore[arg-type]
+        preview_workspace=first_workspace,
+    )
+    seed = tmp_path / "final-swap-seed.mp4"
+    seed.write_bytes(b"seed")
+
+    with pytest.raises(PreviewWorkspaceCapacityError, match="pathname"):
+        coordinator.complete(
+            SimpleNamespace(reservation_id="final-swap", status="ready"),
+            _evidence(_event(), seed),
+        )
+
+    assert set(os.listdir(second_workspace._root_fd)) == names_before
+    assert not tuple(moved_first.glob("*.mp4"))
+    assert not tuple(moved_first.glob(".kuzet-preview-*.tmp"))
+
+
+def test_register_rejects_temp_basename_inode_swap_and_abort_unlinks_exact_target(
+    tmp_path: Path,
+) -> None:
+    workspace = PreviewWorkspace(
+        tmp_path / "inode-bound-previews",
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=100,
+        clock=lambda: NOW,
+    )
+    target = workspace.prepare("inode-swap", kind="final")
+    target.write_bytes(b"trusted-final")
+    target_stat = os.fstat(target.descriptor)
+    moved_name = f".kuzet-preview-{uuid4().hex}.tmp"
+    os.rename(
+        target.temporary_name,
+        moved_name,
+        src_dir_fd=workspace._root_fd,
+        dst_dir_fd=workspace._root_fd,
+    )
+    replacement = os.open(
+        target.temporary_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=workspace._root_fd,
+    )
+    os.write(replacement, b"attacker-replacement")
+    os.close(replacement)
+
+    with pytest.raises(PreviewWorkspaceCapacityError, match="inode"):
+        workspace.register("inode-swap", kind="final", path=target)
+
+    assert workspace.cleanup("inode-swap") == []
+    remaining_target_inodes = {
+        (entry.st_dev, entry.st_ino)
+        for name in os.listdir(workspace._root_fd)
+        if name.startswith(".kuzet-preview-")
+        for entry in (os.stat(name, dir_fd=workspace._root_fd, follow_symlinks=False),)
+    }
+    assert (target_stat.st_dev, target_stat.st_ino) not in remaining_target_inodes
+    assert not workspace.path_for("inode-swap", kind="final").exists()
+
+
+def test_abort_cleanup_removes_preopened_assembly_temp_immediately(
+    tmp_path: Path,
+) -> None:
+    class FailingAssembler:
+        descriptor = -1
+
+        def assemble(self, _: object, output: object) -> object:
+            self.descriptor = output.descriptor  # type: ignore[attr-defined]
+            output.write_bytes(b"partial")  # type: ignore[attr-defined]
+            raise OSError("assembly failed")
+
+    class Publisher:
+        def mark_failed(self, evidence: EvidenceInput) -> EvidenceInput:
+            return replace(evidence, status="failed")
+
+    root = tmp_path / "abort-temp-previews"
+    assembler = FailingAssembler()
+    coordinator = EvidenceCoordinator(
+        ring=_RecordingRing(),
+        assembler=assembler,
+        publisher=Publisher(),  # type: ignore[arg-type]
+        preview_workspace=PreviewWorkspace(
+            root,
+            ttl=timedelta(minutes=5),
+            max_items=2,
+            max_bytes=100,
+            clock=lambda: NOW,
+        ),
+    )
+    seed = tmp_path / "abort-seed.mp4"
+    seed.write_bytes(b"seed")
+
+    with pytest.raises(OSError, match="assembly"):
+        coordinator.complete(
+            SimpleNamespace(reservation_id="abort-temp", status="ready"),
+            _evidence(_event(), seed),
+        )
+
+    assert not tuple(root.glob(".kuzet-preview-*.tmp"))
+    with pytest.raises(OSError):
+        os.fstat(assembler.descriptor)
+
+
+def test_ready_intent_survives_full_wal_across_restarts_until_ready_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    seed = tmp_path / "ready-full-wal-seed.mp4"
+    seed.write_bytes(b"seed")
+    pending = _evidence(event, seed)
+    client = FakeS3Client()
+    journal = SQLiteWALJournal(tmp_path / "ready-full.sqlite3", max_items=1)
+    journal.enqueue_event(_event())
+    publisher = EvidencePublisher(
+        store=_s3_store(client),
+        repository=repository,
+        journal=journal,
+    )
+    original_finalize = repository.finalize_evidence
+
+    def unavailable(*_: object, **__: object) -> object:
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(repository, "finalize_evidence", unavailable)
+    root = tmp_path / "ready-full-wal-previews"
+    first_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    first_ring = _RecordingRing()
+    coordinator = EvidenceCoordinator(
+        ring=first_ring,
+        assembler=_FinalBytesAssembler(),
+        publisher=publisher,
+        preview_workspace=first_workspace,
+    )
+
+    with pytest.raises(JournalFullError) as first_failure:
+        coordinator.complete(
+            SimpleNamespace(reservation_id="ready-full-wal", status="ready"),
+            pending,
+        )
+    assert first_failure.value.evidence_object_durable is True  # type: ignore[attr-defined]
+    assert first_failure.value.ready_transition_durable is False  # type: ignore[attr-defined]
+    assert first_workspace.item_count == 1
+    assert first_ring.released == ["ready-full-wal"]
+    assert client.objects
+    first_workspace.close()
+
+    second_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    second_ring = _RecordingRing()
+    with pytest.raises(ExceptionGroup):
+        EvidenceCoordinator(
+            ring=second_ring,
+            assembler=_FinalBytesAssembler(),
+            publisher=publisher,
+            preview_workspace=second_workspace,
+        )
+    assert second_workspace.item_count == 1
+    assert second_ring.released == ["ready-full-wal"]
+    second_workspace.close()
+
+    monkeypatch.setattr(repository, "finalize_evidence", original_finalize)
+    third_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    third_ring = _RecordingRing()
+    EvidenceCoordinator(
+        ring=third_ring,
+        assembler=_FinalBytesAssembler(),
+        publisher=publisher,
+        preview_workspace=third_workspace,
+    )
+
+    assert repository.get_event(event.event_id).evidence_status == "ready"
+    assert third_workspace.item_count == 0
+    assert third_ring.released == ["ready-full-wal"]
+
+
+def test_deterministic_ready_failure_keeps_tombstone_until_later_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    seed = tmp_path / "deterministic-ready-seed.mp4"
+    seed.write_bytes(b"seed")
+    pending = _evidence(event, seed)
+    publisher = EvidencePublisher(
+        store=_s3_store(FakeS3Client()),
+        repository=repository,
+    )
+    original_finalize = repository.finalize_evidence
+
+    def conflict(*_: object, **__: object) -> object:
+        raise IdempotencyConflictError("deterministic identity conflict")
+
+    monkeypatch.setattr(repository, "finalize_evidence", conflict)
+    root = tmp_path / "deterministic-ready-previews"
+    first_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    coordinator = EvidenceCoordinator(
+        ring=_RecordingRing(),
+        assembler=_FinalBytesAssembler(),
+        publisher=publisher,
+        preview_workspace=first_workspace,
+    )
+    with pytest.raises(IdempotencyConflictError) as failure:
+        coordinator.complete(
+            SimpleNamespace(reservation_id="deterministic-ready", status="ready"),
+            pending,
+        )
+    assert failure.value.evidence_object_durable is True  # type: ignore[attr-defined]
+    assert failure.value.ready_transition_durable is False  # type: ignore[attr-defined]
+    assert first_workspace.item_count == 1
+    first_workspace.close()
+
+    second_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(ExceptionGroup):
+        EvidenceCoordinator(
+            ring=_RecordingRing(),
+            assembler=_FinalBytesAssembler(),
+            publisher=publisher,
+            preview_workspace=second_workspace,
+        )
+    assert second_workspace.item_count == 1
+    second_workspace.close()
+
+    monkeypatch.setattr(repository, "finalize_evidence", original_finalize)
+    third_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    EvidenceCoordinator(
+        ring=_RecordingRing(),
+        assembler=_FinalBytesAssembler(),
+        publisher=publisher,
+        preview_workspace=third_workspace,
+    )
+    assert repository.get_event(event.event_id).evidence_status == "ready"
+    assert third_workspace.item_count == 0
+
+
+def test_restart_republishes_safe_local_ready_intent_after_preupload_crash(
+    tmp_path: Path,
+) -> None:
+    class CrashBeforeUploadPublisher:
+        def publish(self, *_: object, **__: object) -> object:
+            raise KeyboardInterrupt
+
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    seed = tmp_path / "preupload-crash-seed.mp4"
+    seed.write_bytes(b"seed")
+    pending = _evidence(event, seed)
+    root = tmp_path / "preupload-crash-previews"
+    first_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    coordinator = EvidenceCoordinator(
+        ring=_RecordingRing(),
+        assembler=_FinalBytesAssembler(),
+        publisher=CrashBeforeUploadPublisher(),  # type: ignore[arg-type]
+        preview_workspace=first_workspace,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.complete(
+            SimpleNamespace(reservation_id="preupload-crash", status="ready"),
+            pending,
+        )
+    assert first_workspace.item_count == 1
+    assert first_workspace.path_for("preupload-crash", kind="final").exists()
+    first_workspace.close()
+
+    client = FakeS3Client()
+    second_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    ring = _RecordingRing()
+    EvidenceCoordinator(
+        ring=ring,
+        assembler=_FinalBytesAssembler(),
+        publisher=EvidencePublisher(
+            store=_s3_store(client),
+            repository=repository,
+        ),
+        preview_workspace=second_workspace,
+    )
+
+    assert client.objects
+    assert repository.get_event(event.event_id).evidence_status == "ready"
+    assert second_workspace.item_count == 0
+    assert ring.released == ["preupload-crash"]
+
+
+def test_remote_ready_identity_mismatch_fails_terminally_without_inference(
+    tmp_path: Path,
+) -> None:
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    seed = tmp_path / "remote-mismatch-seed.mp4"
+    seed.write_bytes(b"seed")
+    pending = _evidence(event, seed)
+    root = tmp_path / "remote-mismatch-previews"
+    workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    reservation_id = "remote-mismatch"
+    target = workspace.prepare(reservation_id, kind="final", evidence=pending)
+    target.write_bytes(b"trusted-final")
+    registered = workspace.register(
+        reservation_id,
+        kind="final",
+        path=target,
+        evidence=pending,
+    )
+    bounded = replace(
+        pending,
+        sha256=registered.sha256,
+        start_at=NOW - timedelta(seconds=2),
+        end_at=NOW + timedelta(seconds=4),
+        status="pending",
+    )
+    workspace.persist_ready_intent(
+        reservation_id,
+        evidence=bounded,
+        size_bytes=registered.size_bytes,
+    )
+    workspace.close()
+
+    client = FakeS3Client()
+    remote_key = f"pilot-evidence/{bounded.object_key}"
+    wrong = b"different-remote-bytes"
+    client.objects[("evidence", remote_key)] = {
+        "Body": wrong,
+        "ChecksumSHA256": base64.b64encode(hashlib.sha256(wrong).digest()).decode(),
+        "ServerSideEncryption": "AES256",
+        "LastModified": NOW,
+    }
+    restarted_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    EvidenceCoordinator(
+        ring=_RecordingRing(),
+        assembler=_FinalBytesAssembler(),
+        publisher=EvidencePublisher(
+            store=_s3_store(client),
+            repository=repository,
+        ),
+        preview_workspace=restarted_workspace,
+    )
+
+    assert repository.get_event(event.event_id).evidence_status == "failed"
+    assert restarted_workspace.item_count == 0
+    assert client.objects[("evidence", remote_key)]["Body"] == wrong
+
+
 def test_restart_reconciliation_keeps_identity_until_second_restart_succeeds(
     tmp_path: Path,
 ) -> None:
@@ -1391,8 +1907,10 @@ def test_publisher_does_not_journal_deterministic_repository_conflicts(
         raise IdempotencyConflictError("deterministic identity conflict")
 
     monkeypatch.setattr(repository, "finalize_evidence", conflict)
-    with pytest.raises(IdempotencyConflictError, match="deterministic"):
+    with pytest.raises(IdempotencyConflictError, match="deterministic") as transition:
         publisher.publish(clip, evidence)
+    assert transition.value.evidence_object_durable is True  # type: ignore[attr-defined]
+    assert transition.value.ready_transition_durable is False  # type: ignore[attr-defined]
     assert journal.depth() == 0
 
 
@@ -1427,8 +1945,10 @@ def test_publisher_never_journals_deterministic_sqlalchemy_failures(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
     )
 
-    with pytest.raises(type(failure)):
+    with pytest.raises(type(failure)) as transition:
         publisher.publish(clip, evidence)
+    assert transition.value.evidence_object_durable is True  # type: ignore[attr-defined]
+    assert transition.value.ready_transition_durable is False  # type: ignore[attr-defined]
     assert journal.depth() == 0
 
 
