@@ -23,7 +23,7 @@ from protector.pilot.storage.journal import (
     is_retryable_database_error,
 )
 from protector.pilot.storage.models import Base, CandidateEventModel
-from protector.pilot.storage.repositories import PilotRepository
+from protector.pilot.storage.repositories import EvidenceIntent, PilotRepository
 
 UTC = timezone.utc
 NOW = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
@@ -106,6 +106,99 @@ def test_journal_survives_restart_and_replays_idempotently(tmp_path: Path) -> No
         assert len(session.scalars(select(CandidateEventModel)).all()) == 1
 
 
+def test_journal_migrates_legacy_kind_constraint_without_losing_work(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-kind-constraint.sqlite3"
+    event_contract = _event()
+    payload_json = json.dumps(
+        event_contract.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE journal_items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (kind IN ('candidate_event', 'evidence')),
+                schema_version TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO journal_items
+                (kind, schema_version, idempotency_key, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "candidate_event",
+                event_contract.schema_version,
+                event_contract.dedupe_key,
+                payload_json,
+                NOW.isoformat(),
+            ),
+        )
+
+    migrated = SQLiteWALJournal(path, max_items=4)
+    replayed: list[object] = []
+
+    assert migrated.depth() == 1
+    assert migrated.replay(replayed.append) == 1
+    assert replayed[0].payload["event_id"] == str(event_contract.event_id)  # type: ignore[attr-defined]
+    intent = EvidenceIntent(
+        schema_version="evidence-intent.v1",
+        evidence_id=uuid4(),
+        event_id=event_contract.event_id,
+        object_key=f"events/{event_contract.event_id}.mp4",
+        codec="h264",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=4),
+        source_reference="nvr://camera/01",
+        status="failed",
+    )
+    migrated.enqueue(
+        kind="evidence_intent",
+        schema_version=intent.schema_version,
+        idempotency_key=f"evidence-intent:{intent.evidence_id}:failed",
+        payload=intent.to_payload(),
+    )
+    assert migrated.depth() == 1
+
+
+def test_terminal_evidence_intent_replay_marks_candidate_failed(
+    tmp_path: Path,
+) -> None:
+    repository = _repository()
+    event_contract = _event().model_copy(update={"evidence_status": "unavailable"})
+    repository.add_event(event_contract)
+    intent = EvidenceIntent(
+        schema_version="evidence-intent.v1",
+        evidence_id=uuid4(),
+        event_id=event_contract.event_id,
+        object_key=f"events/{event_contract.event_id}.mp4",
+        codec="h264",
+        start_at=NOW,
+        end_at=NOW + timedelta(seconds=4),
+        source_reference="nvr://camera/01",
+        status="failed",
+    )
+    journal = SQLiteWALJournal(tmp_path / "intent-replay.sqlite3", max_items=2)
+    journal.enqueue(
+        kind="evidence_intent",
+        schema_version=intent.schema_version,
+        idempotency_key=f"evidence-intent:{intent.evidence_id}:failed",
+        payload=intent.to_payload(),
+    )
+
+    assert journal.replay(repository.persist_journal_item) == 1
+    assert repository.get_event(event_contract.event_id).evidence_status == "failed"
+
+
 def test_journal_acknowledges_only_after_repository_commit(tmp_path: Path) -> None:
     path = tmp_path / "commit-gate.sqlite3"
     journal = SQLiteWALJournal(path, max_items=10)
@@ -171,6 +264,25 @@ def test_journal_is_bounded_idempotent_and_reports_wal_depth(tmp_path: Path) -> 
             idempotency_key="event-2",
             payload=_event().model_dump(mode="json"),
         )
+
+
+def test_journal_keeps_distinct_same_timestamp_candidates_and_converges_exact_replay(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteWALJournal(tmp_path / "candidate-identities.sqlite3", max_items=4)
+    first = _event()
+    second = _event().model_copy(update={"reason": "second track"})
+
+    first_item = journal.enqueue_event(first)
+    second_item = journal.enqueue_event(second)
+    replayed_first = journal.enqueue_event(first)
+    replayed_second = journal.enqueue_event(second)
+
+    assert first.dedupe_key != second.dedupe_key
+    assert first_item.item_id != second_item.item_id
+    assert replayed_first.item_id == first_item.item_id
+    assert replayed_second.item_id == second_item.item_id
+    assert journal.depth() == 2
 
 
 def test_evidence_journal_rejects_raw_or_oversized_payloads(tmp_path: Path) -> None:

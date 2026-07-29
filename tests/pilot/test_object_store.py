@@ -37,6 +37,7 @@ from protector.pilot.storage.object_store import (
 )
 from protector.pilot.storage.repositories import (
     EvidenceInput,
+    EvidenceIntent,
     IdempotencyConflictError,
     PilotRepository,
 )
@@ -2133,3 +2134,65 @@ def test_production_builder_uses_validated_site_storage_policy_and_injected_cred
     assert services.store.max_object_bytes == 123_456
     assert services.coordinator._ring is ring
     assert services.replay_worker.status.depth == 0
+
+
+def test_restart_reconciles_hashless_pending_intent_without_material_evidence_row(
+    tmp_path: Path,
+) -> None:
+    repository = _repository()
+    event = _event().model_copy(update={"evidence_status": "unavailable"})
+    repository.add_event(event)
+    intent = EvidenceIntent(
+        schema_version="evidence-intent.v1",
+        evidence_id=uuid4(),
+        event_id=event.event_id,
+        object_key=f"events/{event.event_id}.mp4",
+        codec="h264",
+        start_at=NOW - timedelta(seconds=2),
+        end_at=NOW + timedelta(seconds=2),
+        source_reference="nvr://camera/01",
+    )
+    root = tmp_path / "intent-restart"
+    first = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    output = first.prepare("reservation-intent", kind="preview", evidence=intent)
+    output.write_bytes(b"preview")
+    first.register(
+        "reservation-intent",
+        kind="preview",
+        path=output,
+        evidence=intent,
+    )
+    metadata = next(root.glob("*.json")).read_text()
+    assert '"schema_version":"evidence-intent.v1"' in metadata
+    assert "sha256" not in metadata
+    first.close()
+
+    ring = _RecordingRing()
+    second = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    EvidenceCoordinator(
+        ring=ring,
+        assembler=SimpleNamespace(),
+        publisher=EvidencePublisher(
+            store=SimpleNamespace(),  # type: ignore[arg-type]
+            repository=repository,
+        ),
+        preview_workspace=second,
+    )
+
+    assert repository.get_event(event.event_id).evidence_status == "failed"
+    with repository.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(EvidenceModel)) == 0
+    assert ring.released == ["reservation-intent"]
+    assert second.item_count == 0

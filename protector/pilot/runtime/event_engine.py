@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -19,7 +20,7 @@ from protector.pilot.domain import (
     ObservationV1,
 )
 from protector.pilot.storage.journal import JournalFullError
-from protector.pilot.storage.repositories import EvidenceInput
+from protector.pilot.storage.repositories import EvidenceInput, EvidenceIntent
 
 UTC = timezone.utc
 _EVENT_NAMESPACE = uuid5(NAMESPACE_URL, "kuzet-ai/pilot/candidate-event/v1")
@@ -68,6 +69,7 @@ class EngineLimits:
     max_tracks_per_camera: int = 2_048
     max_pending_events: int = 4_096
     max_cameras: int = 64
+    max_ordering_streams: int = 4_096
 
     def __post_init__(self) -> None:
         if (
@@ -76,6 +78,7 @@ class EngineLimits:
             or self.max_tracks_per_camera < 1
             or self.max_pending_events < 1
             or self.max_cameras < 1
+            or self.max_ordering_streams < 1
         ):
             raise ValueError("event-engine item limits must be positive")
         if not math.isfinite(self.seen_retention_seconds) or self.seen_retention_seconds <= 0:
@@ -165,6 +168,8 @@ class LineRule:
             raise ValueError("line endpoints must differ")
         if self.direction not in ("positive_to_negative", "negative_to_positive"):
             raise ValueError("unsupported line direction")
+        if self.debounce.votes_required != 1 or self.debounce.sample_count != 1:
+            raise ValueError("line crossing debounce must be 1-of-1")
 
 
 def _validate_common_rule(rule: Any) -> None:
@@ -224,13 +229,35 @@ def _segments_intersect(
     second_start: tuple[float, float],
     second_end: tuple[float, float],
 ) -> bool:
+    orientations = (
+        _orientation(first_start, first_end, second_start),
+        _orientation(first_start, first_end, second_end),
+        _orientation(second_start, second_end, first_start),
+        _orientation(second_start, second_end, first_end),
+    )
+    if orientations[0] * orientations[1] < -1e-12 and orientations[2] * orientations[3] < -1e-12:
+        return True
+
+    def on_segment(
+        start: tuple[float, float],
+        point: tuple[float, float],
+        end: tuple[float, float],
+    ) -> bool:
+        return (
+            abs(_orientation(start, end, point)) <= 1e-12
+            and min(start[0], end[0]) - 1e-12
+            <= point[0]
+            <= max(start[0], end[0]) + 1e-12
+            and min(start[1], end[1]) - 1e-12
+            <= point[1]
+            <= max(start[1], end[1]) + 1e-12
+        )
+
     return (
-        _orientation(first_start, first_end, second_start)
-        * _orientation(first_start, first_end, second_end)
-        < -1e-12
-        and _orientation(second_start, second_end, first_start)
-        * _orientation(second_start, second_end, first_end)
-        < -1e-12
+        (abs(orientations[0]) <= 1e-12 and on_segment(first_start, second_start, first_end))
+        or (abs(orientations[1]) <= 1e-12 and on_segment(first_start, second_end, first_end))
+        or (abs(orientations[2]) <= 1e-12 and on_segment(second_start, first_start, second_end))
+        or (abs(orientations[3]) <= 1e-12 and on_segment(second_start, first_end, second_end))
     )
 
 
@@ -294,6 +321,7 @@ class EngineStatus:
     vote_groups: int
     tracks: int
     pending_events: int
+    ordering_streams: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +350,7 @@ class _GeometryState:
     loiter_emitted: bool = False
     intrusion_emitted: bool = False
     line_side: int | None = None
+    line_point: tuple[float, float] | None = None
 
 
 Rule = ModuleRule | ZoneRule | LineRule
@@ -362,20 +391,27 @@ class EventEngine:
         self._cooldowns: OrderedDict[StateKey, datetime] = OrderedDict()
         self._accepted = 0
         self._rejected = 0
+        self._lock = threading.RLock()
 
     @property
     def status(self) -> EngineStatus:
-        return EngineStatus(
-            accepted_observations=self._accepted,
-            rejected_observations=self._rejected,
-            seen_observation_ids=len(self._seen_ids),
-            seen_dedupe_keys=len(self._seen_dedupe),
-            vote_groups=len(self._votes),
-            tracks=len(self._tracks),
-            pending_events=len(self._pending),
-        )
+        with self._lock:
+            return EngineStatus(
+                accepted_observations=self._accepted,
+                rejected_observations=self._rejected,
+                seen_observation_ids=len(self._seen_ids),
+                seen_dedupe_keys=len(self._seen_dedupe),
+                vote_groups=len(self._votes),
+                tracks=len(self._tracks),
+                pending_events=len(self._pending),
+                ordering_streams=len(self._last_samples),
+            )
 
     def ingest(self, observation: ObservationV1) -> EngineIngestResult:
+        with self._lock:
+            return self._ingest_unlocked(observation)
+
+    def _ingest_unlocked(self, observation: ObservationV1) -> EngineIngestResult:
         if observation.sample_kind != "fresh":
             return self._reject("cached_display_sample")
         if observation.runtime_state != "online":
@@ -384,15 +420,24 @@ class EventEngine:
             return self._reject("duplicate_observation_id")
         if observation.dedupe_key in self._seen_dedupe:
             return self._reject("duplicate_dedupe_key")
-        epoch_rejection = self._accept_epoch(observation)
-        if epoch_rejection is not None:
-            return self._reject(epoch_rejection)
         sample_key = (
             observation.camera_id,
             observation.stream_epoch,
             observation.module,
             observation.model_artifact_id,
         )
+        if sample_key not in self._last_samples:
+            active_epoch = self._active_epochs.get(observation.camera_id)
+            retained = (
+                sum(key[0] != observation.camera_id for key in self._last_samples)
+                if active_epoch is not None and active_epoch != observation.stream_epoch
+                else len(self._last_samples)
+            )
+            if retained >= self.limits.max_ordering_streams:
+                return self._reject("ordering_stream_capacity_reached")
+        epoch_rejection = self._accept_epoch(observation)
+        if epoch_rejection is not None:
+            return self._reject(epoch_rejection)
         previous = self._last_samples.get(sample_key)
         if previous is not None:
             previous_seq, previous_time = previous
@@ -447,29 +492,31 @@ class EventEngine:
         stream_epoch: UUID,
         source_time: datetime,
     ) -> tuple[CandidateTrigger, ...]:
-        source_time = _utc(source_time, field="source_time")
-        if self._active_epochs.get(camera_id) != stream_epoch:
-            return ()
-        return self._finalize_due(
-            camera_id=camera_id,
-            stream_epoch=stream_epoch,
-            source_time=source_time,
-        )
+        with self._lock:
+            source_time = _utc(source_time, field="source_time")
+            if self._active_epochs.get(camera_id) != stream_epoch:
+                return ()
+            return self._finalize_due(
+                camera_id=camera_id,
+                stream_epoch=stream_epoch,
+                source_time=source_time,
+            )
 
     def flush(self) -> tuple[CandidateTrigger, ...]:
-        triggers = tuple(
-            self._trigger_from_aggregate(key, aggregate)
-            for key, aggregate in sorted(
-                self._pending.items(),
-                key=lambda item: (
-                    item[1].opened_at,
-                    item[1].camera_id,
-                    item[1].rule.rule_id,
-                ),
+        with self._lock:
+            triggers = tuple(
+                self._trigger_from_aggregate(key, aggregate)
+                for key, aggregate in sorted(
+                    self._pending.items(),
+                    key=lambda item: (
+                        item[1].opened_at,
+                        item[1].camera_id,
+                        item[1].rule.rule_id,
+                    ),
+                )
             )
-        )
-        self._pending.clear()
-        return triggers
+            self._pending.clear()
+            return triggers
 
     def _reject(self, reason: str) -> EngineIngestResult:
         self._rejected += 1
@@ -557,6 +604,10 @@ class EventEngine:
         observation: ObservationV1,
     ) -> tuple[CandidateTrigger, ...]:
         key = self._state_key(rule, observation)
+        if observation.confidence < rule.min_confidence:
+            self._geometry.pop(key, None)
+            self._votes.pop(key, None)
+            return ()
         state = self._geometry.setdefault(key, _GeometryState())
         inside = _point_in_polygon(bottom_centre(observation.bbox), rule.polygon)
         if rule.mode == "intrusion":
@@ -597,12 +648,22 @@ class EventEngine:
         observation: ObservationV1,
     ) -> tuple[CandidateTrigger, ...]:
         key = self._state_key(rule, observation)
+        if observation.confidence < rule.min_confidence:
+            self._geometry.pop(key, None)
+            self._votes.pop(key, None)
+            return ()
         state = self._geometry.setdefault(key, _GeometryState())
-        side = _line_side(bottom_centre(observation.bbox), rule.start, rule.end)
+        point = bottom_centre(observation.bbox)
+        side = _line_side(point, rule.start, rule.end)
         previous = state.line_side
+        previous_point = state.line_point
         if side != 0:
             state.line_side = side
-        if previous is None or side == 0 or previous == side:
+            state.line_point = point
+        if previous is None or previous_point is None or side == 0 or previous == side:
+            return ()
+        # Closed line endpoints count; crossings of only the infinite extension do not.
+        if not _segments_intersect(previous_point, point, rule.start, rule.end):
             return ()
         positive = (rule.direction == "positive_to_negative" and previous > 0 and side < 0) or (
             rule.direction == "negative_to_positive" and previous < 0 and side > 0
@@ -733,7 +794,7 @@ class EventEngine:
             reason=aggregate.rule.reason,
             model_artifact_id=aggregate.model_artifact_id,
             gate_mode=aggregate.rule.gate_mode,
-            evidence_status="pending",
+            evidence_status="unavailable",
             review_status="candidate",
         )
         self._cooldowns[key] = aggregate.last_seen_at + timedelta(
@@ -765,8 +826,16 @@ class EvidencePolicy:
             raise ValueError("evidence source references must be non-empty")
         for source in self.source_references.values():
             parsed = urlsplit(source)
-            if parsed.username is not None or parsed.password is not None:
-                raise ValueError("evidence source references must not contain credentials")
+            if (
+                parsed.scheme != "nvr"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "evidence source references must be opaque credential-free NVR identifiers"
+                )
         object.__setattr__(
             self,
             "source_references",
@@ -777,7 +846,7 @@ class EvidencePolicy:
 @dataclass(frozen=True, slots=True)
 class DurableCandidate:
     trigger: CandidateTrigger
-    pending_evidence: EvidenceInput | None
+    pending_evidence: EvidenceIntent | None
     evidence: EvidenceInput | None
 
 
@@ -807,7 +876,9 @@ class SiteEventService:
         replay_worker: Any,
         ring: Any,
         evidence_coordinator: Any,
-        candidate_is_persisted: Callable[[UUID], bool],
+        load_candidate: Callable[[UUID], CandidateEventV1],
+        mark_evidence_pending: Callable[[UUID], CandidateEventV1 | None],
+        mark_evidence_failed: Callable[[UUID], CandidateEventV1 | None],
         evidence_policy: EvidencePolicy,
     ) -> None:
         self.engine = engine
@@ -815,9 +886,14 @@ class SiteEventService:
         self._replay_worker = replay_worker
         self._ring = ring
         self._evidence_coordinator = evidence_coordinator
-        self._candidate_is_persisted = candidate_is_persisted
+        self._load_candidate = load_candidate
+        self._mark_evidence_pending = mark_evidence_pending
+        self._mark_evidence_failed = mark_evidence_failed
         self._evidence_policy = evidence_policy
         self._reasons: OrderedDict[str, None] = OrderedDict()
+        self._state_lock = threading.RLock()
+        self._processing: set[UUID] = set()
+        self._completed: OrderedDict[UUID, None] = OrderedDict()
 
     @property
     def status(self) -> SiteEventStatus:
@@ -829,13 +905,17 @@ class SiteEventService:
             self._degrade("journal_status_failed")
             replay_degraded = True
             quarantine_depth = -1
-        reasons = list(self._reasons)
+        with self._state_lock:
+            reasons = list(self._reasons)
         if replay_degraded and "journal_replay_degraded" not in reasons:
             reasons.append("journal_replay_degraded")
         try:
             depth = int(self._journal.depth())
         except Exception:
             depth = -1
+            self._degrade("journal_depth_failed")
+            with self._state_lock:
+                reasons = list(self._reasons)
         return SiteEventStatus(
             degraded=bool(reasons) or replay_degraded,
             reasons=tuple(reasons),
@@ -880,100 +960,136 @@ class SiteEventService:
     ) -> tuple[DurableCandidate, ...]:
         durable: list[DurableCandidate] = []
         for original_trigger in triggers:
-            trigger = original_trigger
-            reservation: Any | None = None
-            reservation_id = f"event-{trigger.event.event_id}"
-            try:
-                reservation = self._ring.reserve(
-                    reservation_id=reservation_id,
-                    camera_id=trigger.event.camera_id,
-                    stream_epoch=str(trigger.stream_epoch),
-                    event_at=trigger.event.last_seen_at,
-                    pre_roll=self._evidence_policy.pre_roll_seconds,
-                    post_roll=self._evidence_policy.post_roll_seconds,
-                )
-            except Exception:
-                trigger = replace(
-                    trigger,
-                    event=trigger.event.model_copy(update={"evidence_status": "unavailable"}),
-                )
-                self._degrade("evidence_reservation_unavailable")
-
-            try:
-                self._journal.enqueue_event(trigger.event)
-            except JournalFullError:
-                self._degrade("candidate_journal_full")
-                if reservation is not None:
-                    self._safe_release(reservation_id)
+            if not self._claim(original_trigger.event.event_id):
                 continue
-            except Exception:
-                self._degrade("candidate_journal_write_failed")
-                if reservation is not None:
-                    self._safe_release(reservation_id)
-                continue
-
+            completed = False
             try:
-                self._replay_worker.run_periodic_batch()
-            except Exception:
-                self._degrade("journal_replay_failed")
-            try:
-                replay_degraded = bool(self._replay_worker.status.degraded)
-            except Exception:
-                replay_degraded = True
-                self._degrade("journal_status_failed")
-            if replay_degraded:
-                self._degrade("journal_replay_degraded")
-            try:
-                persisted = self._candidate_is_persisted(trigger.event.event_id)
-            except Exception:
-                persisted = False
-                self._degrade("candidate_persistence_check_failed")
-            if not persisted:
-                self._degrade("candidate_persistence_pending")
-                if reservation is not None:
-                    self._safe_release(reservation_id)
-                continue
-
-            if reservation is None:
-                durable.append(DurableCandidate(trigger, None, None))
-                continue
-
-            try:
-                pending = self._pending_evidence(trigger, reservation)
-            except Exception:
-                self._degrade("evidence_processing_failed")
-                self._safe_release(reservation_id)
-                continue
-            try:
-                self._evidence_coordinator.create_preview(
-                    reservation,
-                    evidence=pending,
-                )
-                evidence = (
-                    self._evidence_coordinator.complete(reservation, pending)
-                    if reservation.status == "ready"
-                    else pending
-                )
-            except Exception:
-                self._degrade("evidence_processing_failed")
-                continue
-            durable.append(DurableCandidate(trigger, pending, evidence))
+                candidate = self._process_trigger(original_trigger)
+                if candidate is not None:
+                    durable.append(candidate)
+                    completed = True
+            finally:
+                self._finish_claim(original_trigger.event.event_id, completed=completed)
         return tuple(durable)
+
+    def _process_trigger(
+        self,
+        original_trigger: CandidateTrigger,
+    ) -> DurableCandidate | None:
+        trigger = original_trigger
+        reservation: Any | None = None
+        reservation_id = f"event-{trigger.event.event_id}"
+        try:
+            self._journal.enqueue_event(trigger.event)
+        except JournalFullError:
+            self._degrade("candidate_journal_full")
+            return None
+        except Exception:
+            self._degrade("candidate_journal_write_failed")
+            return None
+
+        try:
+            self._replay_worker.run_periodic_batch()
+        except Exception:
+            self._degrade("journal_replay_failed")
+        try:
+            replay_degraded = bool(self._replay_worker.status.degraded)
+        except Exception:
+            replay_degraded = True
+            self._degrade("journal_status_failed")
+        if replay_degraded:
+            self._degrade("journal_replay_degraded")
+        try:
+            persisted = self._load_candidate(trigger.event.event_id)
+        except KeyError:
+            persisted = None
+        except Exception:
+            persisted = None
+            self._degrade("candidate_persistence_check_failed")
+        if persisted is None:
+            self._degrade("candidate_persistence_pending")
+            return None
+        if not self._same_candidate(persisted, trigger.event):
+            self._degrade("candidate_persistence_identity_mismatch")
+            return None
+
+        try:
+            reservation = self._ring.reserve(
+                reservation_id=reservation_id,
+                camera_id=trigger.event.camera_id,
+                stream_epoch=str(trigger.stream_epoch),
+                event_at=trigger.event.last_seen_at,
+                pre_roll=self._evidence_policy.pre_roll_seconds,
+                post_roll=self._evidence_policy.post_roll_seconds,
+            )
+        except Exception:
+            self._degrade("evidence_reservation_unavailable")
+            return DurableCandidate(trigger, None, None)
+
+        try:
+            pending = self._pending_evidence(trigger, reservation)
+        except Exception:
+            self._degrade("evidence_processing_failed")
+            self._terminalize_candidate(trigger.event.event_id)
+            self._safe_release(reservation_id)
+            return None
+        try:
+            self._evidence_coordinator.create_preview(
+                reservation,
+                evidence=pending,
+            )
+            self._mark_evidence_pending(trigger.event.event_id)
+            pending_event = trigger.event.model_copy(update={"evidence_status": "pending"})
+            trigger = replace(trigger, event=pending_event)
+            evidence = (
+                self._evidence_coordinator.complete(reservation, pending)
+                if reservation.status == "ready"
+                else None
+            )
+        except Exception:
+            self._degrade("evidence_processing_failed")
+            return None
+        return DurableCandidate(trigger, pending, evidence)
+
+    @staticmethod
+    def _same_candidate(persisted: CandidateEventV1, expected: CandidateEventV1) -> bool:
+        return persisted.model_dump(mode="json") == expected.model_dump(mode="json")
+
+    def _claim(self, event_id: UUID) -> bool:
+        with self._state_lock:
+            if event_id in self._processing or event_id in self._completed:
+                return False
+            self._processing.add(event_id)
+            return True
+
+    def _finish_claim(self, event_id: UUID, *, completed: bool) -> None:
+        with self._state_lock:
+            self._processing.discard(event_id)
+            if completed:
+                self._completed[event_id] = None
+                while len(self._completed) > self.engine.limits.max_pending_events:
+                    self._completed.popitem(last=False)
+
+    def _terminalize_candidate(self, event_id: UUID) -> None:
+        try:
+            self._mark_evidence_failed(event_id)
+        except Exception:
+            self._degrade("evidence_terminal_transition_failed")
 
     def _pending_evidence(
         self,
         trigger: CandidateTrigger,
         reservation: Any,
-    ) -> EvidenceInput:
+    ) -> EvidenceIntent:
         source = self._evidence_policy.source_references.get(trigger.event.camera_id)
         if source is None:
             raise ValueError("camera evidence source reference is not configured")
         codec = reservation.fragments[0].codec
-        return EvidenceInput(
+        return EvidenceIntent(
+            schema_version="evidence-intent.v1",
             evidence_id=uuid5(_EVENT_NAMESPACE, f"evidence:{trigger.event.event_id}"),
             event_id=trigger.event.event_id,
             object_key=f"events/{trigger.event.event_id}.mp4",
-            sha256="0" * 64,
             codec=codec,
             start_at=reservation.target_start_at,
             end_at=reservation.target_end_at,
@@ -988,7 +1104,8 @@ class SiteEventService:
             self._degrade("evidence_release_failed")
 
     def _degrade(self, reason: str) -> None:
-        self._reasons.pop(reason, None)
-        self._reasons[reason] = None
-        while len(self._reasons) > 32:
-            self._reasons.popitem(last=False)
+        with self._state_lock:
+            self._reasons.pop(reason, None)
+            self._reasons[reason] = None
+            while len(self._reasons) > 32:
+                self._reasons.popitem(last=False)

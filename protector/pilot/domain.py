@@ -157,7 +157,8 @@ class CandidateEventV1(FrozenModel):
     @property
     def dedupe_key(self) -> str:
         return (
-            f"{self.camera_id}:{self.module}:{self.model_artifact_id}:{self.opened_at.isoformat()}"
+            f"{self.event_id}:{self.camera_id}:{self.module}:"
+            f"{self.model_artifact_id}:{self.opened_at.isoformat()}"
         )
 
     def transition_to(self, target: ReviewStatus) -> CandidateEventV1:

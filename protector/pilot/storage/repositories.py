@@ -87,6 +87,77 @@ class EvidenceInput:
 
 
 @dataclass(frozen=True)
+class EvidenceIntent:
+    """Durable pre-material evidence identity; deliberately has no byte digest."""
+
+    schema_version: Literal["evidence-intent.v1"]
+    evidence_id: UUID
+    event_id: UUID
+    object_key: str
+    codec: Literal["h264", "h265"]
+    start_at: datetime
+    end_at: datetime
+    source_reference: str
+    status: Literal["pending", "failed"] = "pending"
+
+    def __post_init__(self) -> None:
+        if self.start_at.tzinfo is None or self.end_at.tzinfo is None:
+            raise ValueError("evidence intent timestamps must be timezone-aware")
+        if self.end_at <= self.start_at:
+            raise ValueError("evidence intent end_at must follow start_at")
+        if not self.object_key or not self.source_reference:
+            raise ValueError("evidence intent references must be non-empty")
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> EvidenceIntent:
+        return cls(
+            schema_version=payload["schema_version"],
+            evidence_id=UUID(payload["evidence_id"]),
+            event_id=UUID(payload["event_id"]),
+            object_key=payload["object_key"],
+            codec=payload["codec"],
+            start_at=datetime.fromisoformat(payload["start_at"]),
+            end_at=datetime.fromisoformat(payload["end_at"]),
+            source_reference=payload["source_reference"],
+            status=payload["status"],
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "evidence_id": str(self.evidence_id),
+            "event_id": str(self.event_id),
+            "object_key": self.object_key,
+            "codec": self.codec,
+            "start_at": self.start_at.isoformat(),
+            "end_at": self.end_at.isoformat(),
+            "source_reference": self.source_reference,
+            "status": self.status,
+        }
+
+    def materialize(
+        self,
+        *,
+        sha256: str,
+        status: Literal["pending", "ready", "failed"] = "pending",
+        codec: Literal["h264", "h265"] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> EvidenceInput:
+        return EvidenceInput(
+            evidence_id=self.evidence_id,
+            event_id=self.event_id,
+            object_key=self.object_key,
+            sha256=sha256,
+            codec=codec or self.codec,
+            start_at=start_at or self.start_at,
+            end_at=end_at or self.end_at,
+            source_reference=self.source_reference,
+            status=status,
+        )
+
+
+@dataclass(frozen=True)
 class ReviewNotificationResult:
     review: ReviewModel
     outbox: NotificationOutboxModel | None
@@ -310,6 +381,51 @@ class PilotRepository:
             if row is None:
                 raise KeyError(f"unknown event: {event_id}")
             return _event_from_row(row)
+
+    def mark_candidate_evidence_pending(self, event_id: UUID) -> CandidateEventV1:
+        return self._set_candidate_evidence_status(
+            event_id,
+            target="pending",
+            allowed=frozenset(("unavailable", "pending")),
+        )
+
+    def mark_candidate_evidence_failed(self, event_id: UUID) -> CandidateEventV1:
+        return self._set_candidate_evidence_status(
+            event_id,
+            target="failed",
+            allowed=frozenset(("unavailable", "pending", "failed")),
+        )
+
+    def _set_candidate_evidence_status(
+        self,
+        event_id: UUID,
+        *,
+        target: Literal["pending", "failed"],
+        allowed: frozenset[str],
+    ) -> CandidateEventV1:
+        with self.session_factory() as session:
+            if session.get_bind().dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            else:
+                session.begin()
+            try:
+                row = session.scalar(
+                    select(CandidateEventModel)
+                    .where(CandidateEventModel.event_id == str(event_id))
+                    .with_for_update()
+                )
+                if row is None:
+                    raise KeyError(f"unknown event: {event_id}")
+                if row.evidence_status not in allowed:
+                    raise StaleStateError(expected=target, actual=row.evidence_status)
+                row.evidence_status = target
+                session.flush()
+                event = _event_from_row(row)
+                session.commit()
+                return event
+            except BaseException:
+                session.rollback()
+                raise
 
     def list_events(
         self,
@@ -946,5 +1062,11 @@ class PilotRepository:
                 self.finalize_evidence(evidence, status=evidence.status)
             else:
                 self.add_evidence(evidence)
+            return
+        if item.kind == "evidence_intent":
+            intent = EvidenceIntent.from_payload(item.payload)
+            if intent.status != "failed":
+                raise ValueError("journalled evidence intent must be terminal")
+            self.mark_candidate_evidence_failed(intent.event_id)
             return
         raise ValueError(f"unsupported journal item kind: {item.kind}")

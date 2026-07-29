@@ -33,9 +33,10 @@ from protector.pilot.storage.journal import (
     SQLiteWALJournal,
     is_retryable_database_error,
 )
-from protector.pilot.storage.repositories import EvidenceInput, PilotRepository
+from protector.pilot.storage.repositories import EvidenceInput, EvidenceIntent, PilotRepository
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+EvidenceIdentity = EvidenceInput | EvidenceIntent
 
 
 class ObjectPublishError(RuntimeError):
@@ -776,6 +777,21 @@ class EvidencePublisher:
         self._finalize_or_journal(failed, status="failed")
         return failed
 
+    def mark_intent_failed(self, intent: EvidenceIntent) -> EvidenceIntent:
+        failed = replace(intent, status="failed")
+        try:
+            self._repository.mark_candidate_evidence_failed(intent.event_id)
+        except Exception as exc:
+            if self._journal is None or not is_retryable_database_error(exc):
+                raise
+            self._journal.enqueue(
+                kind="evidence_intent",
+                schema_version=failed.schema_version,
+                idempotency_key=f"evidence-intent:{failed.evidence_id}:failed",
+                payload=failed.to_payload(),
+            )
+        return failed
+
     def _finalize_or_journal(
         self,
         evidence: EvidenceInput,
@@ -838,7 +854,7 @@ class WorkspaceRecoveryRecord:
     """Bounded durable intent used to reconcile abandoned evidence work."""
 
     reservation_id: str
-    evidence: EvidenceInput | None
+    evidence: EvidenceIdentity | None
     intent: Literal["ready"] | None
     size_bytes: int | None
 
@@ -1148,7 +1164,7 @@ class PreviewWorkspace:
         reservation_id: str,
         *,
         kind: Literal["preview", "final"],
-        evidence: EvidenceInput | None = None,
+        evidence: EvidenceIdentity | None = None,
     ) -> WorkspaceAssemblyTarget:
         with self._lock:
             self._assert_path_attested()
@@ -1212,7 +1228,7 @@ class PreviewWorkspace:
         *,
         kind: Literal["preview", "final"],
         path: WorkspaceAssemblyTarget,
-        evidence: EvidenceInput | None = None,
+        evidence: EvidenceIdentity | None = None,
     ) -> RegisteredWorkspaceOutput:
         self._assert_path_attested()
         key = self._key(reservation_id)
@@ -1410,7 +1426,7 @@ class PreviewWorkspace:
             )
         )
 
-    def evidence_for(self, reservation_id: str) -> EvidenceInput | None:
+    def evidence_for(self, reservation_id: str) -> EvidenceIdentity | None:
         record = self._records().get(self._key(reservation_id))
         if record is None:
             return None
@@ -1505,17 +1521,19 @@ class PreviewWorkspace:
                 ):
                     continue
                 evidence_payload = raw.get("evidence")
-                evidence = (
-                    None
-                    if evidence_payload is None
-                    else EvidenceInput.from_payload(evidence_payload)
-                )
+                evidence = None
+                if evidence_payload is not None:
+                    evidence = (
+                        EvidenceIntent.from_payload(evidence_payload)
+                        if evidence_payload.get("schema_version") == "evidence-intent.v1"
+                        else EvidenceInput.from_payload(evidence_payload)
+                    )
                 intent = raw.get("intent")
                 size_bytes = raw.get("size_bytes")
                 if intent not in (None, "ready"):
                     raise ValueError("unsupported workspace recovery intent")
                 if intent == "ready" and (
-                    evidence is None
+                    not isinstance(evidence, EvidenceInput)
                     or evidence.status != "pending"
                     or not isinstance(size_bytes, int)
                     or isinstance(size_bytes, bool)
@@ -1573,7 +1591,7 @@ class PreviewWorkspace:
         reservation_id: str,
         created_at: datetime,
         paths: list[str],
-        evidence: EvidenceInput | None,
+        evidence: EvidenceIdentity | None,
         intent: Literal["ready"] | None = None,
         size_bytes: int | None = None,
     ) -> None:
@@ -1583,21 +1601,7 @@ class PreviewWorkspace:
             "paths": paths,
             "intent": intent,
             "size_bytes": size_bytes,
-            "evidence": (
-                None
-                if evidence is None
-                else {
-                    "evidence_id": str(evidence.evidence_id),
-                    "event_id": str(evidence.event_id),
-                    "object_key": evidence.object_key,
-                    "sha256": evidence.sha256,
-                    "codec": evidence.codec,
-                    "start_at": evidence.start_at.isoformat(),
-                    "end_at": evidence.end_at.isoformat(),
-                    "source_reference": evidence.source_reference,
-                    "status": evidence.status,
-                }
-            ),
+            "evidence": self._evidence_payload(evidence),
         }
         encoded_payload = json.dumps(
             payload,
@@ -1607,6 +1611,24 @@ class PreviewWorkspace:
         if len(encoded_payload) > self._MAX_METADATA_BYTES:
             raise ValueError("preview workspace metadata exceeds finite bound")
         self._atomic_write_name(f"{key}.json", encoded_payload)
+
+    @staticmethod
+    def _evidence_payload(evidence: EvidenceIdentity | None) -> dict[str, Any] | None:
+        if evidence is None:
+            return None
+        if isinstance(evidence, EvidenceIntent):
+            return evidence.to_payload()
+        return {
+            "evidence_id": str(evidence.evidence_id),
+            "event_id": str(evidence.event_id),
+            "object_key": evidence.object_key,
+            "sha256": evidence.sha256,
+            "codec": evidence.codec,
+            "start_at": evidence.start_at.isoformat(),
+            "end_at": evidence.end_at.isoformat(),
+            "source_reference": evidence.source_reference,
+            "status": evidence.status,
+        }
 
     def _assert_target_name_bound(
         self,
@@ -1849,7 +1871,7 @@ class EvidenceCoordinator:
         self,
         reservation: Any,
         *,
-        evidence: EvidenceInput | None = None,
+        evidence: EvidenceIdentity | None = None,
     ) -> Any:
         try:
             output_path = self.preview_workspace.prepare(
@@ -1879,7 +1901,7 @@ class EvidenceCoordinator:
     def complete(
         self,
         reservation: Any,
-        evidence: EvidenceInput,
+        evidence: EvidenceIdentity,
     ) -> EvidenceInput:
         primary: Exception | None = None
         result: EvidenceInput | None = None
@@ -1905,13 +1927,22 @@ class EvidenceCoordinator:
                 raise ObjectIntegrityError(
                     "assembler identity does not match the pinned final descriptor"
                 )
-            bounded = replace(
-                evidence,
-                sha256=registered.sha256,
-                codec="h264",
-                start_at=assembled.start_at,
-                end_at=assembled.end_at,
-                status="pending",
+            bounded = (
+                evidence.materialize(
+                    sha256=registered.sha256,
+                    codec="h264",
+                    start_at=assembled.start_at,
+                    end_at=assembled.end_at,
+                )
+                if isinstance(evidence, EvidenceIntent)
+                else replace(
+                    evidence,
+                    sha256=registered.sha256,
+                    codec="h264",
+                    start_at=assembled.start_at,
+                    end_at=assembled.end_at,
+                    status="pending",
+                )
             )
             self.preview_workspace.persist_ready_intent(
                 reservation.reservation_id,
@@ -1964,7 +1995,7 @@ class EvidenceCoordinator:
         self,
         reservation_id: str,
         *,
-        evidence: EvidenceInput | None = None,
+        evidence: EvidenceIdentity | None = None,
     ) -> None:
         errors = self._reconcile_terminal(
             reservation_id,
@@ -2067,12 +2098,15 @@ class EvidenceCoordinator:
         self,
         reservation_id: str,
         *,
-        evidence: EvidenceInput | None,
+        evidence: EvidenceIdentity | None,
     ) -> list[Exception]:
         errors: list[Exception] = []
         if evidence is not None:
             try:
-                self._publisher.mark_failed(evidence)
+                if isinstance(evidence, EvidenceIntent):
+                    self._publisher.mark_intent_failed(evidence)
+                else:
+                    self._publisher.mark_failed(evidence)
             except Exception as exc:
                 errors.append(exc)
         errors.extend(self._release_media_preserving_record(reservation_id))

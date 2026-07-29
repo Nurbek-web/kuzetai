@@ -111,7 +111,8 @@ def test_candidate_event_transitions_only_through_human_review_states():
     assert confirmed.review_status == "confirmed"
     assert escalated.review_status == "escalated"
     assert event.dedupe_key == (
-        "camera-01:weapon:weapon-rfdetr-2026-07-22:2026-07-22T09:30:00+00:00"
+        f"{event.event_id}:camera-01:weapon:weapon-rfdetr-2026-07-22:"
+        "2026-07-22T09:30:00+00:00"
     )
     with pytest.raises(ValueError, match="illegal event transition"):
         event.transition_to("escalated")

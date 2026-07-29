@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -89,6 +90,34 @@ def test_intrusion_emits_once_per_entry_until_the_track_leaves() -> None:
     assert len(engine.ingest(_person(seq=4, seconds=3, bbox=inside)).triggers) == 1
 
 
+def test_zone_boundary_is_inclusive_for_normalised_foot_points() -> None:
+    engine = EventEngine(zone_rules=(_zone_rule(mode="intrusion"),))
+
+    result = engine.ingest(
+        _person(seq=1, seconds=0, bbox=(0.1, 0.1, 0.3, 0.5))
+    )
+
+    assert len(result.triggers) == 1
+
+
+def test_low_confidence_geometry_resets_entry_and_line_state() -> None:
+    zone = EventEngine(zone_rules=(_zone_rule(mode="loitering", loiter_seconds=5),))
+    inside = (0.4, 0.1, 0.6, 0.8)
+
+    zone.ingest(_person(seq=1, seconds=0, bbox=inside))
+    zone.ingest(_person(seq=2, seconds=4, bbox=inside, confidence=0.1))
+    result = zone.ingest(_person(seq=3, seconds=6, bbox=inside))
+
+    assert result.triggers == ()
+
+    line = EventEngine(line_rules=(_line_rule("positive_to_negative"),))
+    left = (0.2, 0.2, 0.4, 0.5)
+    right = (0.6, 0.2, 0.8, 0.5)
+    line.ingest(_person(seq=1, seconds=0, bbox=left))
+    line.ingest(_person(seq=2, seconds=1, bbox=right, confidence=0.1))
+    assert line.ingest(_person(seq=3, seconds=2, bbox=right)).triggers == ()
+
+
 @pytest.mark.parametrize(
     "polygon",
     [
@@ -114,6 +143,20 @@ def test_zone_rule_rejects_non_normalised_or_degenerate_polygons(
             merge_window_seconds=0,
             cooldown_seconds=0,
         )
+
+
+@pytest.mark.parametrize(
+    "polygon",
+    (
+        ((0.1, 0.1), (0.9, 0.1), (0.5, 0.1), (0.9, 0.9), (0.1, 0.9)),
+        ((0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.5, 0.1), (0.1, 0.9)),
+    ),
+)
+def test_zone_rule_rejects_non_adjacent_touches_and_collinear_overlaps(
+    polygon: tuple[tuple[float, float], ...],
+) -> None:
+    with pytest.raises(ValueError, match="self-intersect"):
+        replace(_zone_rule(mode="intrusion"), polygon=polygon)
 
 
 def test_loitering_uses_source_duration_across_missing_frames() -> None:
@@ -214,6 +257,42 @@ def test_opposite_line_direction_does_not_trigger() -> None:
     result = engine.ingest(_person(seq=2, seconds=1, bbox=right))
 
     assert result.triggers == ()
+
+
+def test_line_crossing_requires_intersection_with_finite_segment() -> None:
+    short = replace(
+        _line_rule("positive_to_negative"),
+        start=(0.5, 0.4),
+        end=(0.5, 0.6),
+    )
+    engine = EventEngine(line_rules=(short,))
+
+    engine.ingest(_person(seq=1, seconds=0, bbox=(0.2, 0.0, 0.4, 0.1)))
+    result = engine.ingest(_person(seq=2, seconds=1, bbox=(0.6, 0.0, 0.8, 0.1)))
+
+    assert result.triggers == ()
+
+
+def test_line_crossing_counts_a_closed_segment_endpoint() -> None:
+    short = replace(
+        _line_rule("positive_to_negative"),
+        start=(0.5, 0.4),
+        end=(0.5, 0.6),
+    )
+    engine = EventEngine(line_rules=(short,))
+
+    engine.ingest(_person(seq=1, seconds=0, bbox=(0.2, 0.1, 0.4, 0.4)))
+    result = engine.ingest(_person(seq=2, seconds=1, bbox=(0.6, 0.1, 0.8, 0.4)))
+
+    assert len(result.triggers) == 1
+
+
+def test_line_rule_rejects_unsupported_multi_vote_debounce() -> None:
+    with pytest.raises(ValueError, match="1-of-1"):
+        replace(
+            _line_rule("positive_to_negative"),
+            debounce=DebounceSpec(votes_required=2, sample_count=3, window_seconds=2),
+        )
 
 
 def test_line_rule_rejects_non_normalised_or_degenerate_lines() -> None:

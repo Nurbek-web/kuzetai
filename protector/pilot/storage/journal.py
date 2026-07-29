@@ -24,10 +24,11 @@ from sqlalchemy.exc import (
 
 from protector.pilot.domain import CandidateEventV1
 
-JournalKind = Literal["candidate_event", "evidence"]
+JournalKind = Literal["candidate_event", "evidence", "evidence_intent"]
 SUPPORTED_JOURNAL_SCHEMA_VERSIONS: dict[JournalKind, str] = {
     "candidate_event": "candidate-event.v1",
     "evidence": "evidence-work.v1",
+    "evidence_intent": "evidence-intent.v1",
 }
 _EVIDENCE_METADATA_FIELDS = frozenset(
     {
@@ -36,6 +37,19 @@ _EVIDENCE_METADATA_FIELDS = frozenset(
         "event_id",
         "object_key",
         "sha256",
+        "codec",
+        "start_at",
+        "end_at",
+        "source_reference",
+        "status",
+    }
+)
+_EVIDENCE_INTENT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "evidence_id",
+        "event_id",
+        "object_key",
         "codec",
         "start_at",
         "end_at",
@@ -197,7 +211,9 @@ class SQLiteWALJournal:
             """
             CREATE TABLE IF NOT EXISTS journal_items (
                 item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL CHECK (kind IN ('candidate_event', 'evidence')),
+                kind TEXT NOT NULL CHECK (
+                    kind IN ('candidate_event', 'evidence', 'evidence_intent')
+                ),
                 schema_version TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL UNIQUE,
                 payload_json TEXT NOT NULL,
@@ -205,6 +221,33 @@ class SQLiteWALJournal:
             )
             """
         )
+        table_sql = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_items'"
+        ).fetchone()[0]
+        if "evidence_intent" not in str(table_sql):
+            self._connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                DROP TABLE IF EXISTS journal_items_v2;
+                CREATE TABLE journal_items_v2 (
+                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK (
+                        kind IN ('candidate_event', 'evidence', 'evidence_intent')
+                    ),
+                    schema_version TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO journal_items_v2
+                    (item_id, kind, schema_version, idempotency_key, payload_json, created_at)
+                SELECT item_id, kind, schema_version, idempotency_key, payload_json, created_at
+                FROM journal_items;
+                DROP TABLE journal_items;
+                ALTER TABLE journal_items_v2 RENAME TO journal_items;
+                COMMIT;
+                """
+            )
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS journal_quarantine (
@@ -254,6 +297,8 @@ class SQLiteWALJournal:
         validate_journal_work(kind, schema_version, payload)
         if kind == "evidence" and not set(payload) <= _EVIDENCE_METADATA_FIELDS:
             raise ValueError("evidence journal payload must contain metadata only")
+        if kind == "evidence_intent" and not set(payload) <= _EVIDENCE_INTENT_FIELDS:
+            raise ValueError("evidence-intent journal payload must contain metadata only")
         payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         if len(payload_json.encode("utf-8")) > self.max_payload_bytes:
             raise ValueError(f"journal payload exceeds {self.max_payload_bytes} bytes")

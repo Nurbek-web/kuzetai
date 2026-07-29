@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect, select, update
+from sqlalchemy import func, inspect, select, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
@@ -1029,3 +1029,42 @@ def test_postgresql_concurrent_retry_contract(repository: PilotRepository) -> No
         )
         == 1
     )
+
+
+def test_distinct_same_timestamp_candidates_persist_and_exact_replay_converges(
+    repository: PilotRepository,
+) -> None:
+    first = _event(
+        event_id=UUID("81000000-0000-0000-0000-000000000001"),
+        opened_at=NOW,
+    ).model_copy(update={"reason": "track-a"})
+    second = _event(
+        event_id=UUID("82000000-0000-0000-0000-000000000002"),
+        opened_at=NOW,
+    ).model_copy(update={"reason": "track-b"})
+
+    first_row = repository.store_event_idempotent(first)
+    second_row = repository.store_event_idempotent(second)
+    replayed_first = repository.store_event_idempotent(first)
+    replayed_second = repository.store_event_idempotent(second)
+
+    assert first.dedupe_key != second.dedupe_key
+    assert first_row.event_id != second_row.event_id
+    assert replayed_first.event_id == first_row.event_id
+    assert replayed_second.event_id == second_row.event_id
+    assert len(repository.list_events(opened_from=NOW, opened_to=NOW)) == 2
+
+
+def test_hashless_evidence_intent_transitions_candidate_without_creating_evidence(
+    repository: PilotRepository,
+) -> None:
+    event = _event().model_copy(update={"evidence_status": "unavailable"})
+    repository.add_event(event)
+
+    pending = repository.mark_candidate_evidence_pending(event.event_id)
+    failed = repository.mark_candidate_evidence_failed(event.event_id)
+
+    assert pending.evidence_status == "pending"
+    assert failed.evidence_status == "failed"
+    with repository.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(EvidenceModel)) == 0
