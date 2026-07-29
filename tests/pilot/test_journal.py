@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import event, select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from protector.pilot.domain import CandidateEventV1
@@ -503,3 +505,122 @@ def test_retry_classifier_rejects_deterministic_sql_and_accepts_connection_state
     assert is_retryable_database_error(
         OperationalError("SELECT 1", {}, PostgreSQLConnectionFailure())
     )
+
+
+@pytest.mark.parametrize("sqlstate", ["40001", "40P01", "55P03"])
+def test_postgresql_concurrency_states_stay_live_with_bounded_backoff(
+    tmp_path: Path,
+    sqlstate: str,
+) -> None:
+    class PostgreSQLConcurrencyFailure(Exception):
+        pass
+
+    failure = PostgreSQLConcurrencyFailure(f"transient PostgreSQL state {sqlstate}")
+    failure.sqlstate = sqlstate  # type: ignore[attr-defined]
+    error = OperationalError("UPDATE evidence", {}, failure)
+    assert is_retryable_database_error(error)
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    journal = SQLiteWALJournal(
+        tmp_path / f"postgres-{sqlstate}.sqlite3",
+        max_items=2,
+        max_quarantine_items=2,
+    )
+    item = journal.enqueue_event(_event())
+    attempts: list[int] = []
+
+    def processor(work: object) -> None:
+        attempts.append(work.item_id)  # type: ignore[attr-defined]
+        if len(attempts) == 1:
+            raise error
+
+    worker = EvidenceJournalReplayWorker(
+        journal=journal,
+        processor=processor,
+        batch_size=1,
+        retry_backoff_seconds=3,
+        monotonic_clock=clock,
+    )
+
+    assert worker.startup_drain() == 0
+    assert attempts == [item.item_id]
+    assert worker.status.depth == 1
+    assert worker.status.quarantine_depth == 0
+    assert worker.status.degraded is True
+    assert worker.status.next_retry_in_seconds == 3
+    assert worker.run_periodic_batch() == 0
+    clock.now = 3
+    assert worker.run_periodic_batch() == 1
+    assert attempts == [item.item_id, item.item_id]
+    assert worker.status.depth == 0
+    assert worker.status.quarantine_depth == 0
+
+
+@pytest.mark.skipif(
+    os.getenv("PILOT_TEST_DATABASE_URL") is None,
+    reason="requires disposable PostgreSQL *_test database",
+)
+def test_disposable_postgresql_serialization_failure_remains_live_until_retry(
+    tmp_path: Path,
+) -> None:
+    database_url = os.environ["PILOT_TEST_DATABASE_URL"]
+    parsed_url = make_url(database_url)
+    if (
+        parsed_url.get_backend_name() != "postgresql"
+        or parsed_url.database is None
+        or not parsed_url.database.endswith("_test")
+    ):
+        pytest.fail(
+            "PILOT_TEST_DATABASE_URL must target a disposable PostgreSQL *_test database"
+        )
+    engine = create_engine(database_url)
+    journal = SQLiteWALJournal(
+        tmp_path / "postgres-serialization.sqlite3",
+        max_items=2,
+        max_quarantine_items=2,
+    )
+    item = journal.enqueue_event(_event())
+    attempts: list[int] = []
+    clock = [0.0]
+
+    def processor(work: object) -> None:
+        attempts.append(work.item_id)  # type: ignore[attr-defined]
+        if len(attempts) == 1:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        DO $$
+                        BEGIN
+                            RAISE EXCEPTION 'forced serialization retry'
+                                USING ERRCODE = '40001';
+                        END
+                        $$;
+                        """
+                    )
+                )
+
+    worker = EvidenceJournalReplayWorker(
+        journal=journal,
+        processor=processor,
+        batch_size=1,
+        retry_backoff_seconds=1,
+        monotonic_clock=lambda: clock[0],
+    )
+    try:
+        assert worker.startup_drain() == 0
+        assert attempts == [item.item_id]
+        assert journal.depth() == 1
+        assert journal.quarantine_depth() == 0
+        clock[0] = 1
+        assert worker.run_periodic_batch() == 1
+        assert attempts == [item.item_id, item.item_id]
+        assert journal.depth() == 0
+    finally:
+        engine.dispose()

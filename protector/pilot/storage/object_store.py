@@ -46,6 +46,10 @@ class ObjectIntegrityError(ObjectPublishError):
     """Local or remote object bytes do not match the declared SHA-256."""
 
 
+class EvidencePublicationFailure(ExceptionGroup):
+    """Object publication failed and the durable failed transition also failed."""
+
+
 def validate_object_key(key: str) -> str:
     """Reject absolute, ambiguous, traversal, and reserved temporary keys."""
     if not key or len(key) > 1024 or "\\" in key or "\x00" in key:
@@ -622,12 +626,15 @@ class EvidencePublisher:
             raise ValueError("evidence publication must begin from pending or failed")
         try:
             stored = self._store.publish(source, evidence.object_key, sha256=evidence.sha256)
-        except ObjectPublishError:
-            self.mark_failed(evidence)
-            raise
+        except ObjectPublishError as primary:
+            self._raise_after_failed_transition(primary, evidence)
         if stored.sha256 != evidence.sha256 or stored.key != evidence.object_key:
-            self.mark_failed(evidence)
-            raise ObjectIntegrityError("object store returned a different evidence identity")
+            self._raise_after_failed_transition(
+                ObjectIntegrityError(
+                    "object store returned a different evidence identity"
+                ),
+                evidence,
+            )
         ready = replace(evidence, status="ready")
         self._finalize_or_journal(ready, status="ready")
         return ready
@@ -667,6 +674,20 @@ class EvidencePublisher:
                 payload=payload,
             )
 
+    def _raise_after_failed_transition(
+        self,
+        primary: ObjectPublishError,
+        evidence: EvidenceInput,
+    ) -> None:
+        try:
+            self.mark_failed(evidence)
+        except Exception as secondary:
+            raise EvidencePublicationFailure(
+                "evidence publication and failed transition both failed",
+                [primary, secondary],
+            ) from None
+        raise primary
+
 
 class PreviewWorkspaceCapacityError(RuntimeError):
     """The finite preview workspace cannot accept another temporary clip."""
@@ -695,34 +716,73 @@ class PreviewWorkspace:
             raise ValueError("preview workspace TTL must be positive")
         if max_items < 1 or max_bytes < 1:
             raise ValueError("preview workspace bounds must be positive")
-        self.root = Path(root).absolute()
+        self.root = Path(os.path.abspath(os.fspath(root)))
         if self.root == Path(self.root.anchor):
             raise ValueError("preview workspace must be a dedicated directory")
-        if self.root.exists() and self.root.is_symlink():
-            raise ValueError("preview workspace must not be a symlink")
+        self._reject_symlinked_ancestors(self.root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        root_stat = self.root.stat(follow_symlinks=False)
-        if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o022:
-            raise ValueError("preview workspace ownership or permissions are unsafe")
-        marker = self.root / self._MARKER
-        existing = tuple(self.root.iterdir())
-        if not marker.exists() and existing:
-            raise ValueError("preview workspace is not an owned empty namespace")
-        if marker.is_symlink():
-            raise ValueError("preview workspace marker must not be a symlink")
-        if not marker.exists():
-            self._atomic_write(marker, self._MARKER_PAYLOAD)
-        if self._read_private_file(
-            marker,
-            max_bytes=len(self._MARKER_PAYLOAD),
-        ) != self._MARKER_PAYLOAD:
-            raise ValueError("preview workspace marker content is invalid")
+        self._reject_symlinked_ancestors(self.root)
         self.ttl = ttl
         self.max_items = max_items
         self.max_bytes = max_bytes
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
-        self._assert_owned_namespace()
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        self._root_fd = os.open(self.root, flags)
+        try:
+            root_stat = os.fstat(self._root_fd)
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or root_stat.st_uid != os.getuid()
+                or root_stat.st_mode & 0o022
+            ):
+                raise ValueError(
+                    "preview workspace ownership or permissions are unsafe"
+                )
+            self._root_identity = (
+                root_stat.st_dev,
+                root_stat.st_ino,
+                root_stat.st_uid,
+                stat.S_IMODE(root_stat.st_mode),
+            )
+            existing = tuple(os.listdir(self._root_fd))
+            if self._MARKER not in existing:
+                if existing:
+                    raise ValueError(
+                        "preview workspace is not an owned empty namespace"
+                    )
+                self._atomic_write_name(self._MARKER, self._MARKER_PAYLOAD)
+            if self._read_private_name(
+                self._MARKER,
+                max_bytes=len(self._MARKER_PAYLOAD),
+            ) != self._MARKER_PAYLOAD:
+                raise ValueError("preview workspace marker content is invalid")
+            self._assert_owned_namespace()
+            self._assert_path_attested()
+        except BaseException:
+            os.close(self._root_fd)
+            self._root_fd = -1
+            raise
+
+    def close(self) -> None:
+        with self._lock:
+            if self._root_fd >= 0:
+                os.close(self._root_fd)
+                self._root_fd = -1
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_root_fd", -1)
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self._root_fd = -1
 
     @property
     def item_count(self) -> int:
@@ -732,12 +792,16 @@ class PreviewWorkspace:
     def used_bytes(self) -> int:
         self._assert_owned_namespace()
         total = 0
-        for path in self.root.iterdir():
-            if self._MEDIA_PATTERN.fullmatch(path.name) or self._TEMP_PATTERN.fullmatch(
-                path.name
+        for name in os.listdir(self._root_fd):
+            if self._MEDIA_PATTERN.fullmatch(name) or self._TEMP_PATTERN.fullmatch(
+                name
             ):
                 try:
-                    file_stat = path.stat(follow_symlinks=False)
+                    file_stat = os.stat(
+                        name,
+                        dir_fd=self._root_fd,
+                        follow_symlinks=False,
+                    )
                 except OSError:
                     continue
                 if stat.S_ISREG(file_stat.st_mode):
@@ -745,6 +809,7 @@ class PreviewWorkspace:
         return total
 
     def path_for(self, reservation_id: str, *, kind: Literal["preview", "final"]) -> Path:
+        self._assert_path_attested()
         key = self._key(reservation_id)
         return self.root / f"{key}.{kind}.mp4"
 
@@ -756,6 +821,7 @@ class PreviewWorkspace:
         evidence: EvidenceInput | None = None,
     ) -> Path:
         with self._lock:
+            self._assert_path_attested()
             key = self._key(reservation_id)
             records = self._records()
             current = records.get(key)
@@ -782,7 +848,8 @@ class PreviewWorkspace:
                     else None if current is None else current["evidence"]
                 ),
             )
-            return self.path_for(reservation_id, kind=kind)
+            self._assert_path_attested()
+            return self.root / f"{key}.{kind}.mp4"
 
     def register(
         self,
@@ -792,14 +859,25 @@ class PreviewWorkspace:
         path: Path,
         evidence: EvidenceInput | None = None,
     ) -> None:
-        expected = self.path_for(reservation_id, kind=kind)
+        self._assert_path_attested()
+        key = self._key(reservation_id)
+        expected_name = f"{key}.{kind}.mp4"
+        expected = self.root / expected_name
         if Path(path).absolute() != expected:
             raise ValueError("temporary evidence path escaped the preview workspace")
-        file_stat = expected.stat(follow_symlinks=False)
-        if not stat.S_ISREG(file_stat.st_mode) or expected.is_symlink():
-            raise ValueError("temporary evidence must be a regular owned file")
         with self._lock:
-            key = self._key(reservation_id)
+            self._assert_path_attested()
+            file_stat = os.stat(
+                expected_name,
+                dir_fd=self._root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != os.getuid()
+                or file_stat.st_mode & 0o022
+            ):
+                raise ValueError("temporary evidence must be a regular owned file")
             records = self._records()
             current = records.get(key)
             created_at = (
@@ -808,7 +886,7 @@ class PreviewWorkspace:
                 else datetime.fromisoformat(str(current["created_at"]))
             )
             paths = set(() if current is None else current["paths"])
-            paths.add(expected.name)
+            paths.add(expected_name)
             self._write_record(
                 key=key,
                 reservation_id=reservation_id,
@@ -835,6 +913,7 @@ class PreviewWorkspace:
                 raise PreviewWorkspaceCapacityError(
                     "preview workspace bound reached"
                 )
+            self._assert_path_attested()
 
     def abandoned_records(
         self,
@@ -862,16 +941,32 @@ class PreviewWorkspace:
             )
         )
 
-    def cleanup(self, reservation_id: str) -> list[Exception]:
+    def evidence_for(self, reservation_id: str) -> EvidenceInput | None:
+        record = self._records().get(self._key(reservation_id))
+        if record is None:
+            return None
+        return record["evidence"]
+
+    def cleanup(
+        self,
+        reservation_id: str,
+        *,
+        preserve_record: bool = False,
+    ) -> list[Exception]:
         key = self._key(reservation_id)
         errors: list[Exception] = []
-        for path in (
-            self.root / f"{key}.preview.mp4",
-            self.root / f"{key}.final.mp4",
-            self.root / f"{key}.json",
-        ):
+        try:
+            self._assert_root_attested()
+        except Exception as exc:
+            return [exc]
+        names = [f"{key}.preview.mp4", f"{key}.final.mp4"]
+        if not preserve_record:
+            names.append(f"{key}.json")
+        for name in names:
             try:
-                path.unlink(missing_ok=True)
+                os.unlink(name, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                pass
             except Exception as exc:
                 errors.append(exc)
         try:
@@ -883,18 +978,20 @@ class PreviewWorkspace:
     def cleanup_orphans(self) -> list[Exception]:
         errors: list[Exception] = []
         known_keys = set(self._records())
-        for path in self.root.iterdir():
-            media_match = self._MEDIA_PATTERN.fullmatch(path.name)
-            metadata_match = self._METADATA_PATTERN.fullmatch(path.name)
+        for name in os.listdir(self._root_fd):
+            media_match = self._MEDIA_PATTERN.fullmatch(name)
+            metadata_match = self._METADATA_PATTERN.fullmatch(name)
             is_orphan = (
-                self._TEMP_PATTERN.fullmatch(path.name) is not None
+                self._TEMP_PATTERN.fullmatch(name) is not None
                 or (media_match is not None and media_match.group("key") not in known_keys)
                 or (metadata_match is not None and metadata_match.group("key") not in known_keys)
             )
             if not is_orphan:
                 continue
             try:
-                path.unlink(missing_ok=True)
+                os.unlink(name, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                pass
             except Exception as exc:
                 errors.append(exc)
         try:
@@ -906,14 +1003,14 @@ class PreviewWorkspace:
     def _records(self) -> dict[str, dict[str, Any]]:
         self._assert_owned_namespace()
         records: dict[str, dict[str, Any]] = {}
-        for path in self.root.iterdir():
-            match = self._METADATA_PATTERN.fullmatch(path.name)
-            if match is None or path.is_symlink():
+        for name in os.listdir(self._root_fd):
+            match = self._METADATA_PATTERN.fullmatch(name)
+            if match is None:
                 continue
             try:
                 raw = json.loads(
-                    self._read_private_file(
-                        path,
+                    self._read_private_name(
+                        name,
                         max_bytes=self._MAX_METADATA_BYTES,
                     )
                 )
@@ -950,19 +1047,28 @@ class PreviewWorkspace:
         return records
 
     def _assert_owned_namespace(self) -> None:
-        for path in self.root.iterdir():
-            if path.name == self._MARKER:
+        self._assert_root_attested()
+        for name in os.listdir(self._root_fd):
+            if name == self._MARKER:
                 continue
             if not (
-                self._MEDIA_PATTERN.fullmatch(path.name)
-                or self._METADATA_PATTERN.fullmatch(path.name)
-                or self._TEMP_PATTERN.fullmatch(path.name)
+                self._MEDIA_PATTERN.fullmatch(name)
+                or self._METADATA_PATTERN.fullmatch(name)
+                or self._TEMP_PATTERN.fullmatch(name)
             ):
                 raise PreviewWorkspaceCapacityError(
                     "preview workspace contains an unexpected entry"
                 )
-            file_stat = path.stat(follow_symlinks=False)
-            if not stat.S_ISREG(file_stat.st_mode) or path.is_symlink():
+            file_stat = os.stat(
+                name,
+                dir_fd=self._root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != os.getuid()
+                or file_stat.st_mode & 0o022
+            ):
                 raise PreviewWorkspaceCapacityError(
                     "preview workspace entry is not a regular owned file"
                 )
@@ -1003,17 +1109,21 @@ class PreviewWorkspace:
         ).encode()
         if len(encoded_payload) > self._MAX_METADATA_BYTES:
             raise ValueError("preview workspace metadata exceeds finite bound")
-        self._atomic_write(self.root / f"{key}.json", encoded_payload)
+        self._atomic_write_name(f"{key}.json", encoded_payload)
 
-    @staticmethod
-    def _read_private_file(path: Path, *, max_bytes: int) -> bytes:
-        flags = os.O_RDONLY
+    def _read_private_name(self, name: str, *, max_bytes: int) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(path, flags)
+        descriptor = os.open(name, flags, dir_fd=self._root_fd)
         try:
             file_stat = os.fstat(descriptor)
-            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_bytes:
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != os.getuid()
+                or file_stat.st_mode & 0o022
+                or file_stat.st_size > max_bytes
+            ):
                 raise ValueError("preview workspace metadata is not a finite regular file")
             payload = bytearray()
             while block := os.read(descriptor, min(4_096, max_bytes + 1 - len(payload))):
@@ -1036,29 +1146,122 @@ class PreviewWorkspace:
             raise ValueError("preview workspace clock must be timezone-aware")
         return value.astimezone(UTC)
 
-    def _atomic_write(self, destination: Path, payload: bytes) -> None:
-        temporary = self.root / f".kuzet-preview-{uuid4().hex}.tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    def _atomic_write_name(self, destination: str, payload: bytes) -> None:
+        if "/" in destination or destination in ("", ".", ".."):
+            raise ValueError("preview workspace destination must be one basename")
+        self._assert_root_identity()
+        temporary = f".kuzet-preview-{uuid4().hex}.tmp"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+        )
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(temporary, flags, 0o600)
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=self._root_fd)
         try:
             with os.fdopen(descriptor, "wb") as output:
                 output.write(payload)
                 output.flush()
                 os.fsync(output.fileno())
-            os.replace(temporary, destination)
+            os.replace(
+                temporary,
+                destination,
+                src_dir_fd=self._root_fd,
+                dst_dir_fd=self._root_fd,
+            )
             self._fsync_root()
         except BaseException:
-            temporary.unlink(missing_ok=True)
+            try:
+                os.unlink(temporary, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                pass
             raise
 
     def _fsync_root(self) -> None:
-        descriptor = os.open(self.root, os.O_RDONLY)
+        self._assert_root_identity()
+        os.fsync(self._root_fd)
+
+    def _assert_root_identity(self) -> None:
+        if self._root_fd < 0:
+            raise PreviewWorkspaceCapacityError("preview workspace is closed")
+        root_stat = os.fstat(self._root_fd)
+        identity = (
+            root_stat.st_dev,
+            root_stat.st_ino,
+            root_stat.st_uid,
+            stat.S_IMODE(root_stat.st_mode),
+        )
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or identity != self._root_identity
+            or root_stat.st_uid != os.getuid()
+            or root_stat.st_mode & 0o022
+        ):
+            raise PreviewWorkspaceCapacityError(
+                "preview workspace descriptor attestation changed"
+            )
+
+    def _assert_root_attested(self) -> None:
+        self._assert_root_identity()
         try:
-            os.fsync(descriptor)
+            marker = self._read_private_name(
+                self._MARKER,
+                max_bytes=len(self._MARKER_PAYLOAD),
+            )
+        except (OSError, ValueError) as exc:
+            raise PreviewWorkspaceCapacityError(
+                "preview workspace marker attestation failed"
+            ) from exc
+        if marker != self._MARKER_PAYLOAD:
+            raise PreviewWorkspaceCapacityError(
+                "preview workspace marker content is invalid"
+            )
+
+    def _assert_path_attested(self) -> None:
+        self._assert_root_attested()
+        try:
+            self._reject_symlinked_ancestors(self.root)
+            descriptor = os.open(
+                self.root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except (OSError, ValueError) as exc:
+            raise PreviewWorkspaceCapacityError(
+                "preview workspace pathname no longer identifies the attested root"
+            ) from exc
+        try:
+            current = os.fstat(descriptor)
+            current_identity = (
+                current.st_dev,
+                current.st_ino,
+                current.st_uid,
+                stat.S_IMODE(current.st_mode),
+            )
+            if current_identity != self._root_identity:
+                raise PreviewWorkspaceCapacityError(
+                    "preview workspace pathname no longer identifies the attested root"
+                )
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _reject_symlinked_ancestors(path: Path) -> None:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                entry_stat = os.lstat(current)
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise ValueError(
+                    "preview workspace path must not contain symlinked ancestors"
+                )
 
 
 class EvidenceCoordinator:
@@ -1078,12 +1281,9 @@ class EvidenceCoordinator:
         self.preview_workspace = preview_workspace
         startup_errors: list[Exception] = []
         for reservation_id, evidence in preview_workspace.abandoned_records():
-            if evidence is not None:
-                try:
-                    self._publisher.mark_failed(evidence)
-                except Exception as exc:
-                    startup_errors.append(exc)
-            startup_errors.extend(self._release_and_cleanup(reservation_id))
+            startup_errors.extend(
+                self._reconcile_terminal(reservation_id, evidence=evidence)
+            )
         startup_errors.extend(preview_workspace.cleanup_orphans())
         if startup_errors:
             raise ExceptionGroup(
@@ -1112,14 +1312,9 @@ class EvidenceCoordinator:
             )
             return preview
         except Exception as primary:
-            cleanup_errors: list[Exception] = []
-            if evidence is not None:
-                try:
-                    self._publisher.mark_failed(evidence)
-                except Exception as exc:
-                    cleanup_errors.append(exc)
-            cleanup_errors.extend(
-                self._release_and_cleanup(reservation.reservation_id)
+            cleanup_errors = self._reconcile_terminal(
+                reservation.reservation_id,
+                evidence=evidence,
             )
             self._raise_lifecycle_failure(primary, cleanup_errors)
 
@@ -1158,11 +1353,23 @@ class EvidenceCoordinator:
             primary = exc
         cleanup_errors: list[Exception] = []
         if primary is not None and phase == "assemble":
-            try:
-                self._publisher.mark_failed(evidence)
-            except Exception as exc:
-                cleanup_errors.append(exc)
-        cleanup_errors.extend(self._release_and_cleanup(reservation.reservation_id))
+            cleanup_errors.extend(
+                self._reconcile_terminal(
+                    reservation.reservation_id,
+                    evidence=evidence,
+                )
+            )
+        elif primary is not None and isinstance(
+            primary,
+            EvidencePublicationFailure,
+        ):
+            cleanup_errors.extend(
+                self._release_media_preserving_record(reservation.reservation_id)
+            )
+        else:
+            cleanup_errors.extend(
+                self._release_and_cleanup(reservation.reservation_id)
+            )
         if primary is not None:
             self._raise_lifecycle_failure(primary, cleanup_errors)
         if cleanup_errors:
@@ -1184,13 +1391,14 @@ class EvidenceCoordinator:
         *,
         evidence: EvidenceInput | None = None,
     ) -> None:
-        errors: list[Exception] = []
-        if evidence is not None:
-            try:
-                self._publisher.mark_failed(evidence)
-            except Exception as exc:
-                errors.append(exc)
-        errors.extend(self._release_and_cleanup(reservation_id))
+        errors = self._reconcile_terminal(
+            reservation_id,
+            evidence=(
+                evidence
+                if evidence is not None
+                else self.preview_workspace.evidence_for(reservation_id)
+            ),
+        )
         if errors:
             raise ExceptionGroup("evidence cancellation failed", errors)
 
@@ -1211,12 +1419,43 @@ class EvidenceCoordinator:
         return expired
 
     def _release_and_cleanup(self, reservation_id: str) -> list[Exception]:
+        errors = self._release_media_preserving_record(reservation_id)
+        if errors:
+            return errors
+        return self.preview_workspace.cleanup(reservation_id)
+
+    def _release_media_preserving_record(
+        self,
+        reservation_id: str,
+    ) -> list[Exception]:
         errors: list[Exception] = []
         try:
             self._ring.release(reservation_id)
         except Exception as exc:
             errors.append(exc)
-        errors.extend(self.preview_workspace.cleanup(reservation_id))
+        errors.extend(
+            self.preview_workspace.cleanup(
+                reservation_id,
+                preserve_record=True,
+            )
+        )
+        return errors
+
+    def _reconcile_terminal(
+        self,
+        reservation_id: str,
+        *,
+        evidence: EvidenceInput | None,
+    ) -> list[Exception]:
+        errors: list[Exception] = []
+        if evidence is not None:
+            try:
+                self._publisher.mark_failed(evidence)
+            except Exception as exc:
+                errors.append(exc)
+        errors.extend(self._release_media_preserving_record(reservation_id))
+        if not errors:
+            errors.extend(self.preview_workspace.cleanup(reservation_id))
         return errors
 
     @staticmethod

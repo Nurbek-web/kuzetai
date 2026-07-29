@@ -268,6 +268,7 @@ def test_only_unpinned_fragments_are_pruned_and_expired_pins_release_capacity(
     reservation = ring.reserve(
         reservation_id="event-pin",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=2),
         pre_roll=2,
         post_roll=2,
@@ -294,6 +295,7 @@ def test_reservation_waits_for_post_roll_and_starts_at_a_keyframe(tmp_path: Path
     pending = ring.reserve(
         reservation_id="event-01",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=5),
         pre_roll=3,
         post_roll=3,
@@ -308,6 +310,7 @@ def test_reservation_waits_for_post_roll_and_starts_at_a_keyframe(tmp_path: Path
     ready = ring.reserve(
         reservation_id="event-01",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=5),
         pre_roll=3,
         post_roll=3,
@@ -329,6 +332,7 @@ def test_reservation_refuses_cross_camera_or_non_keyframe_evidence(tmp_path: Pat
         ring.reserve(
             reservation_id="event-01",
             camera_id="camera-01",
+            stream_epoch="default",
             event_at=NOW + timedelta(seconds=1),
             pre_roll=1,
             post_roll=3,
@@ -343,6 +347,7 @@ def test_h264_is_remuxed_without_decode_and_published_by_atomic_rename(tmp_path:
     reservation = ring.reserve(
         reservation_id="event-01",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=3),
         pre_roll=3,
         post_roll=3,
@@ -366,6 +371,7 @@ def test_h265_fails_closed_without_nvenc_and_limits_concurrency(tmp_path: Path) 
     reservation = ring.reserve(
         reservation_id="event-01",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=3),
         pre_roll=3,
         post_roll=3,
@@ -412,6 +418,7 @@ def test_assembler_reopens_and_rehashes_pinned_fragments_before_ffmpeg(
     reservation = ring.reserve(
         reservation_id="event-attest",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=3),
         pre_roll=3,
         post_roll=3,
@@ -434,6 +441,7 @@ def test_browser_incompatible_h264_is_probed_and_uses_bounded_nvenc(tmp_path: Pa
     reservation = ring.reserve(
         reservation_id="event-incompatible-h264",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=3),
         pre_roll=3,
         post_roll=3,
@@ -458,6 +466,7 @@ def test_assembler_verifies_actual_media_duration_before_ready(tmp_path: Path) -
     reservation = ring.reserve(
         reservation_id="event-duration",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=3),
         pre_roll=3,
         post_roll=3,
@@ -478,6 +487,7 @@ def test_pending_h265_reservation_produces_browser_playable_preview(tmp_path: Pa
     pending = ring.reserve(
         reservation_id="event-preview",
         camera_id="camera-01",
+        stream_epoch="default",
         event_at=NOW + timedelta(seconds=5),
         pre_roll=3,
         post_roll=3,
@@ -1071,7 +1081,7 @@ def test_persisted_ring_accepts_first_restart_fragment_without_cross_epoch_reser
     before_restart = _ring(root, Clock())
     old = before_restart.append(
         camera_id="camera-01",
-        payload=b"same-encoded-fragment",
+        payload=b"old-encoded-fragment",
         start_at=NOW,
         end_at=NOW + timedelta(seconds=2),
         codec="h264",
@@ -1082,7 +1092,7 @@ def test_persisted_ring_accepts_first_restart_fragment_without_cross_epoch_reser
     after_restart = _ring(root, Clock())
     new = after_restart.append(
         camera_id="camera-01",
-        payload=b"same-encoded-fragment",
+        payload=b"new-22",
         start_at=NOW,
         end_at=NOW + timedelta(seconds=2),
         codec="h264",
@@ -1092,14 +1102,17 @@ def test_persisted_ring_accepts_first_restart_fragment_without_cross_epoch_reser
     reservation = after_restart.reserve(
         reservation_id="restart-reservation",
         camera_id="camera-01",
+        stream_epoch="runtime-session-b:camera-01:0",
         event_at=NOW + timedelta(seconds=2),
         pre_roll=2,
         post_roll=2,
     )
 
     assert old.fragment_id != new.fragment_id
+    assert old.fragment_id > new.fragment_id
     assert len(after_restart.fragments("camera-01")) == 2
-    assert len({fragment.stream_epoch for fragment in reservation.fragments}) == 1
+    assert reservation.fragments == (new,)
+    assert reservation.fragments[0].path.read_bytes() == b"new-22"
 
 
 def test_time_bound_is_source_span_not_sum_of_fragment_durations(tmp_path: Path) -> None:
@@ -1128,6 +1141,7 @@ def test_reservation_requires_four_to_ten_second_window(tmp_path: Path) -> None:
             ring.reserve(
                 reservation_id=str(uuid4()),
                 camera_id="camera-01",
+                stream_epoch="default",
                 event_at=NOW + timedelta(seconds=1),
                 pre_roll=pre_roll,
                 post_roll=post_roll,

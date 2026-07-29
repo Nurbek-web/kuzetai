@@ -116,6 +116,9 @@ def is_retryable_database_error(error: BaseException) -> bool:
         or ""
     )
     if str(sqlstate).startswith("08") or str(sqlstate) in {
+        "40001",
+        "40P01",
+        "55P03",
         "57P01",
         "57P02",
         "57P03",

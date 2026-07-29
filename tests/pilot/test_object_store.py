@@ -20,7 +20,7 @@ from protector.pilot.domain import CandidateEventV1
 from protector.pilot.gates import CommercialRightsRecordV1, ModelArtifactV1
 from protector.pilot.runtime.evidence import EncodedFragmentRing
 from protector.pilot.storage.db import create_engine, create_session_factory
-from protector.pilot.storage.journal import SQLiteWALJournal
+from protector.pilot.storage.journal import JournalFullError, SQLiteWALJournal
 from protector.pilot.storage.models import Base, EvidenceModel
 from protector.pilot.storage.object_store import (
     EncryptedLocalObjectStore,
@@ -845,6 +845,66 @@ def test_coordinator_cleanup_attempts_mark_release_and_partial_unlink_independen
     assert not workspace.path_for("reservation-partial", kind="final").exists()
 
 
+def test_cleanup_attestation_failure_preserves_primary_order_and_reconciliation(
+    tmp_path: Path,
+) -> None:
+    class Ring:
+        released: list[str] = []
+
+        def release(self, reservation_id: str) -> int:
+            self.released.append(reservation_id)
+            return 1
+
+    class Assembler:
+        def __init__(self, marker: Path) -> None:
+            self._marker = marker
+
+        def assemble(self, _: object, output: Path) -> object:
+            output.write_bytes(b"partial")
+            self._marker.write_bytes(b"forged")
+            raise OSError("assembly failed")
+
+    class Publisher:
+        failed: list[EvidenceInput] = []
+
+        def mark_failed(self, evidence: EvidenceInput) -> EvidenceInput:
+            self.failed.append(evidence)
+            return replace(evidence, status="failed")
+
+    root = tmp_path / "attestation-cleanup-previews"
+    workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=4,
+        max_bytes=1_000,
+        clock=lambda: NOW,
+    )
+    reservation_id = "reservation-attestation-cleanup"
+    key = hashlib.sha256(reservation_id.encode()).hexdigest()
+    coordinator = EvidenceCoordinator(
+        ring=Ring(),
+        assembler=Assembler(root / PreviewWorkspace._MARKER),
+        publisher=Publisher(),  # type: ignore[arg-type]
+        preview_workspace=workspace,
+    )
+    seed = tmp_path / "attestation-cleanup-seed.mp4"
+    seed.write_bytes(b"seed")
+
+    with pytest.raises(ExceptionGroup) as failure:
+        coordinator.complete(
+            SimpleNamespace(reservation_id=reservation_id, status="ready"),
+            _evidence(_event(), seed),
+        )
+
+    assert [type(error) for error in failure.value.exceptions] == [
+        OSError,
+        PreviewWorkspaceCapacityError,
+    ]
+    assert Ring.released == [reservation_id]
+    assert (root / f"{key}.json").exists()
+    assert (root / f"{key}.final.mp4").read_bytes() == b"partial"
+
+
 def test_preview_workspace_expiry_cancel_restart_and_churn_stay_bounded(
     tmp_path: Path,
 ) -> None:
@@ -1044,6 +1104,270 @@ def test_preview_workspace_marker_metadata_and_unknown_entries_fail_closed(
     ):
         _ = symlink_workspace.item_count
     assert outside.read_text(encoding="utf-8") == '{"must":"remain"}'
+
+
+def test_preview_workspace_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    redirected_parent = tmp_path / "redirected-parent"
+    redirected_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        PreviewWorkspace(
+            redirected_parent / "previews",
+            ttl=timedelta(minutes=5),
+            max_items=2,
+            max_bytes=100,
+            clock=lambda: NOW,
+        )
+
+    assert not (real_parent / "previews").exists()
+
+
+def test_preview_cleanup_uses_attested_descriptor_after_root_replacement(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "attested-previews"
+    workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=100,
+        clock=lambda: NOW,
+    )
+    reservation_id = "reservation-root-replacement"
+    workspace.prepare(reservation_id, kind="preview")
+    key = workspace.path_for(reservation_id, kind="preview").name.split(".")[0]
+    original = tmp_path / "attested-previews-original"
+    root.rename(original)
+    root.mkdir(mode=0o700)
+    foreign_media = root / f"{key}.preview.mp4"
+    foreign_metadata = root / f"{key}.json"
+    foreign_media.write_bytes(b"foreign-media")
+    foreign_metadata.write_text('{"foreign":true}', encoding="utf-8")
+
+    assert workspace.cleanup(reservation_id) == []
+
+    assert foreign_media.read_bytes() == b"foreign-media"
+    assert foreign_metadata.read_text(encoding="utf-8") == '{"foreign":true}'
+    assert not (original / f"{key}.json").exists()
+
+
+def test_preview_cleanup_cannot_touch_another_valid_workspace_after_swap(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first-previews"
+    second_root = tmp_path / "second-previews"
+    first = PreviewWorkspace(
+        first_root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=100,
+        clock=lambda: NOW,
+    )
+    second = PreviewWorkspace(
+        second_root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=100,
+        clock=lambda: NOW,
+    )
+    reservation_id = "same-reservation"
+    first.prepare(reservation_id, kind="preview")
+    second.prepare(reservation_id, kind="preview")
+    key = first.path_for(reservation_id, kind="preview").name.split(".")[0]
+    original = tmp_path / "first-previews-original"
+    first_root.rename(original)
+    second_root.rename(first_root)
+
+    assert first.cleanup(reservation_id) == []
+
+    assert (first_root / PreviewWorkspace._MARKER).read_bytes() == (
+        PreviewWorkspace._MARKER_PAYLOAD
+    )
+    assert (first_root / f"{key}.json").exists()
+    assert not (original / f"{key}.json").exists()
+
+
+def test_restart_reconciliation_keeps_identity_until_second_restart_succeeds(
+    tmp_path: Path,
+) -> None:
+    class Ring:
+        def __init__(self) -> None:
+            self.released: list[str] = []
+
+        def release(self, reservation_id: str) -> int:
+            self.released.append(reservation_id)
+            return 1
+
+    class FailingPublisher:
+        def mark_failed(self, _: EvidenceInput) -> EvidenceInput:
+            raise RuntimeError("database and WAL unavailable")
+
+    class RecordingPublisher:
+        def __init__(self) -> None:
+            self.failed: list[EvidenceInput] = []
+
+        def mark_failed(self, evidence: EvidenceInput) -> EvidenceInput:
+            self.failed.append(evidence)
+            return replace(evidence, status="failed")
+
+    root = tmp_path / "reconciliation-previews"
+    seed = tmp_path / "reconciliation-seed.mp4"
+    seed.write_bytes(b"seed")
+    pending = _evidence(_event(), seed)
+    reservation_id = "reservation-reconcile"
+    first_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=100,
+        clock=lambda: NOW,
+    )
+    output = first_workspace.prepare(
+        reservation_id,
+        kind="preview",
+        evidence=pending,
+    )
+    output.write_bytes(b"preview")
+    first_workspace.register(
+        reservation_id,
+        kind="preview",
+        path=output,
+        evidence=pending,
+    )
+    first_ring = Ring()
+
+    with pytest.raises(ExceptionGroup) as first_failure:
+        EvidenceCoordinator(
+            ring=first_ring,
+            assembler=SimpleNamespace(),
+            publisher=FailingPublisher(),  # type: ignore[arg-type]
+            preview_workspace=first_workspace,
+        )
+
+    assert isinstance(first_failure.value.exceptions[0], RuntimeError)
+    assert first_ring.released == [reservation_id]
+    assert first_workspace.item_count == 1
+    assert not output.exists()
+
+    second_workspace = PreviewWorkspace(
+        root,
+        ttl=timedelta(minutes=5),
+        max_items=2,
+        max_bytes=100,
+        clock=lambda: NOW,
+    )
+    second_ring = Ring()
+    successful = RecordingPublisher()
+    EvidenceCoordinator(
+        ring=second_ring,
+        assembler=SimpleNamespace(),
+        publisher=successful,  # type: ignore[arg-type]
+        preview_workspace=second_workspace,
+    )
+
+    assert [item.evidence_id for item in successful.failed] == [pending.evidence_id]
+    assert second_ring.released == [reservation_id]
+    assert second_workspace.item_count == 0
+
+
+def test_cancel_and_expiry_use_persisted_evidence_by_default(tmp_path: Path) -> None:
+    class Clock:
+        now = NOW
+
+        def __call__(self) -> datetime:
+            return self.now
+
+    class Ring:
+        def release(self, _: str) -> int:
+            return 1
+
+    class Assembler:
+        def assemble_preview(self, _: object, output: Path) -> object:
+            output.write_bytes(b"preview")
+            return SimpleNamespace(path=output)
+
+    class Publisher:
+        def __init__(self) -> None:
+            self.failed: list[EvidenceInput] = []
+
+        def mark_failed(self, evidence: EvidenceInput) -> EvidenceInput:
+            self.failed.append(evidence)
+            return replace(evidence, status="failed")
+
+    clock = Clock()
+    publisher = Publisher()
+    coordinator = EvidenceCoordinator(
+        ring=Ring(),
+        assembler=Assembler(),
+        publisher=publisher,  # type: ignore[arg-type]
+        preview_workspace=PreviewWorkspace(
+            tmp_path / "terminal-previews",
+            ttl=timedelta(seconds=10),
+            max_items=4,
+            max_bytes=100,
+            clock=clock,
+        ),
+    )
+    seed = tmp_path / "terminal-seed.mp4"
+    seed.write_bytes(b"seed")
+    first = _evidence(_event(), seed)
+    second = replace(first, evidence_id=uuid4(), object_key="events/second.mp4")
+    coordinator.create_preview(
+        SimpleNamespace(reservation_id="cancel-me"),
+        evidence=first,
+    )
+    coordinator.cancel("cancel-me")
+    coordinator.create_preview(
+        SimpleNamespace(reservation_id="expire-me"),
+        evidence=second,
+    )
+    clock.now += timedelta(seconds=11)
+
+    assert coordinator.sweep_expired() == ("expire-me",)
+    assert [item.evidence_id for item in publisher.failed] == [
+        first.evidence_id,
+        second.evidence_id,
+    ]
+
+
+def test_publisher_preserves_upload_error_before_failed_transition_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingStore:
+        primary = ObjectPublishError("upload failed")
+
+        def publish(self, *_: object, **__: object) -> object:
+            raise self.primary
+
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    seed = tmp_path / "publisher-failure.mp4"
+    seed.write_bytes(b"seed")
+    evidence = _evidence(event, seed)
+    journal = SQLiteWALJournal(tmp_path / "full-journal.sqlite3", max_items=1)
+    journal.enqueue_event(_event())
+    monkeypatch.setattr(
+        repository,
+        "finalize_evidence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("database unavailable")
+        ),
+    )
+    publisher = EvidencePublisher(
+        store=FailingStore(),  # type: ignore[arg-type]
+        repository=repository,
+        journal=journal,
+    )
+
+    with pytest.raises(ExceptionGroup) as failure:
+        publisher.publish(seed, evidence)
+
+    assert failure.value.exceptions[0] is FailingStore.primary
+    assert isinstance(failure.value.exceptions[1], JournalFullError)
 
 
 def test_publisher_does_not_journal_deterministic_repository_conflicts(

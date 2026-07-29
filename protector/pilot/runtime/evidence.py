@@ -336,6 +336,7 @@ class EncodedFragmentRing:
         *,
         reservation_id: str,
         camera_id: str,
+        stream_epoch: str,
         event_at: datetime,
         pre_roll: float,
         post_roll: float,
@@ -343,6 +344,8 @@ class EncodedFragmentRing:
         """Select a camera-local keyframe-decodable prefix and pin it durably."""
         if not reservation_id:
             raise ValueError("reservation_id must be non-empty")
+        if not stream_epoch or len(stream_epoch) > 128:
+            raise ValueError("stream_epoch must be non-empty and at most 128 characters")
         event_at = _require_utc(event_at, field="event_at")
         window_seconds = pre_roll + post_roll
         if pre_roll < 0 or post_roll < 0 or not 4.0 <= window_seconds <= 10.0:
@@ -352,7 +355,11 @@ class EncodedFragmentRing:
 
         with self._lock:
             self.expire_pins()
-            available = list(self.fragments(camera_id))
+            available = [
+                fragment
+                for fragment in self.fragments(camera_id)
+                if fragment.stream_epoch == stream_epoch
+            ]
             keyframe_index = next(
                 (
                     index
@@ -364,12 +371,7 @@ class EncodedFragmentRing:
             )
             if keyframe_index is None:
                 raise ValueError("no camera-local keyframe can decode the requested pre-roll")
-            selected_epoch = available[keyframe_index].stream_epoch
-            available = [
-                fragment
-                for fragment in available[keyframe_index:]
-                if fragment.stream_epoch == selected_epoch
-            ]
+            available = available[keyframe_index:]
             selected: list[EncodedFragment] = []
             previous_end: datetime | None = None
             for fragment in available:
