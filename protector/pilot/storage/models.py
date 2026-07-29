@@ -502,6 +502,12 @@ class NotificationOutboxModel(Base):
             "status IN ('pending', 'delivering', 'delivered', 'dead_letter')",
             name="ck_notification_outbox_status",
         ),
+        Index(
+            "ix_notification_outbox_claim",
+            "status",
+            "available_at",
+            "lease_expires_at",
+        ),
     )
 
     outbox_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -514,6 +520,8 @@ class NotificationOutboxModel(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_token: Mapped[str | None] = mapped_column(String(36))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )

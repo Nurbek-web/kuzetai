@@ -86,6 +86,15 @@
       {% endif %}
     </section>
 
+    {% if notification and notification.status == "dead_letter" %}
+      <section class="panel state-error" aria-labelledby="notification-heading"
+               data-notification-state="dead_letter">
+        <h2 id="notification-heading">Notification delivery needs operator attention</h2>
+        <p>{{ notification.attempt_count }} attempts</p>
+        {% if notification.last_error %}<p>{{ notification.last_error }}</p>{% endif %}
+      </section>
+    {% endif %}
+
     <section class="panel" aria-labelledby="history-heading">
       <h2 id="history-heading">Review history</h2>
       {% if history %}

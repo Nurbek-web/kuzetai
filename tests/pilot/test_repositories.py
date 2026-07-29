@@ -277,7 +277,15 @@ def test_review_transition_is_atomic_legal_and_idempotent(
     assert repository.get_event(event.event_id).review_status == "confirmed"
     with repository.session_factory() as session:
         assert len(session.scalars(select(ReviewModel)).all()) == 1
-        assert len(session.scalars(select(AuditEntryModel)).all()) == 1
+        audits = session.scalars(select(AuditEntryModel)).all()
+        assert len(audits) == 1
+        assert audits[0].payload == {
+            "from_status": "candidate",
+            "to_status": "confirmed",
+            "notes_present": True,
+            "notes_sha256": "c531fbdf353a5bb201922e78c03665c99d644e4a5e998654f7ddfa4f908fa7f7",
+        }
+        assert "Confirmed from clip" not in repr(audits[0].payload)
 
     with pytest.raises(ValueError, match="illegal event transition"):
         repository.review_event(

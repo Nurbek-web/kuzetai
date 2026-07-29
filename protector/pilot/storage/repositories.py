@@ -174,6 +174,22 @@ def _review_audit_key(event_id: UUID, review_idempotency_key: str) -> str:
     return f"review-audit:{hashlib.sha256(material).hexdigest()}"
 
 
+def _review_audit_payload(
+    *,
+    from_status: ReviewStatus,
+    to_status: ReviewStatus,
+    notes: str | None,
+) -> dict[str, Any]:
+    return {
+        "from_status": from_status,
+        "to_status": to_status,
+        "notes_present": notes is not None,
+        "notes_sha256": (
+            hashlib.sha256(notes.encode("utf-8")).hexdigest() if notes is not None else None
+        ),
+    }
+
+
 def _event_from_row(row: CandidateEventModel) -> CandidateEventV1:
     return CandidateEventV1(
         schema_version=row.schema_version,
@@ -654,11 +670,11 @@ class PilotRepository:
                     action=f"event.{target_status}",
                     entity_type="candidate_event",
                     entity_id=str(event_id),
-                    payload={
-                        "from_status": current.review_status,
-                        "to_status": target_status,
-                        "notes": notes,
-                    },
+                    payload=_review_audit_payload(
+                        from_status=current.review_status,
+                        to_status=target_status,
+                        notes=notes,
+                    ),
                     idempotency_key=_review_audit_key(event_id, idempotency_key),
                 )
             )
@@ -790,11 +806,11 @@ class PilotRepository:
                     action=f"event.{target_status}",
                     entity_type="candidate_event",
                     entity_id=str(event_id),
-                    payload={
-                        "from_status": current.review_status,
-                        "to_status": target_status,
-                        "notes": notes,
-                    },
+                    payload=_review_audit_payload(
+                        from_status=current.review_status,
+                        to_status=target_status,
+                        notes=notes,
+                    ),
                     idempotency_key=_review_audit_key(event_id, review_idempotency_key),
                 )
             )

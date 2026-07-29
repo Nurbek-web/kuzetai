@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -18,8 +20,13 @@ from protector.pilot.api.auth import (
     TotpService,
     machine_token_matches,
 )
+from protector.pilot.notifications.base import EvidenceLinkSigner
 from protector.pilot.storage.models import CameraModel, SiteModel, UserModel
 from protector.pilot.storage.repositories import PilotRepository
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -32,6 +39,8 @@ class ApiContext:
     machine_token: str = field(repr=False)
     evidence_preview_provider: Any | None = field(default=None, repr=False)
     pilot_site_id: str | None = None
+    evidence_link_signer: EvidenceLinkSigner | None = field(default=None, repr=False)
+    evidence_link_now: Callable[[], datetime] = field(default=utc_now, repr=False)
 
 
 class PilotSiteConfigurationError(RuntimeError):

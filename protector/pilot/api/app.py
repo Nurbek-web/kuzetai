@@ -6,6 +6,7 @@ import fcntl
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from protector.pilot.api.auth import LoginThrottle, PasswordService, SessionManager, TotpService
-from protector.pilot.api.dependencies import ApiContext
+from protector.pilot.api.dependencies import ApiContext, utc_now
 from protector.pilot.api.routes_auth import router as auth_router
 from protector.pilot.api.routes_cameras import router as cameras_router
 from protector.pilot.api.routes_events import router as events_router
@@ -27,6 +28,7 @@ from protector.pilot.api.web import (
 from protector.pilot.api.web import (
     router as web_router,
 )
+from protector.pilot.notifications.base import EvidenceLinkSigner
 from protector.pilot.storage.repositories import PilotRepository
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024
@@ -226,6 +228,8 @@ def create_app(
     runtime_lock_path: str | Path | None = None,
     evidence_preview_provider: EvidencePreviewProvider | None = None,
     pilot_site_id: str | None = None,
+    evidence_link_signer: EvidenceLinkSigner | None = None,
+    evidence_link_now: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     """Construct an explicitly configured app; secrets have no committed defaults."""
 
@@ -237,6 +241,8 @@ def create_app(
         raise ValueError("in-process sessions and throttling require exactly one API worker")
     if max_request_body_bytes < 1:
         raise ValueError("request body limit must be positive")
+    if evidence_link_now is not None and not callable(evidence_link_now):
+        raise ValueError("evidence link clock must be callable")
     if pilot_site_id is not None:
         pilot_site_id = pilot_site_id.strip()
         if not pilot_site_id or len(pilot_site_id) > MAX_PILOT_SITE_ID_LENGTH:
@@ -271,6 +277,8 @@ def create_app(
         machine_token=machine_token,
         evidence_preview_provider=evidence_preview_provider,
         pilot_site_id=pilot_site_id,
+        evidence_link_signer=evidence_link_signer,
+        evidence_link_now=evidence_link_now if evidence_link_now is not None else utc_now,
     )
     app.add_middleware(PilotWebSecurityHeadersMiddleware)
     app.add_middleware(

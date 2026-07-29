@@ -25,7 +25,9 @@ from protector.pilot.storage.models import (
     CameraHealthSampleModel,
     CameraModel,
     CandidateEventModel,
+    DeliveryAttemptModel,
     EvidenceModel,
+    NotificationOutboxModel,
     ReviewModel,
     UserModel,
 )
@@ -76,6 +78,13 @@ class CameraCard:
 class EventRow:
     event: CandidateEventModel
     camera_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationState:
+    status: str
+    attempt_count: int
+    last_error: str | None
 
 
 def _current_view_session(request: Request, context: ApiContext) -> ServerSession | None:
@@ -260,6 +269,26 @@ def event_detail(
     current = _current_view_session(request, context)
     if current is None:
         return _redirect_to_login()
+    if request.url.query:
+        try:
+            valid_signed_query = (
+                context.evidence_link_signer is not None
+                and context.evidence_link_signer.verify(
+                    str(request.url),
+                    event_id=event_id,
+                    now=context.evidence_link_now(),
+                )
+            )
+        except Exception:
+            valid_signed_query = False
+        if not valid_signed_query:
+            return templates.TemplateResponse(
+                request=request,
+                name="event_detail.html",
+                context={"current": current, "event": None},
+                status_code=status.HTTP_404_NOT_FOUND,
+                headers={"Cache-Control": "no-store"},
+            )
     try:
         pilot_site_id = resolve_pilot_site_id(context)
     except PilotSiteConfigurationError:
@@ -302,6 +331,39 @@ def event_detail(
             .order_by(EvidenceModel.created_at.desc(), EvidenceModel.evidence_id)
             .limit(1)
         )
+        outbox = database_session.scalar(
+            select(NotificationOutboxModel).where(
+                NotificationOutboxModel.event_id == str(event_id)
+            )
+        )
+        notification: NotificationState | None = None
+        if outbox is not None:
+            attempt_count = int(
+                database_session.scalar(
+                    select(func.max(DeliveryAttemptModel.attempt_number)).where(
+                        DeliveryAttemptModel.outbox_id == outbox.outbox_id
+                    )
+                )
+                or 0
+            )
+            latest_attempt = database_session.scalar(
+                select(DeliveryAttemptModel)
+                .where(DeliveryAttemptModel.outbox_id == outbox.outbox_id)
+                .order_by(
+                    DeliveryAttemptModel.attempt_number.desc(),
+                    DeliveryAttemptModel.delivery_attempt_id,
+                )
+                .limit(1)
+            )
+            notification = NotificationState(
+                status=outbox.status,
+                attempt_count=attempt_count,
+                last_error=(
+                    latest_attempt.error[:256]
+                    if latest_attempt is not None and latest_attempt.error
+                    else None
+                ),
+            )
     can_review = (
         current.user.role in ("operator", "admin")
         and event.gate_mode == "operator"
@@ -324,6 +386,7 @@ def event_detail(
             "evidence": evidence,
             "preview_available": preview_available,
             "can_review": can_review,
+            "notification": notification,
         },
         headers={"Cache-Control": "no-store"},
     )

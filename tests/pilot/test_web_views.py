@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,8 +16,15 @@ from protector.pilot.api.auth import PasswordService, SessionUser, TotpService
 from protector.pilot.api.web import EvidencePreview
 from protector.pilot.domain import CandidateEventV1
 from protector.pilot.gates import CommercialRightsRecordV1, ModelArtifactV1
+from protector.pilot.notifications.base import EvidenceLinkSigner
 from protector.pilot.storage.db import create_engine, create_session_factory
-from protector.pilot.storage.models import Base, CameraHealthSampleModel, CameraModel
+from protector.pilot.storage.models import (
+    Base,
+    CameraHealthSampleModel,
+    CameraModel,
+    DeliveryAttemptModel,
+    NotificationOutboxModel,
+)
 from protector.pilot.storage.repositories import EvidenceInput, PilotRepository
 
 UTC = timezone.utc
@@ -91,6 +99,8 @@ def _make_context(
     evidence_provider: object | None = None,
     include_events: bool = True,
     pilot_site_id: str | None = "site-1",
+    evidence_link_signer: EvidenceLinkSigner | None = None,
+    evidence_link_now: Callable[[], datetime] | None = None,
 ) -> WebContext:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'web.db'}")
     Base.metadata.create_all(engine)
@@ -232,6 +242,8 @@ def _make_context(
         machine_token=MACHINE_TOKEN,
         evidence_preview_provider=evidence_provider,
         pilot_site_id=pilot_site_id,
+        evidence_link_signer=evidence_link_signer,
+        evidence_link_now=evidence_link_now,
     )
     return WebContext(
         client=TestClient(app, base_url="https://testserver"),
@@ -583,6 +595,125 @@ def test_event_detail_renders_candidate_metadata_and_escaped_review_history(
     assert OBJECT_KEY_SECRET not in candidate.text + reviewed.text
     assert SOURCE_REFERENCE_SECRET not in candidate.text + reviewed.text
     _assert_html_security_headers(candidate)
+
+
+def test_signed_event_detail_query_still_requires_auth_and_is_event_bound_and_expiring(
+    tmp_path: Path,
+) -> None:
+    current_time = [NOW]
+    signer = EvidenceLinkSigner(
+        secret=b"l" * 32,
+        application_origin="https://testserver",
+        ttl=timedelta(minutes=5),
+    )
+    context = _make_context(
+        tmp_path,
+        evidence_link_signer=signer,
+        evidence_link_now=lambda: current_time[0],
+    )
+    link = signer.issue(EVENT_READY, now=NOW)
+
+    unauthenticated = context.client.get(link, follow_redirects=False)
+
+    assert unauthenticated.status_code == 303
+    assert unauthenticated.headers["location"] == "/pilot/login"
+
+    context.authenticate("viewer")
+    assert context.client.get(f"/pilot/events/{EVENT_READY}").status_code == 200
+    assert context.client.get(link).status_code == 200
+
+    wrong_event = link.replace(str(EVENT_READY), str(EVENT_SHADOW))
+    rejected_event = context.client.get(wrong_event)
+    assert rejected_event.status_code == 404
+    assert str(EVENT_SHADOW) not in rejected_event.text
+    assert "shadow-only fire candidate" not in rejected_event.text
+
+    current_time[0] = NOW + timedelta(minutes=5)
+    expired = context.client.get(link)
+    assert expired.status_code == 404
+    assert str(EVENT_READY) not in expired.text
+    assert "zone &lt;img" not in expired.text
+
+
+def test_event_detail_rejects_missing_signer_and_malformed_signed_queries(
+    tmp_path: Path,
+) -> None:
+    signer = EvidenceLinkSigner(
+        secret=b"l" * 32,
+        application_origin="https://testserver",
+        ttl=timedelta(minutes=5),
+    )
+    link = signer.issue(EVENT_READY, now=NOW)
+    path, query = link.split("?", 1)
+    expires_field, signature_field = query.split("&")
+    malformed_links = (
+        f"{path}?{expires_field}",
+        f"{path}?{signature_field}",
+        f"{link}&extra=1",
+        f"{link[:-1]}{'x' if link[-1] != 'x' else 'y'}",
+    )
+    configured = _make_context(
+        tmp_path,
+        evidence_link_signer=signer,
+        evidence_link_now=lambda: NOW,
+    )
+    configured.authenticate("viewer")
+
+    for malformed_link in malformed_links:
+        response = configured.client.get(malformed_link)
+        assert response.status_code == 404
+        assert str(EVENT_READY) not in response.text
+        assert "zone &lt;img" not in response.text
+
+    missing_signer_path = tmp_path / "missing-signer"
+    missing_signer_path.mkdir()
+    missing_signer = _make_context(missing_signer_path)
+    missing_signer.authenticate("viewer")
+    response = missing_signer.client.get(link)
+    assert response.status_code == 404
+    assert str(EVENT_READY) not in response.text
+    assert "zone &lt;img" not in response.text
+    assert "EvidenceLinkSigner" not in repr(configured.app.state.pilot_context)
+    assert "evidence_link_now" not in repr(configured.app.state.pilot_context)
+
+
+def test_event_detail_renders_operator_visible_dead_letter_state(tmp_path: Path) -> None:
+    context = _make_context(tmp_path)
+    context.repository.review_event_and_enqueue_notification(
+        event_id=EVENT_READY,
+        reviewer_id="operator-1",
+        target_status="confirmed",
+        expected_status="candidate",
+        review_idempotency_key="dead-letter-review",
+        notification_idempotency_key="dead-letter-notification",
+        notes=None,
+        reviewed_at=NOW + timedelta(minutes=1),
+        expected_site_id="site-1",
+    )
+    with context.repository.session_factory.begin() as session:
+        outbox = session.query(NotificationOutboxModel).filter_by(
+            event_id=str(EVENT_READY)
+        ).one()
+        outbox.status = "dead_letter"
+        session.add(
+            DeliveryAttemptModel(
+                delivery_attempt_id="40000000-0000-0000-0000-000000000001",
+                outbox_id=outbox.outbox_id,
+                attempt_number=3,
+                attempted_at=NOW + timedelta(minutes=2),
+                status="failed",
+                error="notification delivery failed",
+            )
+        )
+    context.authenticate("viewer")
+
+    response = context.client.get(f"/pilot/events/{EVENT_READY}")
+
+    assert response.status_code == 200
+    assert 'data-notification-state="dead_letter"' in response.text
+    assert "Notification delivery needs operator attention" in response.text
+    assert "3 attempts" in response.text
+    assert "notification delivery failed" in response.text
 
 
 @pytest.mark.parametrize(
