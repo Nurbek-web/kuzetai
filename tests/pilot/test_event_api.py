@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from protector.pilot.api.app import create_app
-from protector.pilot.api.auth import PasswordService, TotpService
+from protector.pilot.api.auth import PasswordService, SessionUser, TotpService
 from protector.pilot.domain import CandidateEventV1
 from protector.pilot.gates import CommercialRightsRecordV1, ModelArtifactV1
 from protector.pilot.storage.db import create_engine, create_session_factory
@@ -19,8 +19,10 @@ from protector.pilot.storage.models import (
     AuditEntryModel,
     Base,
     CameraHealthSampleModel,
+    CandidateEventModel,
     NotificationOutboxModel,
     ObservationModel,
+    ReviewModel,
 )
 from protector.pilot.storage.repositories import PilotRepository
 
@@ -86,6 +88,7 @@ def api_context(tmp_path: Path) -> tuple[TestClient, PilotRepository, str]:
         session_secret="session-secret-at-least-32-characters",
         totp_encryption_key=TOTP_KEY,
         machine_token=MACHINE_TOKEN,
+        pilot_site_id="site-1",
     )
     client = TestClient(app, base_url="https://testserver")
     login = client.post(
@@ -278,6 +281,176 @@ def test_audit_list_is_bounded_and_does_not_disclose_secrets(
     assert "camera-password" not in response.text
     assert MACHINE_TOKEN not in response.text
     assert client.get("/api/audit", params={"limit": 101}).status_code == 422
+
+
+def test_api_site_boundary_blocks_foreign_reads_reviews_and_audit(
+    api_context: tuple[TestClient, PilotRepository, str],
+) -> None:
+    client, repository, csrf = api_context
+    repository.add_site(site_id="site-2", name="Foreign School")
+    repository.add_camera(
+        camera_id="foreign-cam",
+        site_id="site-2",
+        name="Foreign Camera",
+        source_reference="rtsp://foreign-secret@10.0.0.99/live",
+        codec="h264",
+    )
+    repository.add_camera(
+        camera_id="disabled-history",
+        site_id="site-1",
+        name="Disabled historical camera",
+        source_reference="rtsp://historical-secret@10.0.0.30/live",
+        codec="h264",
+        enabled=False,
+    )
+    foreign_candidate = _event(
+        event_id=UUID("30000000-0000-0000-0000-000000000001"),
+        camera_id="foreign-cam",
+        reason="foreign candidate must stay private",
+    )
+    foreign_audited = _event(
+        event_id=UUID("30000000-0000-0000-0000-000000000002"),
+        camera_id="foreign-cam",
+        reason="foreign audited event",
+        opened_at=NOW + timedelta(seconds=1),
+    )
+    same_site_historical = _event(
+        event_id=UUID("30000000-0000-0000-0000-000000000003"),
+        camera_id="disabled-history",
+        reason="same-site historical event",
+        opened_at=NOW + timedelta(seconds=2),
+    )
+    repository.add_event(foreign_candidate)
+    repository.add_event(foreign_audited)
+    repository.add_event(same_site_historical)
+    repository.review_event_and_enqueue_notification(
+        event_id=foreign_audited.event_id,
+        reviewer_id="operator-1",
+        target_status="rejected",
+        expected_status="candidate",
+        review_idempotency_key="seed-foreign-audit",
+        notification_idempotency_key="seed-foreign-notification",
+        notes="foreign audit",
+        reviewed_at=NOW + timedelta(minutes=1),
+    )
+
+    cameras = client.get("/api/cameras")
+    switched_cameras = client.get("/api/cameras", params={"site_id": "site-2"})
+    events = client.get("/api/events")
+    foreign_filtered = client.get(
+        "/api/events",
+        params={"camera_id": "foreign-cam"},
+    )
+    foreign_detail = client.get(f"/api/events/{foreign_candidate.event_id}")
+    foreign_review = _review(
+        client,
+        foreign_candidate,
+        csrf,
+        idempotency_key="blocked-foreign-review",
+    )
+    historical_detail = client.get(f"/api/events/{same_site_historical.event_id}")
+    historical_review = _review(
+        client,
+        same_site_historical,
+        csrf,
+        idempotency_key="same-site-historical-review",
+    )
+    audit = client.get("/api/audit")
+
+    assert cameras.status_code == 200
+    camera_ids = {row["camera_id"] for row in cameras.json()["items"]}
+    assert "foreign-cam" not in camera_ids
+    assert "disabled-history" in camera_ids
+    assert switched_cameras.status_code == 200
+    assert switched_cameras.json()["items"] == []
+    assert switched_cameras.json()["total"] == 0
+    assert events.status_code == 200
+    event_ids = {row["event_id"] for row in events.json()["items"]}
+    assert str(foreign_candidate.event_id) not in event_ids
+    assert str(foreign_audited.event_id) not in event_ids
+    assert str(same_site_historical.event_id) in event_ids
+    assert foreign_filtered.json()["items"] == []
+    assert foreign_filtered.json()["total"] == 0
+    assert foreign_detail.status_code == 404
+    assert foreign_detail.json() == {"detail": "event not found"}
+    assert foreign_review.status_code == 404
+    assert foreign_review.json() == {"detail": "event not found"}
+    assert historical_detail.status_code == 200
+    assert historical_review.status_code == 200
+    assert historical_review.json()["event"]["review_status"] == "confirmed"
+    audit_entity_ids = {row["entity_id"] for row in audit.json()["items"]}
+    assert str(foreign_audited.event_id) not in audit_entity_ids
+    assert str(same_site_historical.event_id) in audit_entity_ids
+
+    with repository.session_factory() as session:
+        persisted_foreign = session.get(CandidateEventModel, str(foreign_candidate.event_id))
+        assert persisted_foreign is not None
+        assert persisted_foreign.review_status == "candidate"
+        assert (
+            session.query(ReviewModel)
+            .filter(ReviewModel.event_id == str(foreign_candidate.event_id))
+            .count()
+            == 0
+        )
+        assert (
+            session.query(AuditEntryModel)
+            .filter(AuditEntryModel.entity_id == str(foreign_candidate.event_id))
+            .count()
+            == 0
+        )
+        assert (
+            session.query(NotificationOutboxModel)
+            .filter(NotificationOutboxModel.event_id == str(foreign_candidate.event_id))
+            .count()
+            == 0
+        )
+
+
+def test_api_site_resolution_fails_missing_and_ambiguous_as_generic_503(
+    api_context: tuple[TestClient, PilotRepository, str],
+    tmp_path: Path,
+) -> None:
+    _, repository, _ = api_context
+
+    def authenticated_client(app: object) -> TestClient:
+        token, _ = app.state.pilot_context.sessions.create(
+            SessionUser(user_id="operator-1", username="operator", role="operator")
+        )
+        result = TestClient(app, base_url="https://testserver")
+        result.cookies.set("pilot_session", token)
+        return result
+
+    missing_app = create_app(
+        repository=repository,
+        session_secret="missing-site-session-secret-at-least-32-characters",
+        totp_encryption_key=TOTP_KEY,
+        machine_token=MACHINE_TOKEN,
+        pilot_site_id="missing-site",
+        runtime_lock_path=tmp_path / "missing.lock",
+    )
+    missing = authenticated_client(missing_app).get("/api/cameras")
+
+    repository.add_site(site_id="site-2", name="Ambiguous School")
+    repository.add_camera(
+        camera_id="ambiguous-foreign-cam",
+        site_id="site-2",
+        name="Ambiguous Foreign Camera",
+        source_reference="rtsp://foreign-secret@10.0.0.98/live",
+        codec="h264",
+    )
+    ambiguous_app = create_app(
+        repository=repository,
+        session_secret="ambiguous-site-session-secret-at-least-32-characters",
+        totp_encryption_key=TOTP_KEY,
+        machine_token=MACHINE_TOKEN,
+        runtime_lock_path=tmp_path / "ambiguous.lock",
+    )
+    ambiguous = authenticated_client(ambiguous_app).get("/api/events")
+
+    assert missing.status_code == 503
+    assert missing.json() == {"detail": "pilot site unavailable"}
+    assert ambiguous.status_code == 503
+    assert ambiguous.json() == {"detail": "pilot site unavailable"}
 
 
 def test_event_and_audit_payloads_redact_credentials_embedded_in_text(

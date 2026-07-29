@@ -16,8 +16,10 @@ from sqlalchemy import func, or_, select
 from protector.pilot.api.auth import ServerSession
 from protector.pilot.api.dependencies import (
     ApiContext,
+    PilotSiteConfigurationError,
     get_context,
     get_current_session,
+    resolve_pilot_site_id,
 )
 from protector.pilot.storage.models import (
     CameraHealthSampleModel,
@@ -76,10 +78,6 @@ class EventRow:
     camera_name: str
 
 
-class PilotSiteConfigurationError(RuntimeError):
-    """The console cannot identify one authoritative pilot site."""
-
-
 def _current_view_session(request: Request, context: ApiContext) -> ServerSession | None:
     try:
         return get_current_session(request, context)
@@ -91,23 +89,6 @@ def _current_view_session(request: Request, context: ApiContext) -> ServerSessio
 
 def _redirect_to_login() -> RedirectResponse:
     return RedirectResponse("/pilot/login", status_code=status.HTTP_303_SEE_OTHER)
-
-
-def _resolve_pilot_site_id(context: ApiContext) -> str:
-    if context.pilot_site_id is not None:
-        return context.pilot_site_id
-    with context.repository.session_factory() as database_session:
-        enabled_site_ids = list(
-            database_session.scalars(
-                select(CameraModel.site_id)
-                .where(CameraModel.enabled.is_(True))
-                .distinct()
-                .order_by(CameraModel.site_id)
-            )
-        )
-    if len(enabled_site_ids) != 1:
-        raise PilotSiteConfigurationError("pilot site identity is ambiguous")
-    return enabled_site_ids[0]
 
 
 def _latest_camera_cards(context: ApiContext, *, pilot_site_id: str) -> list[CameraCard]:
@@ -222,7 +203,7 @@ def dashboard(
     if current is None:
         return _redirect_to_login()
     try:
-        pilot_site_id = _resolve_pilot_site_id(context)
+        pilot_site_id = resolve_pilot_site_id(context)
         cameras = _latest_camera_cards(context, pilot_site_id=pilot_site_id)
         events = _filtered_events(
             context,
@@ -280,7 +261,7 @@ def event_detail(
     if current is None:
         return _redirect_to_login()
     try:
-        pilot_site_id = _resolve_pilot_site_id(context)
+        pilot_site_id = resolve_pilot_site_id(context)
     except PilotSiteConfigurationError:
         return templates.TemplateResponse(
             request=request,
@@ -359,7 +340,7 @@ def evidence_preview(
     if provider is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="preview unavailable")
     try:
-        pilot_site_id = _resolve_pilot_site_id(context)
+        pilot_site_id = resolve_pilot_site_id(context)
     except PilotSiteConfigurationError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

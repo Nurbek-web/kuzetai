@@ -19,10 +19,11 @@ from protector.pilot.api.dependencies import (
     redact_secrets,
     require_csrf,
     require_idempotency_key,
+    require_pilot_site_id,
     require_roles,
 )
 from protector.pilot.domain import CandidateEventV1
-from protector.pilot.storage.models import AuditEntryModel, CandidateEventModel
+from protector.pilot.storage.models import AuditEntryModel, CameraModel, CandidateEventModel
 from protector.pilot.storage.repositories import IdempotencyConflictError, StaleStateError
 
 router = APIRouter(prefix="/api", tags=["events"])
@@ -80,6 +81,7 @@ def _notification_key(event_id: UUID, idempotency_key: str) -> str:
 def list_events(
     current: Annotated[ServerSession, Depends(get_current_session)],
     context: Annotated[ApiContext, Depends(get_context)],
+    pilot_site_id: Annotated[str, Depends(require_pilot_site_id)],
     camera_id: Annotated[str | None, Query(max_length=128)] = None,
     module: Annotated[str | None, Query(max_length=128)] = None,
     gate_mode: Literal["disabled", "shadow", "operator"] | None = None,
@@ -95,6 +97,7 @@ def list_events(
     filters = [
         expression
         for expression in (
+            CameraModel.site_id == pilot_site_id,
             CandidateEventModel.camera_id == camera_id if camera_id is not None else None,
             CandidateEventModel.module == module if module is not None else None,
             CandidateEventModel.gate_mode == gate_mode if gate_mode is not None else None,
@@ -108,8 +111,15 @@ def list_events(
         )
         if expression is not None
     ]
-    statement = select(CandidateEventModel)
-    count_statement = select(func.count()).select_from(CandidateEventModel)
+    statement = select(CandidateEventModel).join(
+        CameraModel,
+        CameraModel.camera_id == CandidateEventModel.camera_id,
+    )
+    count_statement = (
+        select(func.count())
+        .select_from(CandidateEventModel)
+        .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+    )
     if filters:
         statement = statement.where(*filters)
         count_statement = count_statement.where(*filters)
@@ -134,10 +144,11 @@ def get_event(
     event_id: UUID,
     current: Annotated[ServerSession, Depends(get_current_session)],
     context: Annotated[ApiContext, Depends(get_context)],
+    pilot_site_id: Annotated[str, Depends(require_pilot_site_id)],
 ) -> dict[str, object]:
     del current
     try:
-        event = context.repository.get_event(event_id)
+        event = context.repository.get_event(event_id, expected_site_id=pilot_site_id)
     except KeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="event not found"
@@ -172,6 +183,7 @@ def review_event(
     ],
     idempotency_key: Annotated[str, Depends(require_idempotency_key)],
     context: Annotated[ApiContext, Depends(get_context)],
+    pilot_site_id: Annotated[str, Depends(require_pilot_site_id)],
 ) -> dict[str, object]:
     if csrf_session.session_id != role_session.session_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="session mismatch")
@@ -186,6 +198,7 @@ def review_event(
             notification_idempotency_key=_notification_key(event_id, idempotency_key),
             notes=body.notes,
             reviewed_at=body.reviewed_at,
+            expected_site_id=pilot_site_id,
         )
     except KeyError as exc:
         raise HTTPException(
@@ -206,7 +219,7 @@ def review_event(
             },
         ) from exc
 
-    event = context.repository.get_event(event_id)
+    event = context.repository.get_event(event_id, expected_site_id=pilot_site_id)
     return {
         "review_id": result.review.review_id,
         "event": _event_payload(event),
@@ -217,6 +230,7 @@ def review_event(
 def list_audit(
     current: Annotated[ServerSession, Depends(get_current_session)],
     context: Annotated[ApiContext, Depends(get_context)],
+    pilot_site_id: Annotated[str, Depends(require_pilot_site_id)],
     entity_type: Annotated[str | None, Query(max_length=128)] = None,
     entity_id: Annotated[str | None, Query(max_length=255)] = None,
     action: Annotated[str | None, Query(max_length=255)] = None,
@@ -227,14 +241,31 @@ def list_audit(
     filters = [
         expression
         for expression in (
+            AuditEntryModel.entity_type == "candidate_event",
+            CameraModel.site_id == pilot_site_id,
             AuditEntryModel.entity_type == entity_type if entity_type is not None else None,
             AuditEntryModel.entity_id == entity_id if entity_id is not None else None,
             AuditEntryModel.action == action if action is not None else None,
         )
         if expression is not None
     ]
-    statement = select(AuditEntryModel)
-    count_statement = select(func.count()).select_from(AuditEntryModel)
+    statement = (
+        select(AuditEntryModel)
+        .join(
+            CandidateEventModel,
+            CandidateEventModel.event_id == AuditEntryModel.entity_id,
+        )
+        .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+    )
+    count_statement = (
+        select(func.count())
+        .select_from(AuditEntryModel)
+        .join(
+            CandidateEventModel,
+            CandidateEventModel.event_id == AuditEntryModel.entity_id,
+        )
+        .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+    )
     if filters:
         statement = statement.where(*filters)
         count_statement = count_statement.where(*filters)

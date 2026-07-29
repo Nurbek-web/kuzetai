@@ -375,9 +375,22 @@ class PilotRepository:
             transition_history=">".join(event.transition_history),
         )
 
-    def get_event(self, event_id: UUID) -> CandidateEventV1:
+    def get_event(
+        self,
+        event_id: UUID,
+        *,
+        expected_site_id: str | None = None,
+    ) -> CandidateEventV1:
         with self.session_factory() as session:
-            row = session.get(CandidateEventModel, str(event_id))
+            statement = select(CandidateEventModel).where(
+                CandidateEventModel.event_id == str(event_id)
+            )
+            if expected_site_id is not None:
+                statement = statement.join(
+                    CameraModel,
+                    CameraModel.camera_id == CandidateEventModel.camera_id,
+                ).where(CameraModel.site_id == expected_site_id)
+            row = session.scalar(statement)
             if row is None:
                 raise KeyError(f"unknown event: {event_id}")
             return _event_from_row(row)
@@ -664,16 +677,21 @@ class PilotRepository:
         notification_idempotency_key: str,
         notes: str | None,
         reviewed_at: datetime,
+        expected_site_id: str | None = None,
     ) -> ReviewNotificationResult:
         """Commit review, audit, and any confirmed-operator outbox row together."""
         with self.session_factory() as session:
             if session.get_bind().dialect.name == "sqlite":
                 session.connection().exec_driver_sql("BEGIN IMMEDIATE")
-            event_row = session.scalar(
-                select(CandidateEventModel)
-                .where(CandidateEventModel.event_id == str(event_id))
-                .with_for_update()
+            event_statement = select(CandidateEventModel).where(
+                CandidateEventModel.event_id == str(event_id)
             )
+            if expected_site_id is not None:
+                event_statement = event_statement.join(
+                    CameraModel,
+                    CameraModel.camera_id == CandidateEventModel.camera_id,
+                ).where(CameraModel.site_id == expected_site_id)
+            event_row = session.scalar(event_statement.with_for_update())
             if event_row is None:
                 session.rollback()
                 raise KeyError(f"unknown event: {event_id}")

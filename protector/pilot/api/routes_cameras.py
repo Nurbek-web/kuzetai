@@ -13,6 +13,7 @@ from protector.pilot.api.dependencies import (
     get_context,
     get_current_session,
     redact_secrets,
+    require_pilot_site_id,
 )
 from protector.pilot.storage.models import CameraModel
 
@@ -23,6 +24,7 @@ router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 def list_cameras(
     current: Annotated[ServerSession, Depends(get_current_session)],
     context: Annotated[ApiContext, Depends(get_context)],
+    pilot_site_id: Annotated[str, Depends(require_pilot_site_id)],
     site_id: Annotated[str | None, Query(max_length=128)] = None,
     state: Literal["starting", "online", "degraded", "offline", "reconnecting"] | None = None,
     enabled: bool | None = None,
@@ -33,6 +35,7 @@ def list_cameras(
     filters = [
         expression
         for expression in (
+            CameraModel.site_id == pilot_site_id,
             CameraModel.site_id == site_id if site_id is not None else None,
             CameraModel.state == state if state is not None else None,
             CameraModel.enabled == enabled if enabled is not None else None,

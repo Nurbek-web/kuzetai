@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any
 
 from fastapi import Depends, Header, HTTPException, Request, status
+from sqlalchemy import select
 
 from protector.pilot.api.auth import (
     LoginThrottle,
@@ -17,7 +18,7 @@ from protector.pilot.api.auth import (
     TotpService,
     machine_token_matches,
 )
-from protector.pilot.storage.models import UserModel
+from protector.pilot.storage.models import CameraModel, SiteModel, UserModel
 from protector.pilot.storage.repositories import PilotRepository
 
 
@@ -33,8 +34,47 @@ class ApiContext:
     pilot_site_id: str | None = None
 
 
+class PilotSiteConfigurationError(RuntimeError):
+    """The control plane cannot identify one authoritative pilot site."""
+
+
+def resolve_pilot_site_id(context: ApiContext) -> str:
+    configured_site_id = context.pilot_site_id
+    with context.repository.session_factory() as database_session:
+        if configured_site_id is not None:
+            persisted_site_id = database_session.scalar(
+                select(SiteModel.site_id).where(SiteModel.site_id == configured_site_id)
+            )
+            if persisted_site_id is None:
+                raise PilotSiteConfigurationError("configured pilot site is missing")
+            return persisted_site_id
+        enabled_site_ids = list(
+            database_session.scalars(
+                select(CameraModel.site_id)
+                .where(CameraModel.enabled.is_(True))
+                .distinct()
+                .order_by(CameraModel.site_id)
+            )
+        )
+    if len(enabled_site_ids) != 1:
+        raise PilotSiteConfigurationError("pilot site identity is ambiguous")
+    return enabled_site_ids[0]
+
+
 def get_context(request: Request) -> ApiContext:
     return request.app.state.pilot_context
+
+
+def require_pilot_site_id(
+    context: Annotated[ApiContext, Depends(get_context)],
+) -> str:
+    try:
+        return resolve_pilot_site_id(context)
+    except PilotSiteConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="pilot site unavailable",
+        ) from exc
 
 
 def get_current_session(
