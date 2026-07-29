@@ -9,7 +9,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy.sql.elements import ColumnElement
 
 from protector.pilot.api.auth import ServerSession
 from protector.pilot.api.dependencies import (
@@ -23,7 +24,16 @@ from protector.pilot.api.dependencies import (
     require_roles,
 )
 from protector.pilot.domain import CandidateEventV1
-from protector.pilot.storage.models import AuditEntryModel, CameraModel, CandidateEventModel
+from protector.pilot.storage.models import (
+    AuditEntryModel,
+    CameraModel,
+    CandidateEventModel,
+    DeliveryAttemptModel,
+    EvidenceModel,
+    NotificationOutboxModel,
+    ReviewModel,
+    SiteModel,
+)
 from protector.pilot.storage.repositories import IdempotencyConflictError, StaleStateError
 
 router = APIRouter(prefix="/api", tags=["events"])
@@ -75,6 +85,104 @@ def _event_payload(event: CandidateEventV1) -> dict[str, object]:
 def _notification_key(event_id: UUID, idempotency_key: str) -> str:
     material = f"{event_id}:{idempotency_key}".encode()
     return f"review-notification:{hashlib.sha256(material).hexdigest()}"
+
+
+def _audit_site_attribution(pilot_site_id: str) -> ColumnElement[bool]:
+    return or_(
+        and_(
+            AuditEntryModel.entity_type == "site",
+            exists(
+                select(SiteModel.site_id).where(
+                    SiteModel.site_id == AuditEntryModel.entity_id,
+                    SiteModel.site_id == pilot_site_id,
+                )
+            ).correlate(AuditEntryModel),
+        ),
+        and_(
+            AuditEntryModel.entity_type == "camera",
+            exists(
+                select(CameraModel.camera_id).where(
+                    CameraModel.camera_id == AuditEntryModel.entity_id,
+                    CameraModel.site_id == pilot_site_id,
+                )
+            ).correlate(AuditEntryModel),
+        ),
+        and_(
+            AuditEntryModel.entity_type == "candidate_event",
+            exists(
+                select(CandidateEventModel.event_id)
+                .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+                .where(
+                    CandidateEventModel.event_id == AuditEntryModel.entity_id,
+                    CameraModel.site_id == pilot_site_id,
+                )
+            ).correlate(AuditEntryModel),
+        ),
+        and_(
+            AuditEntryModel.entity_type == "evidence",
+            exists(
+                select(EvidenceModel.evidence_id)
+                .join(
+                    CandidateEventModel,
+                    CandidateEventModel.event_id == EvidenceModel.event_id,
+                )
+                .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+                .where(
+                    EvidenceModel.evidence_id == AuditEntryModel.entity_id,
+                    CameraModel.site_id == pilot_site_id,
+                )
+            ).correlate(AuditEntryModel),
+        ),
+        and_(
+            AuditEntryModel.entity_type == "review",
+            exists(
+                select(ReviewModel.review_id)
+                .join(
+                    CandidateEventModel,
+                    CandidateEventModel.event_id == ReviewModel.event_id,
+                )
+                .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+                .where(
+                    ReviewModel.review_id == AuditEntryModel.entity_id,
+                    CameraModel.site_id == pilot_site_id,
+                )
+            ).correlate(AuditEntryModel),
+        ),
+        and_(
+            AuditEntryModel.entity_type == "notification_outbox",
+            exists(
+                select(NotificationOutboxModel.outbox_id)
+                .join(
+                    CandidateEventModel,
+                    CandidateEventModel.event_id == NotificationOutboxModel.event_id,
+                )
+                .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+                .where(
+                    NotificationOutboxModel.outbox_id == AuditEntryModel.entity_id,
+                    CameraModel.site_id == pilot_site_id,
+                )
+            ).correlate(AuditEntryModel),
+        ),
+        and_(
+            AuditEntryModel.entity_type == "delivery_attempt",
+            exists(
+                select(DeliveryAttemptModel.delivery_attempt_id)
+                .join(
+                    NotificationOutboxModel,
+                    NotificationOutboxModel.outbox_id == DeliveryAttemptModel.outbox_id,
+                )
+                .join(
+                    CandidateEventModel,
+                    CandidateEventModel.event_id == NotificationOutboxModel.event_id,
+                )
+                .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
+                .where(
+                    DeliveryAttemptModel.delivery_attempt_id == AuditEntryModel.entity_id,
+                    CameraModel.site_id == pilot_site_id,
+                )
+            ).correlate(AuditEntryModel),
+        ),
+    )
 
 
 @router.get("/events")
@@ -238,34 +346,19 @@ def list_audit(
     offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
 ) -> dict[str, object]:
     del current
+    site_attribution = _audit_site_attribution(pilot_site_id)
     filters = [
         expression
         for expression in (
-            AuditEntryModel.entity_type == "candidate_event",
-            CameraModel.site_id == pilot_site_id,
+            site_attribution,
             AuditEntryModel.entity_type == entity_type if entity_type is not None else None,
             AuditEntryModel.entity_id == entity_id if entity_id is not None else None,
             AuditEntryModel.action == action if action is not None else None,
         )
         if expression is not None
     ]
-    statement = (
-        select(AuditEntryModel)
-        .join(
-            CandidateEventModel,
-            CandidateEventModel.event_id == AuditEntryModel.entity_id,
-        )
-        .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
-    )
-    count_statement = (
-        select(func.count())
-        .select_from(AuditEntryModel)
-        .join(
-            CandidateEventModel,
-            CandidateEventModel.event_id == AuditEntryModel.entity_id,
-        )
-        .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
-    )
+    statement = select(AuditEntryModel)
+    count_statement = select(func.count()).select_from(AuditEntryModel)
     if filters:
         statement = statement.where(*filters)
         count_statement = count_statement.where(*filters)

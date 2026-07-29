@@ -20,11 +20,12 @@ from protector.pilot.storage.models import (
     Base,
     CameraHealthSampleModel,
     CandidateEventModel,
+    DeliveryAttemptModel,
     NotificationOutboxModel,
     ObservationModel,
     ReviewModel,
 )
-from protector.pilot.storage.repositories import PilotRepository
+from protector.pilot.storage.repositories import AuditEntryInput, EvidenceInput, PilotRepository
 
 UTC = timezone.utc
 NOW = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
@@ -333,6 +334,39 @@ def test_api_site_boundary_blocks_foreign_reads_reviews_and_audit(
         notes="foreign audit",
         reviewed_at=NOW + timedelta(minutes=1),
     )
+    same_camera_audit = repository.append_audit(
+        AuditEntryInput(
+            actor_user_id="operator-1",
+            action="camera.disabled",
+            entity_type="camera",
+            entity_id="disabled-history",
+            payload={"source_reference": "rtsp://historical-secret@10.0.0.30/live"},
+            idempotency_key="same-camera-audit",
+            occurred_at=NOW + timedelta(minutes=2),
+        )
+    )
+    foreign_camera_audit = repository.append_audit(
+        AuditEntryInput(
+            actor_user_id="operator-1",
+            action="camera.created",
+            entity_type="camera",
+            entity_id="foreign-cam",
+            payload={"source_reference": "rtsp://foreign-secret@10.0.0.99/live"},
+            idempotency_key="foreign-camera-audit",
+            occurred_at=NOW + timedelta(minutes=2),
+        )
+    )
+    unknown_audit = repository.append_audit(
+        AuditEntryInput(
+            actor_user_id="operator-1",
+            action="unknown.claimed",
+            entity_type="unknown",
+            entity_id="disabled-history",
+            payload={"site_id": "site-1"},
+            idempotency_key="unknown-camera-claim",
+            occurred_at=NOW + timedelta(minutes=2),
+        )
+    )
 
     cameras = client.get("/api/cameras")
     switched_cameras = client.get("/api/cameras", params={"site_id": "site-2"})
@@ -356,6 +390,7 @@ def test_api_site_boundary_blocks_foreign_reads_reviews_and_audit(
         idempotency_key="same-site-historical-review",
     )
     audit = client.get("/api/audit")
+    camera_audit = client.get("/api/audit", params={"entity_type": "camera"})
 
     assert cameras.status_code == 200
     camera_ids = {row["camera_id"] for row in cameras.json()["items"]}
@@ -381,6 +416,16 @@ def test_api_site_boundary_blocks_foreign_reads_reviews_and_audit(
     audit_entity_ids = {row["entity_id"] for row in audit.json()["items"]}
     assert str(foreign_audited.event_id) not in audit_entity_ids
     assert str(same_site_historical.event_id) in audit_entity_ids
+    audit_ids = {row["audit_id"] for row in audit.json()["items"]}
+    assert same_camera_audit.audit_id in audit_ids
+    assert foreign_camera_audit.audit_id not in audit_ids
+    assert unknown_audit.audit_id not in audit_ids
+    assert camera_audit.status_code == 200
+    assert [row["audit_id"] for row in camera_audit.json()["items"]] == [
+        same_camera_audit.audit_id
+    ]
+    assert "historical-secret" not in audit.text + camera_audit.text
+    assert "foreign-secret" not in audit.text + camera_audit.text
 
     with repository.session_factory() as session:
         persisted_foreign = session.get(CandidateEventModel, str(foreign_candidate.event_id))
@@ -404,6 +449,162 @@ def test_api_site_boundary_blocks_foreign_reads_reviews_and_audit(
             .count()
             == 0
         )
+
+
+def test_audit_site_attribution_covers_persisted_lifecycle_relations(
+    api_context: tuple[TestClient, PilotRepository, str],
+) -> None:
+    client, repository, _ = api_context
+    repository.add_site(site_id="site-2", name="Foreign Audit School")
+    repository.add_camera(
+        camera_id="foreign-audit-cam",
+        site_id="site-2",
+        name="Foreign Audit Camera",
+        source_reference="rtsp://foreign-audit-secret@10.0.0.97/live",
+        codec="h264",
+    )
+    same_event = _event(
+        event_id=UUID("40000000-0000-0000-0000-000000000001"),
+        camera_id="cam-01",
+    )
+    foreign_event = _event(
+        event_id=UUID("40000000-0000-0000-0000-000000000002"),
+        camera_id="foreign-audit-cam",
+        opened_at=NOW + timedelta(seconds=1),
+    )
+    repository.add_event(same_event)
+    repository.add_event(foreign_event)
+    same_review = repository.review_event_and_enqueue_notification(
+        event_id=same_event.event_id,
+        reviewer_id="operator-1",
+        target_status="confirmed",
+        expected_status="candidate",
+        review_idempotency_key="same-lifecycle-review",
+        notification_idempotency_key="same-lifecycle-notification",
+        notes=None,
+        reviewed_at=NOW + timedelta(minutes=1),
+    )
+    foreign_review = repository.review_event_and_enqueue_notification(
+        event_id=foreign_event.event_id,
+        reviewer_id="operator-1",
+        target_status="confirmed",
+        expected_status="candidate",
+        review_idempotency_key="foreign-lifecycle-review",
+        notification_idempotency_key="foreign-lifecycle-notification",
+        notes=None,
+        reviewed_at=NOW + timedelta(minutes=1),
+    )
+    assert same_review.outbox is not None
+    assert foreign_review.outbox is not None
+    same_evidence = repository.add_evidence(
+        EvidenceInput(
+            evidence_id=UUID("50000000-0000-0000-0000-000000000001"),
+            event_id=same_event.event_id,
+            object_key="site-1/cam-01/lifecycle.mp4",
+            sha256="d" * 64,
+            codec="h264",
+            start_at=NOW,
+            end_at=NOW + timedelta(seconds=4),
+            source_reference="encoded-ring://private/cam-01",
+            status="ready",
+        )
+    )
+    foreign_evidence = repository.add_evidence(
+        EvidenceInput(
+            evidence_id=UUID("50000000-0000-0000-0000-000000000002"),
+            event_id=foreign_event.event_id,
+            object_key="site-2/foreign-audit-cam/lifecycle.mp4",
+            sha256="e" * 64,
+            codec="h264",
+            start_at=NOW,
+            end_at=NOW + timedelta(seconds=4),
+            source_reference="encoded-ring://private/foreign-audit-cam",
+            status="ready",
+        )
+    )
+    with repository.session_factory.begin() as session:
+        same_attempt = DeliveryAttemptModel(
+            delivery_attempt_id="60000000-0000-0000-0000-000000000001",
+            outbox_id=same_review.outbox.outbox_id,
+            attempt_number=1,
+            attempted_at=NOW + timedelta(minutes=2),
+            status="delivered",
+        )
+        foreign_attempt = DeliveryAttemptModel(
+            delivery_attempt_id="60000000-0000-0000-0000-000000000002",
+            outbox_id=foreign_review.outbox.outbox_id,
+            attempt_number=1,
+            attempted_at=NOW + timedelta(minutes=2),
+            status="delivered",
+        )
+        session.add_all((same_attempt, foreign_attempt))
+
+    entity_pairs = (
+        ("site", "site-1", "site-2"),
+        ("camera", "cam-01", "foreign-audit-cam"),
+        ("candidate_event", str(same_event.event_id), str(foreign_event.event_id)),
+        ("evidence", same_evidence.evidence_id, foreign_evidence.evidence_id),
+        ("review", same_review.review.review_id, foreign_review.review.review_id),
+        (
+            "notification_outbox",
+            same_review.outbox.outbox_id,
+            foreign_review.outbox.outbox_id,
+        ),
+        (
+            "delivery_attempt",
+            same_attempt.delivery_attempt_id,
+            foreign_attempt.delivery_attempt_id,
+        ),
+    )
+    same_audit_ids: set[str] = set()
+    foreign_audit_ids: set[str] = set()
+    for entity_type, same_entity_id, foreign_entity_id in entity_pairs:
+        same_audit_ids.add(
+            repository.append_audit(
+                AuditEntryInput(
+                    actor_user_id="operator-1",
+                    action="scope.test",
+                    entity_type=entity_type,
+                    entity_id=same_entity_id,
+                    payload={},
+                    idempotency_key=f"scope-same-{entity_type}",
+                    occurred_at=NOW + timedelta(minutes=3),
+                )
+            ).audit_id
+        )
+        foreign_audit_ids.add(
+            repository.append_audit(
+                AuditEntryInput(
+                    actor_user_id="operator-1",
+                    action="scope.test",
+                    entity_type=entity_type,
+                    entity_id=foreign_entity_id,
+                    payload={},
+                    idempotency_key=f"scope-foreign-{entity_type}",
+                    occurred_at=NOW + timedelta(minutes=3),
+                )
+            ).audit_id
+        )
+    unknown = repository.append_audit(
+        AuditEntryInput(
+            actor_user_id="operator-1",
+            action="scope.test",
+            entity_type="unknown",
+            entity_id="cam-01",
+            payload={"site_id": "site-1"},
+            idempotency_key="scope-unknown",
+            occurred_at=NOW + timedelta(minutes=3),
+        )
+    )
+
+    response = client.get("/api/audit", params={"action": "scope.test", "limit": 100})
+
+    assert response.status_code == 200
+    returned_ids = {row["audit_id"] for row in response.json()["items"]}
+    assert returned_ids == same_audit_ids
+    assert not returned_ids.intersection(foreign_audit_ids)
+    assert unknown.audit_id not in returned_ids
+    assert response.json()["total"] == len(same_audit_ids)
 
 
 def test_api_site_resolution_fails_missing_and_ambiguous_as_generic_503(
