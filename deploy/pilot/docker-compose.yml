@@ -1,0 +1,201 @@
+name: kuzet-controlled-pilot
+
+# The NVIDIA data plane is deliberately separate. It is built from the
+# digest-pinned deploy/pilot/Dockerfile.runtime and accepted only on the target
+# L4 host. This Compose project runs one shared control plane, never one model
+# stack per camera.
+
+x-service-hardening: &service-hardening
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  postgres:
+    <<: *service-hardening
+    image: postgres:17.5-bookworm@sha256:fbcea1bd13b6a882cd6caa6b58db3ae5c102efe50ec625b3e2a5cbc50db5bfe4
+    user: "999:999"
+    environment:
+      POSTGRES_DB: kuzet_pilot
+      POSTGRES_USER: kuzet
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m,uid=999,gid=999,mode=0700
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "kuzet", "-d", "kuzet_pilot"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  api:
+    <<: *service-hardening
+    image: ${PILOT_API_IMAGE_REPOSITORY:?set-reviewed-api-repository}@sha256:${PILOT_API_IMAGE_SHA256:?set-reviewed-64hex-content-digest}
+    user: "10001:10001"
+    environment:
+      PILOT_SITE_ID: ${PILOT_SITE_ID:?set-authoritative-site-id}
+      PILOT_PUBLIC_ORIGIN: ${PILOT_PUBLIC_ORIGIN:?set-https-public-origin}
+      PILOT_API_WORKERS: "1"
+    secrets:
+      - database_url
+      - session_secret
+      - totp_encryption_key
+      - machine_token
+      - evidence_link_secret
+    volumes:
+      - pilot_health:/run/kuzet/health
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    networks:
+      control:
+        ipv4_address: 172.30.0.20
+      data: {}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import pathlib,urllib.request; token=pathlib.Path('/run/secrets/machine_token').read_text().strip(); request=urllib.request.Request('http://127.0.0.1:8000/internal/health/live',headers={'Authorization':'Bearer '+token}); urllib.request.urlopen(request,timeout=2).read()"
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 256
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+
+  tls-proxy:
+    <<: *service-hardening
+    image: nginx:1.28.0-alpine3.21@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284
+    user: "101:101"
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    ports:
+      - "${PILOT_BIND_ADDRESS:?set-explicit-bind-address}:${PILOT_TLS_PORT:-8443}:8443"
+    secrets:
+      - tls_certificate
+      - tls_private_key
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m,uid=101,gid=101,mode=0700
+      - /var/run:rw,noexec,nosuid,nodev,size=8m,uid=101,gid=101,mode=0700
+    networks:
+      control:
+        ipv4_address: 172.30.0.10
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "--no-check-certificate", "https://127.0.0.1:8443/proxy-live"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  prometheus:
+    <<: *service-hardening
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=5GB
+      - --web.enable-lifecycle=false
+      - --web.enable-admin-api=false
+    secrets:
+      - machine_token
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - control
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "promtool", "check", "ready", "--url=http://127.0.0.1:9090"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+networks:
+  control:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  data:
+    internal: true
+
+volumes:
+  postgres_data: {}
+  prometheus_data: {}
+  pilot_health: {}
+
+secrets:
+  postgres_password:
+    external: true
+  database_url:
+    external: true
+  session_secret:
+    external: true
+  totp_encryption_key:
+    external: true
+  machine_token:
+    external: true
+  evidence_link_secret:
+    external: true
+  tls_certificate:
+    external: true
+  tls_private_key:
+    external: true

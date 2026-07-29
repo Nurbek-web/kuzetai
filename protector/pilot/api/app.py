@@ -10,13 +10,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from protector.pilot.api.auth import LoginThrottle, PasswordService, SessionManager, TotpService
-from protector.pilot.api.dependencies import ApiContext, utc_now
+from protector.pilot.api.dependencies import (
+    ApiContext,
+    get_context,
+    require_machine_auth,
+    utc_now,
+)
 from protector.pilot.api.routes_auth import router as auth_router
 from protector.pilot.api.routes_cameras import router as cameras_router
 from protector.pilot.api.routes_events import router as events_router
@@ -28,6 +33,7 @@ from protector.pilot.api.web import (
 from protector.pilot.api.web import (
     router as web_router,
 )
+from protector.pilot.metrics import PilotHealthService, PilotMetrics
 from protector.pilot.notifications.base import EvidenceLinkSigner
 from protector.pilot.storage.repositories import PilotRepository
 
@@ -230,6 +236,9 @@ def create_app(
     pilot_site_id: str | None = None,
     evidence_link_signer: EvidenceLinkSigner | None = None,
     evidence_link_now: Callable[[], datetime] | None = None,
+    metrics: PilotMetrics | None = None,
+    metrics_refresh: Callable[[], None] | None = None,
+    health: PilotHealthService | None = None,
 ) -> FastAPI:
     """Construct an explicitly configured app; secrets have no committed defaults."""
 
@@ -243,6 +252,8 @@ def create_app(
         raise ValueError("request body limit must be positive")
     if evidence_link_now is not None and not callable(evidence_link_now):
         raise ValueError("evidence link clock must be callable")
+    if metrics_refresh is not None and (metrics is None or not callable(metrics_refresh)):
+        raise ValueError("metrics refresh requires metrics and must be callable")
     if pilot_site_id is not None:
         pilot_site_id = pilot_site_id.strip()
         if not pilot_site_id or len(pilot_site_id) > MAX_PILOT_SITE_ID_LENGTH:
@@ -279,6 +290,9 @@ def create_app(
         pilot_site_id=pilot_site_id,
         evidence_link_signer=evidence_link_signer,
         evidence_link_now=evidence_link_now if evidence_link_now is not None else utc_now,
+        metrics=metrics,
+        metrics_refresh=metrics_refresh,
+        health=health,
     )
     app.add_middleware(PilotWebSecurityHeadersMiddleware)
     app.add_middleware(
@@ -306,6 +320,82 @@ def create_app(
     app.include_router(cameras_router)
     app.include_router(events_router)
     app.include_router(internal_router)
+
+    @app.get(
+        "/internal/metrics",
+        include_in_schema=False,
+        dependencies=[Depends(require_machine_auth)],
+    )
+    def internal_metrics(context: ApiContext = Depends(get_context)) -> Response:
+        if context.metrics is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="metrics unavailable",
+            )
+        if context.metrics_refresh is not None:
+            try:
+                context.metrics_refresh()
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="metrics unavailable",
+                ) from None
+        return Response(
+            content=context.metrics.render(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    @app.get(
+        "/internal/health/live",
+        include_in_schema=False,
+        dependencies=[Depends(require_machine_auth)],
+    )
+    def internal_liveness(
+        response: Response,
+        context: ApiContext = Depends(get_context),
+    ) -> dict[str, str]:
+        if context.health is None:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"status": "dead", "control_plane": "failed"}
+        result = context.health.liveness()
+        if result["status"] != "alive":
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return result
+
+    @app.get(
+        "/internal/health/ready",
+        include_in_schema=False,
+        dependencies=[Depends(require_machine_auth)],
+    )
+    def internal_readiness(
+        response: Response,
+        context: ApiContext = Depends(get_context),
+    ) -> dict[str, object]:
+        if context.health is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="health unavailable",
+            )
+        result = context.health.readiness()
+        if result["status"] != "ready":
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return result
+
+    @app.get(
+        "/internal/health",
+        include_in_schema=False,
+        dependencies=[Depends(require_machine_auth)],
+    )
+    def internal_health(context: ApiContext = Depends(get_context)) -> dict[str, object]:
+        if context.health is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="health unavailable",
+            )
+        return context.health.readiness()
+
     app.mount("/pilot/static", StaticFiles(directory=STATIC_ROOT), name="pilot-static")
     app.include_router(web_router)
     return app
