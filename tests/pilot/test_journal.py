@@ -656,6 +656,48 @@ def test_replay_worker_quarantines_poison_and_processes_later_valid_work(
     assert worker.status.last_error == "IntegrityError"
 
 
+def test_replay_exclusions_preserve_eligible_fifo_batching_and_exact_ack(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteWALJournal(tmp_path / "eligible-replay.sqlite3", max_items=4)
+    items = tuple(
+        journal.enqueue_event(
+            _event().model_copy(
+                update={
+                    "opened_at": NOW + timedelta(minutes=index),
+                    "last_seen_at": NOW
+                    + timedelta(minutes=index, seconds=2),
+                }
+            )
+        )
+        for index in range(4)
+    )
+    excluded = frozenset((items[0].item_id, items[2].item_id))
+    selected = journal.replay_items(
+        limit=2,
+        excluded_item_ids=excluded,
+    )
+    processed: list[int] = []
+    worker = EvidenceJournalReplayWorker(
+        journal=journal,
+        processor=lambda item: processed.append(item.item_id),
+        batch_size=1,
+        retry_backoff_seconds=1,
+    )
+
+    assert tuple(item.item_id for item in selected) == (
+        items[1].item_id,
+        items[3].item_id,
+    )
+    assert worker.startup_drain(excluded_item_ids=excluded) == 1
+    assert worker.run_periodic_batch(excluded_item_ids=excluded) == 1
+    assert processed == [items[1].item_id, items[3].item_id]
+    assert tuple(item.item_id for item in journal.items(limit=4)) == (
+        items[0].item_id,
+        items[2].item_id,
+    )
+
+
 def test_replay_worker_quarantines_legacy_schema_poison_without_blocking_queue(
     tmp_path: Path,
 ) -> None:

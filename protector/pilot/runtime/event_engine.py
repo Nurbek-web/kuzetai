@@ -1346,13 +1346,17 @@ class SiteEventService:
             pending = self._make_evidence_intent(trigger, reservation)
         except Exception:
             self._degrade("evidence_processing_failed")
-            self._terminalize_candidate(trigger.event)
-            self._safe_release(reservation_id)
-            if not self._ack_pending_identity(
-                event_id=trigger.event.event_id,
-                reservation_id=reservation_id,
-            ):
-                self._degrade("pending_evidence_ack_failed")
+            transition_ok = self._terminalize_candidate(trigger.event)
+            release_ok = self._safe_release(reservation_id)
+            if transition_ok and release_ok:
+                if not self._ack_pending_identity(
+                    event_id=trigger.event.event_id,
+                    reservation_id=reservation_id,
+                ):
+                    self._degrade("pending_evidence_ack_failed")
+            else:
+                self._degrade("pending_evidence_recovery_retryable")
+                self._schedule_pending_evidence_recovery()
             return None
         pending_work = _PendingEvidenceWork(
             trigger=trigger,
@@ -1716,7 +1720,17 @@ class SiteEventService:
                         seed.trigger.event,
                     ):
                         raise ValueError("pending evidence seed candidate identity changed")
-                    if candidate.evidence_status in ("ready", "failed"):
+                    if candidate.evidence_status == "ready":
+                        self._ack_recovered_identity(
+                            event_id=seed.trigger.event.event_id,
+                            reservation_id=seed.reservation_id,
+                        )
+                        continue
+                    if candidate.evidence_status == "failed":
+                        if not self._safe_release(seed.reservation_id):
+                            raise _RetryablePendingEvidenceError(
+                                "failed seed reservation cleanup is not durable"
+                            )
                         self._ack_recovered_identity(
                             event_id=seed.trigger.event.event_id,
                             reservation_id=seed.reservation_id,
@@ -1726,6 +1740,10 @@ class SiteEventService:
                         if not self._terminalize_candidate(candidate):
                             raise _RetryablePendingEvidenceError(
                                 "seed capacity reconciliation is not durable"
+                            )
+                        if not self._safe_release(seed.reservation_id):
+                            raise _RetryablePendingEvidenceError(
+                                "seed capacity reservation cleanup is not durable"
                             )
                         self._ack_recovered_identity(
                             event_id=seed.trigger.event.event_id,
@@ -1801,6 +1819,7 @@ class SiteEventService:
         self._reconcile_terminal_memory_without_rows()
 
     def _run_candidate_safe_replay(self, *, startup: bool) -> int:
+        excluded_item_ids: set[int] = set()
         try:
             missing_items = tuple(
                 self._journal.candidate_items_without_pending_evidence()
@@ -1818,20 +1837,39 @@ class SiteEventService:
             missing_items = ()
         if missing_items:
             self._degrade("candidate_replay_missing_recovery_seed")
-            try:
-                for item in missing_items:
+            quarantined = False
+            quarantine_failed = False
+            for item in missing_items:
+                excluded_item_ids.add(item.item_id)
+                try:
                     self._journal.quarantine(
                         item,
                         error_type="MissingEvidenceRecoverySeed",
                     )
-            except Exception:
+                    quarantined = True
+                except Exception:
+                    quarantine_failed = True
+            if quarantine_failed:
                 self._degrade("candidate_replay_seed_quarantine_failed")
                 self._schedule_pending_evidence_recovery()
-                return 0
-            self._degrade("candidate_replay_seed_quarantined")
+            if quarantined:
+                self._degrade("candidate_replay_seed_quarantined")
+        exclusions = frozenset(excluded_item_ids)
         if startup:
-            return int(self._replay_worker.startup_drain())
-        return int(self._replay_worker.run_periodic_batch())
+            if not exclusions:
+                return int(self._replay_worker.startup_drain())
+            return int(
+                self._replay_worker.startup_drain(
+                    excluded_item_ids=exclusions,
+                )
+            )
+        if not exclusions:
+            return int(self._replay_worker.run_periodic_batch())
+        return int(
+            self._replay_worker.run_periodic_batch(
+                excluded_item_ids=exclusions,
+            )
+        )
 
     def _reconcile_terminal_memory_without_rows(self) -> None:
         """Release capacity after an ACK committed but its caller crashed."""
@@ -1867,7 +1905,7 @@ class SiteEventService:
                 self._schedule_pending_evidence_recovery()
                 continue
             if (
-                candidate.evidence_status == "ready"
+                candidate.evidence_status in ("ready", "failed")
                 and self._same_candidate_material(candidate, work.trigger.event)
             ):
                 self._drop_pending_memory(work.trigger.event.event_id)

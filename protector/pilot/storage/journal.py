@@ -925,6 +925,36 @@ class SQLiteWALJournal:
             ).fetchall()
         return tuple(self._row_to_item(row) for row in rows)
 
+    def replay_items(
+        self,
+        *,
+        limit: int,
+        excluded_item_ids: frozenset[int] = frozenset(),
+    ) -> tuple[JournalItem, ...]:
+        """Return the oldest eligible finite replay batch."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if len(excluded_item_ids) > self.max_items:
+            raise ValueError("excluded item IDs exceed journal capacity")
+        if any(item_id < 1 for item_id in excluded_item_ids):
+            raise ValueError("excluded item IDs must be positive")
+        query = """
+            SELECT item_id, kind, schema_version, idempotency_key,
+                   payload_json, created_at
+            FROM journal_items
+        """
+        parameters: tuple[Any, ...] = ()
+        if excluded_item_ids:
+            ordered_ids = tuple(sorted(excluded_item_ids))
+            placeholders = ",".join("?" for _ in ordered_ids)
+            query += f" WHERE item_id NOT IN ({placeholders})"
+            parameters = ordered_ids
+        query += " ORDER BY item_id LIMIT ?"
+        parameters += (limit,)
+        with self._lock:
+            rows = self._connection.execute(query, parameters).fetchall()
+        return tuple(self._row_to_item(row) for row in rows)
+
     def acknowledge(self, item_id: int) -> bool:
         with self._lock:
             cursor = self._connection.execute(
@@ -1117,21 +1147,36 @@ class EvidenceJournalReplayWorker:
             ),
         )
 
-    def startup_drain(self) -> int:
+    def startup_drain(
+        self,
+        *,
+        excluded_item_ids: frozenset[int] = frozenset(),
+    ) -> int:
         """Drain at most one configured batch during startup."""
-        return self._run_batch()
+        return self._run_batch(excluded_item_ids=excluded_item_ids)
 
-    def run_periodic_batch(self) -> int:
+    def run_periodic_batch(
+        self,
+        *,
+        excluded_item_ids: frozenset[int] = frozenset(),
+    ) -> int:
         """Run one finite periodic batch unless retry backoff is still active."""
-        return self._run_batch()
+        return self._run_batch(excluded_item_ids=excluded_item_ids)
 
-    def _run_batch(self) -> int:
+    def _run_batch(
+        self,
+        *,
+        excluded_item_ids: frozenset[int],
+    ) -> int:
         with self._lock:
             now = self._monotonic()
             if self._retry_at is not None and now < self._retry_at:
                 return 0
             processed = 0
-            for item in self._journal.items(limit=self.batch_size):
+            for item in self._journal.replay_items(
+                limit=self.batch_size,
+                excluded_item_ids=excluded_item_ids,
+            ):
                 try:
                     validate_journal_work(item.kind, item.schema_version, item.payload)
                     self._processor(item)

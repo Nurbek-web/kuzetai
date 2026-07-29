@@ -659,6 +659,7 @@ def _service(
     engine: EventEngine | None = None,
     pending_recovery_backoff_seconds: float = 1.0,
     monotonic_clock: object | None = None,
+    source_references: dict[str, str] | None = None,
 ) -> tuple[SiteEventService, _Ring, _Coordinator, EvidenceJournalReplayWorker]:
     replay = EvidenceJournalReplayWorker(
         journal=journal,
@@ -692,7 +693,9 @@ def _service(
         evidence_policy=EvidencePolicy(
             pre_roll_seconds=2,
             post_roll_seconds=2,
-            source_references={"cam-01": "nvr://cam-01"},
+            source_references=source_references
+            if source_references is not None
+            else {"cam-01": "nvr://cam-01"},
         ),
         pending_recovery_backoff_seconds=pending_recovery_backoff_seconds,
         monotonic_clock=monotonic_clock,  # type: ignore[arg-type]
@@ -2993,7 +2996,14 @@ def test_terminal_ack_commit_before_return_crash_restores_memory_capacity(
     states: dict[UUID, CandidateEventV1] = {}
 
     def load(event_id: UUID) -> CandidateEventV1:
-        return states.get(event_id, CandidateEventV1.model_validate(replayed[0].payload))
+        if event_id in states:
+            return states[event_id]
+        return next(
+            event
+            for item in replayed
+            if (event := CandidateEventV1.model_validate(item.payload)).event_id
+            == event_id
+        )
 
     def mark(event_id: UUID, status: str) -> CandidateEventV1:
         states[event_id] = load(event_id).model_copy(
@@ -3049,6 +3059,17 @@ def test_terminal_ack_commit_before_return_crash_restores_memory_capacity(
 
     assert recovered.pending_evidence_work == 0
     assert recovered.pending_evidence_memory_work == 0
+    assert service.start().pending_evidence_memory_work == 0
+    service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_A,
+        source_time=NOW + timedelta(seconds=1),
+    )
+    admitted = service.process(
+        _observation(seq=2, seconds=2, track_id="ready-capacity-proof")
+    )
+    assert len(admitted.durable_candidates) == 1
+    assert admitted.status.pending_evidence_memory_work == 0
 
 
 def test_durable_ready_publication_wins_concurrent_epoch_switch(
@@ -3801,3 +3822,456 @@ def test_real_restart_converges_actual_lifecycle_crash_boundaries(
         assert restarted_journal.pending_evidence_work_depth() == 0
     assert restarted_workspace.item_count == 0
     restarted_workspace.close()
+
+
+def test_failed_ack_commit_before_return_releases_capacity_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = SQLiteWALJournal(
+        tmp_path / "failed-ack-commit-crash.sqlite3",
+        max_items=4,
+    )
+    persisted: dict[UUID, CandidateEventV1] = {}
+
+    def persist(item: object) -> None:
+        event = CandidateEventV1.model_validate(item.payload)
+        persisted[event.event_id] = event
+
+    def load(event_id: UUID) -> CandidateEventV1:
+        return persisted[event_id]
+
+    def mark(event_id: UUID, status: str) -> CandidateEventV1:
+        persisted[event_id] = persisted[event_id].model_copy(
+            update={"evidence_status": status}
+        )
+        return persisted[event_id]
+
+    ring = _Ring(ready=False)
+    service, _, _, _ = _service(
+        tmp_path,
+        journal=journal,
+        processor=persist,
+        load_candidate=load,
+        mark_evidence_pending=lambda event_id: mark(event_id, "pending"),
+        mark_evidence_failed=lambda event_id: mark(event_id, "failed"),
+        ring=ring,
+        engine=EventEngine(
+            module_rules=(_module_rule(votes_required=1, sample_count=1),),
+            limits=EngineLimits(max_pending_events=1),
+        ),
+    )
+    first = service.process(_observation(seq=1, seconds=0))
+    first_event_id = first.durable_candidates[0].trigger.event.event_id
+    service.process(
+        _observation(
+            seq=1,
+            seconds=1,
+            stream_epoch=EPOCH_B,
+            class_name="background",
+            confidence=0.1,
+        )
+    )
+    original_ack = journal.acknowledge_pending_evidence_work
+
+    def commit_then_crash(**kwargs: object) -> bool:
+        assert original_ack(**kwargs)
+        raise SystemExit("failed ACK committed before process death")
+
+    monkeypatch.setattr(
+        journal,
+        "acknowledge_pending_evidence_work",
+        commit_then_crash,
+    )
+
+    with pytest.raises(SystemExit, match="failed ACK committed"):
+        service.run_periodic(
+            camera_id="cam-01",
+            stream_epoch=EPOCH_B,
+            source_time=NOW + timedelta(seconds=2),
+        )
+
+    assert persisted[first_event_id].evidence_status == "failed"
+    assert journal.pending_evidence_work_depth() == 0
+    assert service.status.pending_evidence_memory_work == 1
+    monkeypatch.setattr(
+        journal,
+        "acknowledge_pending_evidence_work",
+        original_ack,
+    )
+
+    assert service.start().pending_evidence_memory_work == 0
+    assert service.start().pending_evidence_memory_work == 0
+    service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_B,
+        source_time=NOW + timedelta(seconds=3),
+    )
+
+    admitted = service.process(
+        _observation(
+            seq=2,
+            seconds=4,
+            stream_epoch=EPOCH_B,
+            track_id="second-event",
+        )
+    )
+
+    assert len(admitted.durable_candidates) == 1
+    assert admitted.status.pending_evidence_memory_work == 1
+    assert len(persisted) == 2
+
+
+def test_full_candidate_quarantine_does_not_block_seeded_recovery(
+    tmp_path: Path,
+) -> None:
+    journal_path = tmp_path / "full-quarantine-recovery.sqlite3"
+    journal = SQLiteWALJournal(
+        journal_path,
+        max_items=6,
+        max_quarantine_items=1,
+    )
+    event_factory = EventEngine(
+        module_rules=(_module_rule(votes_required=1, sample_count=1),)
+    )
+    filler = event_factory.ingest(
+        _observation(seq=1, seconds=-10, track_id="quarantine-filler")
+    ).triggers[0].event
+    filler_item = journal.enqueue_event(filler)
+    journal.quarantine(filler_item, error_type="ExistingForensicRow")
+    orphan_one = event_factory.ingest(
+        _observation(seq=2, seconds=-9, track_id="orphan-one")
+    ).triggers[0].event
+    orphan_two = event_factory.ingest(
+        _observation(seq=3, seconds=-8, track_id="orphan-two")
+    ).triggers[0].event
+    orphan_items = (
+        journal.enqueue_event(orphan_one),
+        journal.enqueue_event(orphan_two),
+    )
+    persisted: dict[UUID, CandidateEventV1] = {}
+
+    def unavailable(_: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    first, ring, _, _ = _service(
+        tmp_path,
+        journal=journal,
+        processor=unavailable,
+        load_candidate=lambda event_id: persisted[event_id],
+        ring=_Ring(ready=False),
+    )
+
+    first_initial = first.process(
+        _observation(seq=1, seconds=0, track_id="seeded-after-orphans")
+    )
+    second_initial = first.process(
+        _observation(seq=2, seconds=1, track_id="second-seeded-after-orphans")
+    )
+
+    assert first_initial.durable_candidates == ()
+    assert second_initial.durable_candidates == ()
+    assert journal.quarantine_depth() == 1
+    assert journal.depth() == 4
+    assert journal.pending_evidence_work_depth() == 2
+    assert (
+        "candidate_replay_seed_quarantine_failed"
+        in second_initial.status.reasons
+    )
+    seeded_event_ids = tuple(
+        UUID(item.event_id)
+        for item in journal.pending_evidence_work_items(limit=2)
+    )
+    journal.close()
+
+    restarted_journal = SQLiteWALJournal(
+        journal_path,
+        max_items=6,
+        max_quarantine_items=1,
+    )
+
+    persisted_order: list[UUID] = []
+
+    def persist(item: object) -> None:
+        event = CandidateEventV1.model_validate(item.payload)
+        persisted[event.event_id] = event
+        persisted_order.append(event.event_id)
+
+    def mark(event_id: UUID, status: str) -> CandidateEventV1:
+        persisted[event_id] = persisted[event_id].model_copy(
+            update={"evidence_status": status}
+        )
+        return persisted[event_id]
+
+    restarted_engine = EventEngine(
+        module_rules=(_module_rule(votes_required=1, sample_count=1),)
+    )
+    restarted_engine.ingest(
+        _observation(
+            seq=3,
+            seconds=2,
+            class_name="background",
+            confidence=0.1,
+        )
+    )
+
+    class ReadyCoordinator(_Coordinator):
+        def complete(self, reservation: object, evidence: object) -> object:
+            result = super().complete(reservation, evidence)
+            assert isinstance(evidence, EvidenceIntent)
+            mark(evidence.event_id, "ready")
+            return result
+
+    restarted, _, coordinator, _ = _service(
+        tmp_path,
+        journal=restarted_journal,
+        processor=persist,
+        load_candidate=lambda event_id: persisted[event_id],
+        mark_evidence_pending=lambda event_id: mark(event_id, "pending"),
+        mark_evidence_failed=lambda event_id: mark(event_id, "failed"),
+        ring=ring,
+        coordinator=ReadyCoordinator(),
+        engine=restarted_engine,
+    )
+
+    started = restarted.start()
+
+    assert tuple(persisted_order) == seeded_event_ids
+    assert all(
+        persisted[event_id].evidence_status == "pending"
+        for event_id in seeded_event_ids
+    )
+    assert started.pending_evidence_memory_work == 2
+    assert restarted_journal.quarantine_depth() == 1
+    assert tuple(item.item_id for item in restarted_journal.items(limit=6)) == tuple(
+        item.item_id for item in orphan_items
+    )
+    ring.ready = True
+    completed = restarted.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_A,
+        source_time=NOW + timedelta(seconds=3),
+    )
+
+    assert len(completed.durable_candidates) == 2
+    assert coordinator.complete_calls
+    assert all(
+        persisted[event_id].evidence_status == "ready"
+        for event_id in seeded_event_ids
+    )
+    assert restarted_journal.pending_evidence_work_depth() == 0
+    assert tuple(item.item_id for item in restarted_journal.items(limit=6)) == tuple(
+        item.item_id for item in orphan_items
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure_target", "failures", "restart"),
+    (
+        ("transition", 1, False),
+        ("release", 1, False),
+        ("transition", 2, True),
+        ("release", 2, True),
+    ),
+)
+def test_pre_intent_failure_retains_seed_until_transition_and_release_converge(
+    tmp_path: Path,
+    failure_target: str,
+    failures: int,
+    restart: bool,
+) -> None:
+    journal_path = tmp_path / f"pre-intent-{failure_target}-{failures}.sqlite3"
+    persisted: dict[UUID, CandidateEventV1] = {}
+
+    def persist(item: object) -> None:
+        event = CandidateEventV1.model_validate(item.payload)
+        persisted[event.event_id] = event
+
+    def load(event_id: UUID) -> CandidateEventV1:
+        return persisted[event_id]
+
+    transition_attempts = 0
+
+    def mark_failed(event_id: UUID) -> CandidateEventV1:
+        nonlocal transition_attempts
+        transition_attempts += 1
+        if failure_target == "transition" and transition_attempts <= failures:
+            raise sqlite3.OperationalError("database is locked")
+        persisted[event_id] = persisted[event_id].model_copy(
+            update={"evidence_status": "failed"}
+        )
+        return persisted[event_id]
+
+    class FlakyReleaseRing(_Ring):
+        def __init__(self) -> None:
+            super().__init__(ready=False)
+            self.release_attempts = 0
+
+        def release(self, reservation_id: str) -> None:
+            self.release_attempts += 1
+            if failure_target == "release" and self.release_attempts <= failures:
+                raise OSError("ring release unavailable")
+            super().release(reservation_id)
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    ring = FlakyReleaseRing()
+
+    def build(journal: SQLiteWALJournal, *, source_configured: bool) -> SiteEventService:
+        service, _, _, _ = _service(
+            tmp_path,
+            journal=journal,
+            processor=persist,
+            load_candidate=load,
+            mark_evidence_pending=lambda event_id: persisted[event_id].model_copy(
+                update={"evidence_status": "pending"}
+            ),
+            mark_evidence_failed=mark_failed,
+            ring=ring,
+            engine=EventEngine(
+                module_rules=(_module_rule(votes_required=1, sample_count=1),),
+                limits=EngineLimits(max_pending_events=1),
+            ),
+            monotonic_clock=clock,
+            source_references=(
+                {"cam-01": "nvr://cam-01"} if source_configured else {}
+            ),
+        )
+        return service
+
+    journal = SQLiteWALJournal(journal_path, max_items=4)
+    service = build(journal, source_configured=False)
+    initial = service.process(_observation(seq=1, seconds=0))
+    first_event_id = next(iter(persisted))
+
+    assert initial.durable_candidates == ()
+    assert initial.status.degraded is True
+    assert initial.status.pending_evidence_work == 1
+    assert journal.pending_evidence_work_items(limit=1)[0].phase == "seed"
+
+    if restart:
+        journal.close()
+        journal = SQLiteWALJournal(journal_path, max_items=4)
+        service = build(journal, source_configured=False)
+        started = service.start()
+        assert started.pending_evidence_work == 1
+        assert started.pending_evidence_next_retry_seconds == 1
+
+    clock.now = 1
+    recovered = service.run_periodic(
+        camera_id="cam-01",
+        stream_epoch=EPOCH_A,
+        source_time=NOW + timedelta(seconds=1),
+    )
+
+    assert persisted[first_event_id].evidence_status == "failed"
+    assert recovered.status.pending_evidence_work == 0
+    assert journal.pending_evidence_work_depth() == 0
+    assert ring.release_attempts >= 1
+
+    accepting = build(journal, source_configured=True)
+    admitted = accepting.process(
+        _observation(
+            seq=1,
+            seconds=3,
+            stream_epoch=EPOCH_B,
+            track_id="capacity-proof",
+        )
+    )
+
+    assert len(admitted.durable_candidates) == 1
+    assert admitted.status.pending_evidence_memory_work == 1
+
+
+def test_recovered_seed_over_capacity_releases_reservation_before_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal_path = tmp_path / "seed-capacity-cleanup.sqlite3"
+    journal = SQLiteWALJournal(journal_path, max_items=4)
+    persisted: dict[UUID, CandidateEventV1] = {}
+
+    def persist(item: object) -> None:
+        event = CandidateEventV1.model_validate(item.payload)
+        persisted[event.event_id] = event
+
+    def mark(event_id: UUID, status: str) -> CandidateEventV1:
+        persisted[event_id] = persisted[event_id].model_copy(
+            update={"evidence_status": status}
+        )
+        return persisted[event_id]
+
+    ring = _Ring(ready=False)
+    first, _, _, _ = _service(
+        tmp_path,
+        journal=journal,
+        processor=persist,
+        load_candidate=lambda event_id: persisted[event_id],
+        mark_evidence_pending=lambda event_id: mark(event_id, "pending"),
+        mark_evidence_failed=lambda event_id: mark(event_id, "failed"),
+        ring=ring,
+        engine=EventEngine(
+            module_rules=(_module_rule(votes_required=1, sample_count=1),),
+            limits=EngineLimits(max_pending_events=2),
+        ),
+    )
+
+    def crash_before_seed_promotion(**_: object) -> object:
+        raise SystemExit("reservation exists before seed promotion")
+
+    monkeypatch.setattr(
+        journal,
+        "reserve_pending_evidence_work",
+        crash_before_seed_promotion,
+    )
+    for seq, track_id in ((1, "first-seed"), (2, "second-seed")):
+        with pytest.raises(SystemExit, match="reservation exists"):
+            first.process(
+                _observation(
+                    seq=seq,
+                    seconds=float(seq - 1),
+                    track_id=track_id,
+                )
+            )
+
+    seed_records = journal.pending_evidence_work_items(limit=2)
+    assert tuple(record.phase for record in seed_records) == ("seed", "seed")
+    second_event_id = UUID(seed_records[1].event_id)
+    second_reservation_id = seed_records[1].reservation_id
+    journal.close()
+
+    restarted_journal = SQLiteWALJournal(journal_path, max_items=4)
+    restarted_engine = EventEngine(
+        module_rules=(_module_rule(votes_required=1, sample_count=1),),
+        limits=EngineLimits(max_pending_events=1),
+    )
+    restarted_engine.ingest(
+        _observation(
+            seq=3,
+            seconds=2,
+            class_name="background",
+            confidence=0.1,
+        )
+    )
+    restarted, _, _, _ = _service(
+        tmp_path,
+        journal=restarted_journal,
+        processor=persist,
+        load_candidate=lambda event_id: persisted[event_id],
+        mark_evidence_pending=lambda event_id: mark(event_id, "pending"),
+        mark_evidence_failed=lambda event_id: mark(event_id, "failed"),
+        ring=ring,
+        engine=restarted_engine,
+    )
+
+    started = restarted.start()
+
+    assert persisted[second_event_id].evidence_status == "failed"
+    assert second_reservation_id in ring.released
+    assert started.pending_evidence_work == 1
+    assert restarted_journal.pending_evidence_work_depth() == 1
