@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -10,7 +11,7 @@ import yaml
 from sqlalchemy import select
 
 from protector.pilot.capacity_acceptance import require_measured_primary_capacity
-from protector.pilot.config import SiteConfig, load_site_config
+from protector.pilot.config import SiteConfig
 from protector.pilot.gates import (
     PILOT_TARGET_COMPUTE_CAPABILITY,
     PILOT_TENSORRT_VERSION,
@@ -19,32 +20,22 @@ from protector.pilot.gates import (
 from protector.pilot.runtime.deepstream import RuntimeModelManifestV1
 from protector.pilot.storage.db import SessionFactory
 from protector.pilot.storage.models import CameraModel, ModelArtifactModel, SiteModel
+from protector.pilot.trusted_artifacts import (
+    VerifiedDetachedArtifact,
+    read_regular_bounded,
+    verify_detached_artifact,
+)
 
 
 class ProvisioningError(RuntimeError):
     """The reviewed bootstrap inputs do not match the persistent database."""
 
 
-def _file_digest(path: Path, *, max_bytes: int) -> str:
-    if not path.is_absolute() or not path.is_file() or path.is_symlink():
-        raise ProvisioningError("reviewed provisioning manifest is unavailable")
-    size = path.stat().st_size
-    if not 0 < size <= max_bytes:
-        raise ProvisioningError("reviewed provisioning manifest exceeds finite size bound")
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(64 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _require_digest(path: Path, expected: str, label: str, *, max_bytes: int) -> None:
-    if (
-        len(expected) != 64
-        or any(character not in "0123456789abcdef" for character in expected)
-        or _file_digest(path, max_bytes=max_bytes) != expected
-    ):
-        raise ProvisioningError(f"{label} digest does not match reviewed input")
+@dataclass(frozen=True)
+class ReviewedInputSnapshots:
+    site_config: bytes
+    runtime_manifest: bytes
+    capacity: VerifiedDetachedArtifact
 
 
 def _source_reference(feed: object) -> str:
@@ -81,32 +72,51 @@ def load_reviewed_inputs(
     runtime_manifest_sha256: str,
     measured_capacity_path: Path,
     measured_capacity_sha256: str,
-) -> tuple[SiteConfig, RuntimeModelManifestV1, MeasuredCapacityReportV1]:
+    measured_capacity_signature_path: Path,
+    capacity_authority_public_key_path: Path,
+    runtime_image_id_sha256: str,
+    runtime_image_config_sha256: str,
+    runtime_code_sha256: str,
+    mount_contract_sha256: str,
+) -> tuple[
+    SiteConfig,
+    RuntimeModelManifestV1,
+    MeasuredCapacityReportV1,
+    ReviewedInputSnapshots,
+]:
     """Load only exact, digest-reviewed inputs and apply target-independent gates."""
-    _require_digest(
-        site_config_path,
-        site_config_sha256,
-        "site configuration",
-        max_bytes=1024 * 1024,
-    )
-    _require_digest(
-        runtime_manifest_path,
-        runtime_manifest_sha256,
-        "runtime manifest",
-        max_bytes=8 * 1024 * 1024,
-    )
-    _require_digest(
-        measured_capacity_path,
-        measured_capacity_sha256,
-        "measured capacity report",
-        max_bytes=8 * 1024 * 1024,
-    )
-    site_config = load_site_config(site_config_path)
     try:
-        raw_manifest = yaml.safe_load(runtime_manifest_path.read_text(encoding="utf-8"))
+        site_payload = read_regular_bounded(
+            site_config_path,
+            max_bytes=1024 * 1024,
+            label="site configuration",
+        )
+        runtime_payload = read_regular_bounded(
+            runtime_manifest_path,
+            max_bytes=8 * 1024 * 1024,
+            label="runtime manifest",
+        )
+        if hashlib.sha256(site_payload).hexdigest() != site_config_sha256:
+            raise ProvisioningError(
+                "site configuration digest does not match reviewed input"
+            )
+        if hashlib.sha256(runtime_payload).hexdigest() != runtime_manifest_sha256:
+            raise ProvisioningError(
+                "runtime manifest digest does not match reviewed input"
+            )
+        verified_capacity = verify_detached_artifact(
+            payload_path=measured_capacity_path,
+            signature_path=measured_capacity_signature_path,
+            trusted_public_key_path=capacity_authority_public_key_path,
+            expected_payload_sha256=measured_capacity_sha256,
+            max_payload_bytes=8 * 1024 * 1024,
+            label="measured capacity report",
+        )
+        site_config = SiteConfig.model_validate(yaml.safe_load(site_payload))
+        raw_manifest = yaml.safe_load(runtime_payload)
         manifest = RuntimeModelManifestV1.model_validate(raw_manifest)
         capacity_report = MeasuredCapacityReportV1.model_validate(
-            yaml.safe_load(measured_capacity_path.read_text(encoding="utf-8"))
+            yaml.safe_load(verified_capacity.payload)
         )
     except (OSError, ValueError, yaml.YAMLError) as exc:
         raise ProvisioningError("runtime manifest is invalid") from exc
@@ -127,10 +137,24 @@ def load_reviewed_inputs(
             site_config=site_config,
             runtime_manifest=manifest,
             report=capacity_report,
+            runtime_image_id_sha256=runtime_image_id_sha256,
+            runtime_image_config_sha256=runtime_image_config_sha256,
+            runtime_code_sha256=runtime_code_sha256,
+            mount_contract_sha256=mount_contract_sha256,
+            runtime_manifest_file_sha256=runtime_manifest_sha256,
         )
     except ValueError as exc:
         raise ProvisioningError(str(exc)) from exc
-    return site_config, manifest, capacity_report
+    return (
+        site_config,
+        manifest,
+        capacity_report,
+        ReviewedInputSnapshots(
+            site_config=site_payload,
+            runtime_manifest=runtime_payload,
+            capacity=verified_capacity,
+        ),
+    )
 
 
 def provision_reviewed_pilot(

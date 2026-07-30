@@ -189,6 +189,15 @@ def _read_secret(name: str) -> str:
 
 def create_production_app() -> object:
     """Build one exact-site API process from fixed Docker-secret locations."""
+    acceptance_environment = tuple(
+        name
+        for name in os.environ
+        if name.startswith("PILOT_ACCEPTANCE_")
+    )
+    if acceptance_environment:
+        raise RuntimeError(
+            "acceptance authority belongs in the dedicated controller process"
+        )
     site_id = os.environ.get("PILOT_SITE_ID", "").strip()
     public_origin = os.environ.get("PILOT_PUBLIC_ORIGIN", "").strip()
     try:

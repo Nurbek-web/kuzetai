@@ -55,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-manifest-sha256", required=True)
     parser.add_argument("--measured-capacity-report", type=Path, required=True)
     parser.add_argument("--measured-capacity-sha256", required=True)
+    parser.add_argument("--measured-capacity-signature", type=Path, required=True)
+    parser.add_argument("--capacity-authority-public-key", type=Path, required=True)
     parser.add_argument("--mount-contract", type=Path, required=True)
     parser.add_argument("--mount-contract-sha256", required=True)
     parser.add_argument("--image-id", required=True)
@@ -93,6 +95,12 @@ def main(argv: list[str] | None = None) -> int:
             site_config_source=arguments.site_config,
             runtime_manifest_source=arguments.runtime_manifest,
             measured_capacity_source=arguments.measured_capacity_report,
+            measured_capacity_signature_source=(
+                arguments.measured_capacity_signature
+            ),
+            capacity_authority_public_key_source=(
+                arguments.capacity_authority_public_key
+            ),
         )
     except (OSError, ValueError, yaml.YAMLError) as exc:
         parser.error(str(exc))

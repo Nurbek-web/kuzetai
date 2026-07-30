@@ -15,7 +15,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from protector.pilot.api.auth import LoginThrottle, PasswordService, SessionManager, TotpService
+from protector.pilot.api.auth import (
+    LoginThrottle,
+    PasswordService,
+    SessionManager,
+    TotpService,
+)
 from protector.pilot.api.dependencies import (
     ApiContext,
     get_context,
@@ -90,6 +95,9 @@ class RequestBodyLimitMiddleware:
         self.app = app
         self.max_body_bytes = max_body_bytes
 
+    def _limit_for_scope(self, scope: dict[str, Any]) -> int:
+        return self.max_body_bytes
+
     async def __call__(
         self,
         scope: dict[str, Any],
@@ -99,6 +107,7 @@ class RequestBodyLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        max_body_bytes = self._limit_for_scope(scope)
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         content_length = headers.get(b"content-length")
         if content_length is not None:
@@ -107,7 +116,7 @@ class RequestBodyLimitMiddleware:
                 if declared_length < 0:
                     await self._reject(send, status_code=400)
                     return
-                if declared_length > self.max_body_bytes:
+                if declared_length > max_body_bytes:
                     await self._reject(send)
                     return
             except ValueError:
@@ -122,7 +131,7 @@ class RequestBodyLimitMiddleware:
                 return
             body = message.get("body", b"")
             total += len(body)
-            if total > self.max_body_bytes:
+            if total > max_body_bytes:
                 await self._reject(send)
                 return
             buffered.append(message)
@@ -135,7 +144,7 @@ class RequestBodyLimitMiddleware:
             try:
                 return next(iterator)
             except StopIteration:
-                return {"type": "http.request", "body": b"", "more_body": False}
+                return await receive()
 
         await self.app(scope, replay, send)
 
@@ -262,9 +271,7 @@ def create_app(
         if not pilot_site_id or len(pilot_site_id) > MAX_PILOT_SITE_ID_LENGTH:
             raise ValueError("pilot site identity must contain 1 to 128 characters")
     singleton = ProcessSingletonLock(
-        runtime_lock_path
-        or os.getenv("PILOT_API_LOCK_PATH")
-        or DEFAULT_RUNTIME_LOCK_PATH
+        runtime_lock_path or os.getenv("PILOT_API_LOCK_PATH") or DEFAULT_RUNTIME_LOCK_PATH
     )
 
     @asynccontextmanager

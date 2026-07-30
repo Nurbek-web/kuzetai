@@ -36,9 +36,11 @@ def _site() -> SiteConfig:
     feeds = tuple(
         CameraFeed(
             camera_id=f"camera-{number:02d}",
+            source_index=number - 1,
             rtsp_url=SecretReference(environment=f"PILOT_CAMERA_{number:02d}_RTSP"),
             codec="h264",
             resolution=Resolution(width=1920, height=1080),
+            fps=25.0,
             bitrate_kbps=2048,
             analytics_hz={"person": 5.0},
         )

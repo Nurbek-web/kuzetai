@@ -89,6 +89,7 @@ def _notification_key(event_id: UUID, idempotency_key: str) -> str:
 
 def _audit_site_attribution(pilot_site_id: str) -> ColumnElement[bool]:
     return or_(
+        AuditEntryModel.site_id == pilot_site_id,
         and_(
             AuditEntryModel.entity_type == "site",
             exists(

@@ -104,9 +104,11 @@ class SecretReference(FrozenModel):
 
 class CameraFeed(FrozenModel):
     camera_id: NonEmptyString
+    source_index: Annotated[int, Field(ge=0, lt=20)]
     rtsp_url: SecretReference
     codec: Literal["h264", "h265"]
     resolution: Resolution
+    fps: Annotated[float, Field(gt=0, le=120)]
     bitrate_kbps: PositiveBitrate
     analytics_hz: Mapping[NonEmptyString, AnalyticsHz]
 
@@ -140,8 +142,12 @@ class ReadyToStart(FrozenModel):
     @field_validator("feeds")
     @classmethod
     def camera_ids_are_unique(cls, feeds: tuple[CameraFeed, ...]) -> tuple[CameraFeed, ...]:
-        if len({feed.camera_id for feed in feeds}) != len(feeds):
-            raise ValueError("camera IDs must be unique")
+        if (
+            len({feed.camera_id for feed in feeds}) != len(feeds)
+            or tuple(feed.source_index for feed in feeds)
+            != tuple(range(len(feeds)))
+        ):
+            raise ValueError("camera IDs and source indices must be exact and unique")
         return feeds
 
 

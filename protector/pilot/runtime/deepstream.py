@@ -14,14 +14,19 @@ import hashlib
 import importlib
 import math
 import os
+import re
+import signal
 import stat
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event as ThreadEvent
+from threading import RLock
 from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
@@ -43,6 +48,7 @@ from protector.pilot.runtime.evidence import (
     SourceTimeMappingError,
     SplitMuxEvidenceSinkFactory,
 )
+from protector.pilot.runtime.source_probe import CorrelatedNtpV1, SourceProbeLease
 from protector.pilot.runtime.supervisor import CameraHealth, CameraSupervisor
 from protector.pilot.telemetry import (
     AsyncRuntimeTelemetryPublisher,
@@ -51,6 +57,7 @@ from protector.pilot.telemetry import (
     TargetResourceMetricsProvider,
     read_machine_token,
 )
+from protector.pilot.trusted_artifacts import verify_detached_artifact
 
 DEEPSTREAM_IMAGE = (
     "nvcr.io/nvidia/deepstream:9.1-samples-multiarch"
@@ -63,6 +70,8 @@ PYDS_REPLACEMENT_ISSUE = "PILOT-DS-001: replace isolated pyds probe with Service
 NVTRACKER_CONFIG_PATH = Path("/app/deploy/pilot/deepstream/nvtracker.yml")
 _OBJECT_SEQUENCE_BITS = 16
 _MAX_OBJECTS_PER_FRAME = 1 << _OBJECT_SEQUENCE_BITS
+_MAX_METADATA_OWNER_ENTRIES = 4_096
+_AMBIGUOUS_METADATA_OWNER = object()
 _NVTRACKER_PROPERTIES = (
     "tracker-width",
     "tracker-height",
@@ -92,6 +101,10 @@ class SourcePlan(FrozenModel):
     camera_id: str
     source_id: int = Field(ge=0)
     codec: Literal["h264", "h265"]
+    width: int = Field(ge=320, le=7680)
+    height: int = Field(ge=240, le=4320)
+    fps: float = Field(gt=0, le=120)
+    bitrate_kbps: int = Field(gt=0, le=200_000)
     queue_capacity: int = Field(gt=0)
     has_encoded_evidence_branch: bool = True
     has_nvdec_branch: bool = True
@@ -137,11 +150,15 @@ class DeepStreamGraphSpec(FrozenModel):
         sources = tuple(
             SourcePlan(
                 camera_id=feed.camera_id,
-                source_id=index,
+                source_id=feed.source_index,
                 codec=feed.codec,
+                width=feed.resolution.width,
+                height=feed.resolution.height,
+                fps=feed.fps,
+                bitrate_kbps=feed.bitrate_kbps,
                 queue_capacity=site.queues.decode,
             )
-            for index, feed in enumerate(feeds)
+            for feed in feeds
         )
         elements = (
             ElementSpec(
@@ -173,7 +190,9 @@ class DeepStreamGraphSpec(FrozenModel):
             ElementSpec(name="tracker", factory="nvtracker", properties={"shared": True}),
             ElementSpec(name="analytics", factory="nvdsanalytics", properties={"shared": True}),
             ElementSpec(
-                name="metadata-sink", factory="fakesink", properties={"sync": False, "metadata-only": True}
+                name="metadata-sink",
+                factory="fakesink",
+                properties={"sync": False, "metadata-only": True},
             ),
         )
         optional_branches = tuple(
@@ -240,7 +259,12 @@ class DeepStreamGraphSpec(FrozenModel):
         self, *, name: str, factory: str, properties: Mapping[str, Any]
     ) -> DeepStreamGraphSpec:
         return self.model_copy(
-            update={"elements": (*self.elements, ElementSpec(name=name, factory=factory, properties=properties))}
+            update={
+                "elements": (
+                    *self.elements,
+                    ElementSpec(name=name, factory=factory, properties=properties),
+                )
+            }
         )
 
     def validate(self) -> None:
@@ -250,7 +274,10 @@ class DeepStreamGraphSpec(FrozenModel):
         camera_ids = [source.camera_id for source in self.sources]
         if len(set(source_ids)) != len(source_ids) or len(set(camera_ids)) != len(camera_ids):
             raise GraphContractError("source IDs and camera IDs must be unique")
-        if not all(source.has_encoded_evidence_branch and source.has_nvdec_branch for source in self.sources):
+        if not all(
+            source.has_encoded_evidence_branch and source.has_nvdec_branch
+            for source in self.sources
+        ):
             raise GraphContractError("every source requires encoded evidence and NVDEC branches")
         if not self.metadata_only_publication:
             raise GraphContractError("core graph may publish metadata only")
@@ -278,7 +305,10 @@ class DeepStreamGraphSpec(FrozenModel):
             for element in self.elements
             if element.factory == "nvinfer" and element.properties.get("role") == "primary"
         )
-        if primary.properties.get("batch-size") != 20 or primary.properties.get("precision") != "fp16":
+        if (
+            primary.properties.get("batch-size") != 20
+            or primary.properties.get("precision") != "fp16"
+        ):
             raise GraphContractError("primary nvinfer must be shared FP16 batch-size=20")
 
         for element in self.elements:
@@ -288,7 +318,9 @@ class DeepStreamGraphSpec(FrozenModel):
             raise GraphContractError("fire_smoke and weapon branches must both be declared")
         for branch in self.optional_branches:
             if branch.enabled or not branch.shadow_only:
-                raise GraphContractError("conditional analytics must start disabled and shadow-only")
+                raise GraphContractError(
+                    "conditional analytics must start disabled and shadow-only"
+                )
             self._validate_queue(branch.queue)
             if branch.valve.factory != "valve" or branch.valve.properties.get("drop") is not True:
                 raise GraphContractError("conditional analytics require a closed valve")
@@ -325,7 +357,9 @@ class RuntimeModelManifestV1(FrozenModel):
     @field_validator("engine_sha256")
     @classmethod
     def engine_hash_is_digest_when_present(cls, value: str | None) -> str | None:
-        if value is not None and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value.lower())):
+        if value is not None and (
+            len(value) != 64 or any(c not in "0123456789abcdef" for c in value.lower())
+        ):
             raise ValueError("engine_sha256 must be a 64-character hexadecimal digest")
         return value
 
@@ -345,7 +379,9 @@ class RuntimeModelManifestV1(FrozenModel):
     @field_validator("nvinfer_config_sha256")
     @classmethod
     def config_hash_is_digest_when_present(cls, value: str | None) -> str | None:
-        if value is not None and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value.lower())):
+        if value is not None and (
+            len(value) != 64 or any(c not in "0123456789abcdef" for c in value.lower())
+        ):
             raise ValueError("nvinfer_config_sha256 must be a 64-character hexadecimal digest")
         return value
 
@@ -483,12 +519,15 @@ def person_config_paths_match(manifest: RuntimeModelManifestV1, config_path: Pat
     if manifest.artifact.preprocessing != "letterbox-rgb-640x640" or any(
         properties.get(key) != value for key, value in required_person_properties.items()
     ):
-        raise GraphContractError("nvinfer configuration does not match approved person preprocessing")
-    if (
-        properties.get("onnx-file") != str(manifest.artifact_path)
-        or properties.get("model-engine-file") != str(manifest.engine_path)
-    ):
-        raise GraphContractError("person nvinfer configuration does not load manifest-verified paths")
+        raise GraphContractError(
+            "nvinfer configuration does not match approved person preprocessing"
+        )
+    if properties.get("onnx-file") != str(manifest.artifact_path) or properties.get(
+        "model-engine-file"
+    ) != str(manifest.engine_path):
+        raise GraphContractError(
+            "person nvinfer configuration does not load manifest-verified paths"
+        )
 
 
 def should_link_rtsp_video_pad(caps: Mapping[str, str], codec: Literal["h264", "h265"]) -> bool:
@@ -503,16 +542,72 @@ def should_link_rtsp_video_pad(caps: Mapping[str, str], codec: Literal["h264", "
 
 def rtsp_caps_fields(caps: Any | None) -> dict[str, str] | None:
     """Read one negotiated RTP structure without assuming caps are ready."""
-    if caps is None or caps.get_size() < 1:
+    try:
+        if caps is None or type(caps.get_size()) is not int or caps.get_size() < 1:
+            return None
+        structure = caps.get_structure(0)
+    except (AttributeError, IndexError, OverflowError, TypeError, ValueError):
         return None
-    structure = caps.get_structure(0)
     if structure is None:
         return None
-    return {
-        "name": structure.get_name(),
-        "media": structure.get_string("media") or "",
-        "encoding-name": structure.get_string("encoding-name") or "",
-    }
+    try:
+        name = structure.get_name()
+        media = structure.get_string("media")
+        encoding = structure.get_string("encoding-name")
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return None
+    if not all(type(value) is str for value in (name, media, encoding)):
+        return None
+    return {"name": name, "media": media, "encoding-name": encoding}
+
+
+def decoder_caps_fields(caps: Any | None) -> tuple[int, int, int, int] | None:
+    """Extract the exact negotiated decoder geometry and FPS rational."""
+    try:
+        if caps is None or type(caps.get_size()) is not int or caps.get_size() < 1:
+            return None
+        structure = caps.get_structure(0)
+        if structure is None or structure.get_name() != "video/x-raw":
+            return None
+        width = structure.get_value("width")
+        height = structure.get_value("height")
+        framerate = structure.get_value("framerate")
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        OverflowError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        return None
+    if (
+        type(framerate) is tuple
+        and len(framerate) == 2
+        and type(framerate[0]) is int
+        and type(framerate[1]) is int
+    ):
+        numerator, denominator = framerate
+    else:
+        try:
+            numerator = framerate.numerator
+            denominator = framerate.denominator
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            try:
+                numerator = framerate.num
+                denominator = framerate.denom
+            except (AttributeError, OverflowError, TypeError, ValueError):
+                return None
+    if (
+        type(numerator) is not int
+        or type(denominator) is not int
+        or numerator <= 0
+        or denominator <= 0
+    ):
+        return None
+    return width, height, numerator, denominator
 
 
 def evidence_placeholder_properties() -> dict[str, bool]:
@@ -559,12 +654,16 @@ class SourceRecoveryCoordinator:
         supervisor: CameraSupervisor,
         source_ids: Mapping[str, int],
         rebuild_source: Callable[[str], None],
+        recover_camera: Callable[[str], None] | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._supervisor = supervisor
         self._source_ids = dict(source_ids)
-        self._camera_by_source_id = {source_id: camera_id for camera_id, source_id in source_ids.items()}
+        self._camera_by_source_id = {
+            source_id: camera_id for camera_id, source_id in source_ids.items()
+        }
         self._rebuild_source = rebuild_source
+        self._recover_camera = recover_camera or supervisor.recover
         self._monotonic = monotonic_clock
         self._last_rebuild_reconnect_count: dict[str, int] = {}
         self._attempt_started_at: dict[str, float] = {}
@@ -600,7 +699,7 @@ class SourceRecoveryCoordinator:
                 and self._last_rebuild_reconnect_count.get(camera_id) != health.reconnect_count
             ):
                 try:
-                    self._supervisor.recover(camera_id)
+                    self._recover_camera(camera_id)
                     self._rebuild_source(camera_id)
                     self._last_rebuild_reconnect_count[camera_id] = health.reconnect_count
                     self._attempt_started_at[camera_id] = self._monotonic()
@@ -612,6 +711,9 @@ class SourceRecoveryCoordinator:
         return started is not None and self._monotonic() - started > grace_seconds
 
     def _camera_for_element(self, element_name: str) -> str | None:
+        generation_match = re.fullmatch(r"source-(\d+)-generation-\d+", element_name)
+        if generation_match is not None:
+            return self._camera_by_source_id.get(int(generation_match.group(1)))
         prefix, separator, suffix = element_name.rpartition("-")
         if not separator or prefix not in self._SOURCE_ELEMENT_PREFIXES:
             return None
@@ -652,6 +754,144 @@ BindingLoader = Callable[[], object]
 EvidenceSinkFactory = Callable[[Any, SourcePlan], Any | None]
 
 
+class NativeProbeLeaseFactory(Protocol):
+    """Issue one authoritative primitive-only lease for a source generation."""
+
+    def acquire(self, camera_id: str, source_id: int) -> SourceProbeLease: ...
+
+
+class _TransactionalSourceProbeLease:
+    """Stable generation callback target with at most one live inner lease."""
+
+    def __init__(
+        self,
+        *,
+        factory: NativeProbeLeaseFactory,
+        camera_id: str,
+        source_id: int,
+    ) -> None:
+        self._factory = factory
+        self._camera_id = camera_id
+        self._source_id = source_id
+        self._inner: SourceProbeLease | None = None
+        self._lock = RLock()
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._inner is not None
+
+    def activate(self) -> None:
+        with self._lock:
+            if self._inner is not None:
+                raise RuntimeError(f"camera {self._camera_id} source probe lease is already active")
+            self._inner = self._factory.acquire(self._camera_id, self._source_id)
+
+    def deactivate(self) -> None:
+        with self._lock:
+            inner = self._inner
+            self._inner = None
+        if inner is not None:
+            inner.close()
+
+    def observe_rtp_caps(
+        self,
+        codec: str,
+        observed_monotonic_ns: int,
+    ) -> bool:
+        with self._lock:
+            return (
+                False
+                if self._inner is None
+                else self._inner.observe_rtp_caps(codec, observed_monotonic_ns)
+            )
+
+    def observe_decoder_caps(
+        self,
+        width: int,
+        height: int,
+        fps_numerator: int,
+        fps_denominator: int,
+        observed_monotonic_ns: int,
+    ) -> bool:
+        with self._lock:
+            return (
+                False
+                if self._inner is None
+                else self._inner.observe_decoder_caps(
+                    width,
+                    height,
+                    fps_numerator,
+                    fps_denominator,
+                    observed_monotonic_ns,
+                )
+            )
+
+    def observe_parser_buffer(
+        self,
+        byte_size: int,
+        source_timestamp_ns: int,
+        pts_ns: int,
+        observed_monotonic_ns: int,
+    ) -> bool:
+        with self._lock:
+            return (
+                False
+                if self._inner is None
+                else self._inner.observe_parser_buffer(
+                    byte_size,
+                    source_timestamp_ns,
+                    pts_ns,
+                    observed_monotonic_ns,
+                )
+            )
+
+    def observe_decoded_buffer(
+        self,
+        pts_ns: int,
+        observed_monotonic_ns: int,
+    ) -> bool:
+        with self._lock:
+            return (
+                False
+                if self._inner is None
+                else self._inner.observe_decoded_buffer(
+                    pts_ns,
+                    observed_monotonic_ns,
+                )
+            )
+
+    def observe_nvds_ntp(
+        self,
+        pts_ns: int,
+        source_ntp_ns: int,
+        observed_monotonic_ns: int,
+    ) -> bool:
+        with self._lock:
+            return (
+                False
+                if self._inner is None
+                else self._inner.observe_nvds_ntp(
+                    pts_ns,
+                    source_ntp_ns,
+                    observed_monotonic_ns,
+                )
+            )
+
+    def correlated_ntp(
+        self,
+        pts_ns: int,
+        source_ntp_ns: int,
+    ) -> CorrelatedNtpV1 | None:
+        with self._lock:
+            return (
+                None if self._inner is None else self._inner.correlated_ntp(pts_ns, source_ntp_ns)
+            )
+
+    def close(self) -> None:
+        self.deactivate()
+
+
 class RuntimeTelemetrySink(Protocol):
     def enqueue(
         self,
@@ -662,6 +902,51 @@ class RuntimeTelemetrySink(Protocol):
     ) -> None: ...
 
     def close(self) -> None: ...
+
+
+@dataclass(slots=True)
+class _SourceGeneration:
+    """All camera-local resources whose lifetime must advance atomically."""
+
+    camera_id: str
+    source_id: int
+    ordinal: int
+    source_bin: Any
+    writer: Any | None
+    lease: _TransactionalSourceProbeLease
+    lifecycle: Literal[
+        "staged",
+        "live_unauthorized",
+        "authorized",
+        "quiescing",
+        "retired",
+    ] = "staged"
+    authorized_running_time_ns: int | None = None
+    authorized_stream_epoch: str | None = None
+    correlation_not_before_monotonic_ns: int = 0
+    evidence_open_location: str | None = None
+    authority_revision: int = 0
+    _added_to_pipeline: bool = False
+    _lease_closed: bool = False
+    _writer_bound: bool = False
+    _writer_unbound: bool = False
+    _cutover_source_pad: Any | None = None
+    _cutover_mux_sink_pad: Any | None = None
+    _cutover_probe_id: int | None = None
+    _flush_stop_pending: bool = False
+
+    def close_lease(self) -> None:
+        if self._lease_closed:
+            return
+        self._lease_closed = True
+        self.lease.close()
+
+
+@dataclass(slots=True)
+class _PendingWriterCleanup:
+    camera_id: str
+    writer: Any
+    generation: _SourceGeneration | None
 
 
 class DeepStreamDataPlane:
@@ -677,6 +962,8 @@ class DeepStreamDataPlane:
         evidence_sink_factory: EvidenceSinkFactory | None = None,
         runtime_session_seed_factory: Callable[[], UUID | str] = uuid4,
         telemetry_publisher_factory: Callable[[str], RuntimeTelemetrySink] | None = None,
+        native_probe_lease_factory: NativeProbeLeaseFactory | None = None,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         self._manifest = runtime_manifest
         self._runtime_info = runtime_info
@@ -685,6 +972,8 @@ class DeepStreamDataPlane:
         self._evidence_sink_factory = evidence_sink_factory
         self._runtime_session_seed_factory = runtime_session_seed_factory
         self._telemetry_publisher_factory = telemetry_publisher_factory
+        self._native_probe_lease_factory = native_probe_lease_factory
+        self._monotonic_ns = monotonic_ns
         self._telemetry_publisher: RuntimeTelemetrySink | None = None
         self._graph: DeepStreamGraphSpec | None = None
         self._pipeline: Any | None = None
@@ -700,10 +989,24 @@ class DeepStreamDataPlane:
         self._started_monotonic: float | None = None
         self._awaiting_frame_since: dict[str, float] = {}
         self._source_time_mapper = SourceTimeMapper()
+        self._active_source_generations: dict[str, _SourceGeneration] = {}
+        self._staged_source_generations: dict[str, _SourceGeneration] = {}
+        self._retired_source_generations: dict[str, _SourceGeneration] = {}
+        self._metadata_source_generations: dict[str, _SourceGeneration] = {}
+        self._source_generation_ordinals: dict[str, int] = {}
+        self._pending_writer_cleanup: OrderedDict[int, _PendingWriterCleanup] = OrderedDict()
+        self._pending_evidence_disable: set[str] = set()
+        self._generation_state_lock = RLock()
+        self._metadata_owner_lock = RLock()
+        self._metadata_owners: OrderedDict[
+            tuple[int, int],
+            _SourceGeneration | object,
+        ] = OrderedDict()
 
     def start(self, site: SiteConfig) -> None:
         if self._pipeline is not None:
             raise RuntimeError("DeepStream data plane is already running")
+        self._retry_pending_evidence_disable()
         graph = DeepStreamGraphSpec.from_site(site)
         compute_capability, tensorrt_version = self._runtime_info()
         self._manifest.validate_for_host(
@@ -721,6 +1024,10 @@ class DeepStreamDataPlane:
             ) from exc
         if not isinstance(bindings, _NvidiaBindings):
             raise NvidiaBindingsUnavailable("binding loader returned an invalid NVIDIA adapter")
+        if self._native_probe_lease_factory is None:
+            raise GraphContractError(
+                "target DeepStream startup requires an authoritative native source probe factory"
+            )
         locations = resolve_rtsp_locations(site)
         self._graph = graph
         self._failed_reason = None
@@ -744,6 +1051,7 @@ class DeepStreamDataPlane:
             supervisor=self._supervisor,
             source_ids={source.camera_id: source.source_id for source in graph.sources},
             rebuild_source=self._rebuild_source,
+            recover_camera=self._recover_camera_epoch,
         )
         self._metadata_publisher = MetadataPublisher(
             supervisor=self._supervisor,
@@ -764,6 +1072,18 @@ class DeepStreamDataPlane:
             self.stop()
             raise
 
+    def _recover_camera_epoch(self, camera_id: str) -> None:
+        with self._generation_state_lock:
+            if self._supervisor is None:
+                raise RuntimeError("camera supervisor is unavailable")
+            generation = self._active_source_generations.get(camera_id)
+            if generation is not None:
+                self._revoke_generation_authority(
+                    generation,
+                    lifecycle="quiescing",
+                )
+            self._supervisor.recover(camera_id)
+
     def stop(self) -> None:
         cleanup_error: BaseException | None = None
 
@@ -775,19 +1095,60 @@ class DeepStreamDataPlane:
                 if cleanup_error is None:
                     cleanup_error = exc
 
+        generations: list[_SourceGeneration] = []
+        seen_generations: set[int] = set()
+        for generation in (
+            *self._active_source_generations.values(),
+            *self._staged_source_generations.values(),
+            *self._retired_source_generations.values(),
+        ):
+            identity = id(generation)
+            if identity not in seen_generations:
+                seen_generations.add(identity)
+                generations.append(generation)
+        cleanup(self._retry_pending_writer_cleanup)
+        for generation in generations:
+            cleanup(
+                lambda generation=generation: self._retry_pending_flush_stop(
+                    generation,
+                    release_block=True,
+                )
+            )
         if self._telemetry_publisher is not None:
             cleanup(self._telemetry_publisher.close)
         if self._pipeline is not None and self._bindings is not None:
             cleanup(lambda: stop_pipeline(self._pipeline, self._bindings.gst))
+        for generation in generations:
+            cleanup(lambda generation=generation: self._discard_generation_source_block(generation))
         if self._graph is not None and hasattr(self._evidence_sink_factory, "disable"):
             for source in self._graph.sources:
-                cleanup(
-                    lambda camera_id=source.camera_id: self._evidence_sink_factory.disable(  # type: ignore[union-attr]
-                        camera_id
-                    )
-                )
+                self._queue_evidence_disable(source.camera_id)
+        cleanup(self._retry_pending_evidence_disable)
         if self._supervisor is not None:
             cleanup(self._supervisor.clear_observations)
+        for generation in (
+            *self._staged_source_generations.values(),
+            *self._retired_source_generations.values(),
+        ):
+            if (
+                generation._added_to_pipeline
+                and self._pipeline is not None
+                and self._bindings is not None
+            ):
+                cleanup(
+                    lambda generation=generation: generation.source_bin.set_state(
+                        self._bindings.gst.State.NULL  # type: ignore[union-attr]
+                    )
+                )
+                cleanup(
+                    lambda generation=generation: self._remove_generation_from_pipeline(
+                        generation,
+                        f"staged source bin {generation.camera_id}",
+                    )
+                )
+        for generation in generations:
+            cleanup(lambda generation=generation: self._unbind_generation_writer(generation))
+            cleanup(generation.close_lease)
         self._pipeline = None
         self._graph = None
         self._bindings = None
@@ -798,6 +1159,13 @@ class DeepStreamDataPlane:
         self._started_monotonic = None
         self._awaiting_frame_since = {}
         self._source_time_mapper = SourceTimeMapper()
+        self._active_source_generations = {}
+        self._staged_source_generations = {}
+        self._retired_source_generations = {}
+        self._metadata_source_generations = {}
+        self._source_generation_ordinals = {}
+        with self._metadata_owner_lock:
+            self._metadata_owners.clear()
         self._supervisor = None
         if cleanup_error is not None:
             raise cleanup_error
@@ -834,7 +1202,10 @@ class DeepStreamDataPlane:
             now = time.monotonic()
             for health in self.health():
                 if health.state == "online":
-                    if health.last_frame_age_seconds is not None and health.last_frame_age_seconds > 5.0:
+                    if (
+                        health.last_frame_age_seconds is not None
+                        and health.last_frame_age_seconds > 5.0
+                    ):
                         self._recovery.handle_camera_failure(
                             health.camera_id, "source_frame_timeout", force=True
                         )
@@ -857,7 +1228,9 @@ class DeepStreamDataPlane:
                     self._started_monotonic if self._started_monotonic is not None else now,
                 )
                 if now - began > 5.0:
-                    self._recovery.handle_camera_failure(health.camera_id, "source_frame_timeout", force=True)
+                    self._recovery.handle_camera_failure(
+                        health.camera_id, "source_frame_timeout", force=True
+                    )
                     self._awaiting_frame_since[health.camera_id] = now
             self._recovery.advance()
         return self._pipeline is not None and self._failed_reason is None
@@ -868,9 +1241,7 @@ class DeepStreamDataPlane:
             try:
                 publisher.enqueue(
                     self.health(),
-                    analytics_state=(
-                        "failed" if self._failed_reason is not None else "degraded"
-                    ),
+                    analytics_state=("failed" if self._failed_reason is not None else "degraded"),
                     evidence_state=(
                         "degraded"
                         if self._evidence_sink_factory is not None
@@ -898,13 +1269,13 @@ class DeepStreamDataPlane:
         mux.set_property("batched-push-timeout", 40_000)
         mux.set_property("attach-sys-ts", False)
         pipeline.add(mux)
-        for source in graph.sources:
-            source_bin = self._build_source_bin(gst, source, locations[source.camera_id])
-            pipeline.add(source_bin)
-            source_pad = source_bin.get_static_pad("decoded_src")
-            sink_pad = mux.request_pad_simple(f"sink_{source.source_id}")
-            if source_pad.link(sink_pad) != gst.PadLinkReturn.OK:
-                raise RuntimeError(f"failed to link camera {source.camera_id} to streammux")
+        self._attach_initial_source_generations(
+            pipeline,
+            mux,
+            gst,
+            graph,
+            locations,
+        )
 
         primary_queue = self._make_queue(gst, graph.element("primary-queue"))
         person = self._make_element(gst, "nvinfer", "person-primary")
@@ -924,7 +1295,15 @@ class DeepStreamDataPlane:
         analytics = self._make_element(gst, "nvdsanalytics", "analytics")
         metadata_sink = self._make_element(gst, "fakesink", "metadata-sink")
         metadata_sink.set_property("sync", False)
-        for element in (primary_queue, person, core_tee, core_queue, tracker, analytics, metadata_sink):
+        for element in (
+            primary_queue,
+            person,
+            core_tee,
+            core_queue,
+            tracker,
+            analytics,
+            metadata_sink,
+        ):
             pipeline.add(element)
         if not gst.Element.link_many(mux, primary_queue, person, core_tee):
             raise RuntimeError("failed to link shared primary person path")
@@ -941,18 +1320,292 @@ class DeepStreamDataPlane:
             sink.set_property("async", False)
             for element in (branch_queue, valve, sink):
                 pipeline.add(element)
-            if not core_tee.link(branch_queue) or not gst.Element.link_many(branch_queue, valve, sink):
+            if not core_tee.link(branch_queue) or not gst.Element.link_many(
+                branch_queue, valve, sink
+            ):
                 raise RuntimeError(f"failed to isolate disabled {branch.module} branch")
-        analytics.get_static_pad("src").add_probe(gst.PadProbeType.BUFFER, self._metadata_probe, bindings)
+        analytics.get_static_pad("src").add_probe(
+            gst.PadProbeType.BUFFER, self._metadata_probe, bindings
+        )
         # Task 7 replaces per-source evidence discard sinks with bounded writers;
         # optional model work remains disabled until independently promoted.
         return pipeline
 
-    def _build_source_bin(self, gst: Any, source: SourcePlan, location: str) -> Any:
-        source_bin = gst.Bin.new(f"source-{source.source_id}")
+    def _attach_initial_source_generations(
+        self,
+        pipeline: Any,
+        mux: Any,
+        gst: Any,
+        graph: DeepStreamGraphSpec,
+        locations: Mapping[str, str],
+    ) -> None:
+        for source in graph.sources:
+            generation = self._build_source_generation(
+                gst,
+                source,
+                locations[source.camera_id],
+            )
+            self._staged_source_generations[source.camera_id] = generation
+            source_bin = generation.source_bin
+            if pipeline.add(source_bin) is False:
+                raise RuntimeError(f"failed to add camera {source.camera_id} source generation")
+            generation._added_to_pipeline = True
+            source_pad = source_bin.get_static_pad("decoded_src")
+            sink_pad = mux.request_pad_simple(f"sink_{source.source_id}")
+            if source_pad.link(sink_pad) != gst.PadLinkReturn.OK:
+                raise RuntimeError(f"failed to link camera {source.camera_id} to streammux")
+            generation.lifecycle = "live_unauthorized"
+            self._metadata_source_generations[source.camera_id] = generation
+            self._active_source_generations[source.camera_id] = generation
+            self._staged_source_generations.pop(source.camera_id, None)
+
+    def _bind_generation_writer(
+        self,
+        generation: _SourceGeneration,
+        *,
+        stream_epoch: str,
+    ) -> None:
+        if generation._writer_bound:
+            return
+        if generation._writer_unbound:
+            raise RuntimeError(f"camera {generation.camera_id} evidence writer was already retired")
+        writer = generation.writer
+        factory = self._evidence_sink_factory
+        if writer is None or not hasattr(factory, "bind_writer"):
+            generation._writer_bound = True
+            return
+        factory.bind_writer(  # type: ignore[union-attr]
+            writer,
+            stream_epoch=stream_epoch,
+        )
+        generation._writer_bound = True
+
+    def _unbind_generation_writer(self, generation: _SourceGeneration) -> None:
+        if generation._writer_unbound:
+            return
+        writer = generation.writer
+        factory = self._evidence_sink_factory
+        if writer is None or not hasattr(factory, "unbind_writer"):
+            generation._writer_bound = False
+            generation._writer_unbound = True
+            return
+        self._queue_writer_cleanup(
+            generation.camera_id,
+            writer,
+            generation=generation,
+        )
+        self._retry_pending_writer_cleanup(
+            camera_id=generation.camera_id,
+            writer=writer,
+        )
+
+    def _queue_writer_cleanup(
+        self,
+        camera_id: str,
+        writer: Any,
+        *,
+        generation: _SourceGeneration | None,
+    ) -> None:
+        key = id(writer)
+        with self._generation_state_lock:
+            pending = self._pending_writer_cleanup.get(key)
+            if pending is None:
+                self._pending_writer_cleanup[key] = _PendingWriterCleanup(
+                    camera_id=camera_id,
+                    writer=writer,
+                    generation=generation,
+                )
+                return
+            if pending.writer is not writer or pending.camera_id != camera_id:
+                raise RuntimeError("evidence writer cleanup identity collision")
+            if pending.generation is None and generation is not None:
+                pending.generation = generation
+
+    def _retry_pending_writer_cleanup(
+        self,
+        *,
+        camera_id: str | None = None,
+        writer: Any | None = None,
+    ) -> None:
+        with self._generation_state_lock:
+            pending_items = tuple(
+                pending
+                for pending in self._pending_writer_cleanup.values()
+                if (camera_id is None or pending.camera_id == camera_id)
+                and (writer is None or pending.writer is writer)
+            )
+        cleanup_error: BaseException | None = None
+        factory = self._evidence_sink_factory
+        for pending in pending_items:
+            try:
+                if not hasattr(factory, "unbind_writer"):
+                    raise RuntimeError(
+                        f"camera {pending.camera_id} evidence writer cleanup is unavailable"
+                    )
+                factory.unbind_writer(pending.writer)  # type: ignore[union-attr]
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                continue
+            with self._generation_state_lock:
+                current = self._pending_writer_cleanup.get(id(pending.writer))
+                if current is not pending:
+                    continue
+                if pending.generation is not None:
+                    pending.generation._writer_bound = False
+                    pending.generation._writer_unbound = True
+                self._pending_writer_cleanup.pop(id(pending.writer), None)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _queue_evidence_disable(self, camera_id: str) -> None:
+        with self._generation_state_lock:
+            self._pending_evidence_disable.add(camera_id)
+
+    def _disable_evidence(self, camera_id: str) -> None:
+        self._queue_evidence_disable(camera_id)
+        self._retry_pending_evidence_disable(camera_id=camera_id)
+
+    def _retry_pending_evidence_disable(
+        self,
+        *,
+        camera_id: str | None = None,
+    ) -> None:
+        with self._generation_state_lock:
+            pending_camera_ids = tuple(
+                sorted(
+                    pending_camera_id
+                    for pending_camera_id in self._pending_evidence_disable
+                    if camera_id is None or pending_camera_id == camera_id
+                )
+            )
+        cleanup_error: BaseException | None = None
+        factory = self._evidence_sink_factory
+        for camera_id in pending_camera_ids:
+            try:
+                if not hasattr(factory, "disable"):
+                    raise RuntimeError(
+                        f"camera {camera_id} evidence disable cleanup is unavailable"
+                    )
+                factory.disable(camera_id)  # type: ignore[union-attr]
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                continue
+            with self._generation_state_lock:
+                self._pending_evidence_disable.discard(camera_id)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _revoke_generation_authority(
+        self,
+        generation: _SourceGeneration,
+        *,
+        lifecycle: Literal["live_unauthorized", "quiescing"] = "live_unauthorized",
+    ) -> None:
+        """Revoke one stream epoch without permanently retiring its writer."""
+        generation.lifecycle = lifecycle
+        generation.authorized_running_time_ns = None
+        generation.authorized_stream_epoch = None
+        generation.correlation_not_before_monotonic_ns = max(
+            generation.correlation_not_before_monotonic_ns,
+            self._monotonic_ns(),
+        )
+        generation.evidence_open_location = None
+        generation._writer_bound = False
+        generation.authority_revision += 1
+        self._clear_metadata_owners(generation.camera_id)
+        factory = self._evidence_sink_factory
+        if hasattr(factory, "reset_camera"):
+            factory.reset_camera(generation.camera_id)  # type: ignore[union-attr]
+
+    def _restore_generation_after_failed_rebuild_locked(
+        self,
+        generation: _SourceGeneration,
+    ) -> None:
+        generation.lifecycle = "live_unauthorized"
+        generation.correlation_not_before_monotonic_ns = max(
+            generation.correlation_not_before_monotonic_ns,
+            self._monotonic_ns(),
+        )
+
+    def _build_source_generation(
+        self,
+        gst: Any,
+        source: SourcePlan,
+        location: str,
+        *,
+        activate_lease: bool = True,
+    ) -> _SourceGeneration:
+        factory = self._native_probe_lease_factory
+        if factory is None:
+            raise GraphContractError(
+                "target DeepStream source generation requires a native probe lease"
+            )
+        ordinal = self._source_generation_ordinals.get(source.camera_id, 0) + 1
+        self._source_generation_ordinals[source.camera_id] = ordinal
+        lease = _TransactionalSourceProbeLease(
+            factory=factory,
+            camera_id=source.camera_id,
+            source_id=source.source_id,
+        )
+        try:
+            if activate_lease:
+                lease.activate()
+            source_bin = self._build_source_bin(
+                gst,
+                source,
+                location,
+                lease,
+                f"source-{source.source_id}-generation-{ordinal}",
+            )
+            writer = (
+                None
+                if not hasattr(source_bin, "get_by_name")
+                else source_bin.get_by_name(f"evidence-writer-{source.source_id}")
+            )
+            return _SourceGeneration(
+                camera_id=source.camera_id,
+                source_id=source.source_id,
+                ordinal=ordinal,
+                source_bin=source_bin,
+                writer=writer,
+                lease=lease,
+            )
+        except BaseException:
+            lease.close()
+            raise
+
+    def _build_source_bin(
+        self,
+        gst: Any,
+        source: SourcePlan,
+        location: str,
+        lease: SourceProbeLease | None = None,
+        bin_name: str | None = None,
+    ) -> Any:
+        self._retry_pending_evidence_disable(camera_id=source.camera_id)
+        self._retry_pending_writer_cleanup(camera_id=source.camera_id)
+        source_bin = gst.Bin.new(bin_name or f"source-{source.source_id}")
         rtspsrc = self._make_element(gst, "rtspsrc", f"rtsp-{source.source_id}")
         rtspsrc.set_property("location", location)
         rtspsrc.set_property("latency", 200)
+        if lease is not None:
+            bindings = self._bindings
+            try:
+                configure_ntp = bindings.pyds.configure_source_for_ntp_sync  # type: ignore[union-attr]
+            except AttributeError as exc:
+                raise RuntimeError(
+                    f"camera {source.camera_id} cannot configure RTCP NTP sync"
+                ) from exc
+            try:
+                configured = configure_ntp(hash(rtspsrc))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"camera {source.camera_id} cannot configure RTCP NTP sync"
+                ) from exc
+            if configured is False:
+                raise RuntimeError(f"camera {source.camera_id} cannot configure RTCP NTP sync")
         depay = self._make_element(gst, source.depay_factory, f"depay-{source.source_id}")
         parser = self._make_element(gst, source.parser_factory, f"parse-{source.source_id}")
         # Repeat codec headers at random-access points so every retained fragment
@@ -967,23 +1620,14 @@ class DeepStreamDataPlane:
         }
         evidence_queue = self._make_queue(
             gst,
-            ElementSpec(name=f"evidence-{source.source_id}", factory="queue", properties=queue_properties),
+            ElementSpec(
+                name=f"evidence-{source.source_id}", factory="queue", properties=queue_properties
+            ),
         )
         evidence_sink = None
         if self._evidence_sink_factory is not None:
             try:
                 evidence_sink = self._evidence_sink_factory(gst, source)
-                if (
-                    evidence_sink is not None
-                    and self._supervisor is not None
-                    and hasattr(self._evidence_sink_factory, "bind_writer")
-                ):
-                    self._evidence_sink_factory.bind_writer(  # type: ignore[attr-defined]
-                        evidence_sink,
-                        stream_epoch=str(
-                            self._supervisor.health_for(source.camera_id).stream_epoch
-                        ),
-                    )
             except Exception:
                 self._evidence_attachment_failures += 1
                 raise RuntimeError(
@@ -998,38 +1642,96 @@ class DeepStreamDataPlane:
                 evidence_sink.set_property(name, value)
         decode_queue = self._make_queue(
             gst,
-            ElementSpec(name=f"decode-{source.source_id}", factory="queue", properties=queue_properties),
+            ElementSpec(
+                name=f"decode-{source.source_id}", factory="queue", properties=queue_properties
+            ),
         )
         decoder = self._make_element(gst, "nvv4l2decoder", f"nvdec-{source.source_id}")
-        for element in (
-            rtspsrc,
-            depay,
-            parser,
-            tee,
-            evidence_queue,
-            evidence_sink,
-            decode_queue,
-            decoder,
-        ):
-            source_bin.add(element)
-        rtspsrc.connect("pad-added", self._link_dynamic_rtsp_pad, depay, source.codec)
-        if not gst.Element.link_many(depay, parser, tee):
-            raise RuntimeError(f"failed to build encoded branch for {source.camera_id}")
-        if not tee.link(evidence_queue):
-            raise RuntimeError(f"failed to split evidence/NVDEC branches for {source.camera_id}")
-        if not evidence_queue.link(evidence_sink):
-            if using_discard:
-                raise RuntimeError(f"failed to attach evidence discard for {source.camera_id}")
-            self._evidence_attachment_failures += 1
-            if hasattr(self._evidence_sink_factory, "disable"):
-                self._evidence_sink_factory.disable(source.camera_id)  # type: ignore[attr-defined]
-            raise RuntimeError(
-                f"failed to attach bounded evidence writer for {source.camera_id}"
-            )
-        if not tee.link(decode_queue) or not decode_queue.link(decoder):
-            raise RuntimeError(f"failed to split evidence/NVDEC branches for {source.camera_id}")
-        source_bin.add_pad(gst.GhostPad.new("decoded_src", decoder.get_static_pad("src")))
-        return source_bin
+        try:
+            for element in (
+                rtspsrc,
+                depay,
+                parser,
+                tee,
+                evidence_queue,
+                evidence_sink,
+                decode_queue,
+                decoder,
+            ):
+                source_bin.add(element)
+            if lease is None:
+                rtspsrc.connect("pad-added", self._link_dynamic_rtsp_pad, depay, source.codec)
+            else:
+                rtspsrc.connect(
+                    "pad-added",
+                    self._link_dynamic_rtsp_pad,
+                    depay,
+                    source.codec,
+                    source.camera_id,
+                    lease,
+                    gst,
+                )
+            if not gst.Element.link_many(depay, parser, tee):
+                raise RuntimeError(f"failed to build encoded branch for {source.camera_id}")
+            if not tee.link(evidence_queue):
+                raise RuntimeError(
+                    f"failed to split evidence/NVDEC branches for {source.camera_id}"
+                )
+            if not evidence_queue.link(evidence_sink):
+                if using_discard:
+                    raise RuntimeError(f"failed to attach evidence discard for {source.camera_id}")
+                self._evidence_attachment_failures += 1
+                raise RuntimeError(
+                    f"failed to attach bounded evidence writer for {source.camera_id}"
+                )
+            if not tee.link(decode_queue) or not decode_queue.link(decoder):
+                raise RuntimeError(
+                    f"failed to split evidence/NVDEC branches for {source.camera_id}"
+                )
+            if lease is not None:
+                parser.get_static_pad("src").add_probe(
+                    gst.PadProbeType.BUFFER,
+                    self._parser_buffer_probe,
+                    source.camera_id,
+                    lease,
+                    gst,
+                )
+                decoder.get_static_pad("src").add_probe(
+                    gst.PadProbeType.EVENT_DOWNSTREAM,
+                    self._decoder_caps_probe,
+                    source.camera_id,
+                    lease,
+                    gst,
+                )
+                decoder.get_static_pad("src").add_probe(
+                    gst.PadProbeType.BUFFER,
+                    self._decoder_buffer_probe,
+                    source.camera_id,
+                    lease,
+                    gst,
+                )
+            source_bin.add_pad(gst.GhostPad.new("decoded_src", decoder.get_static_pad("src")))
+            return source_bin
+        except BaseException:
+            factory = self._evidence_sink_factory
+            if (
+                not using_discard
+                and evidence_sink is not None
+                and hasattr(factory, "unbind_writer")
+            ):
+                try:
+                    self._queue_writer_cleanup(
+                        source.camera_id,
+                        evidence_sink,
+                        generation=None,
+                    )
+                    self._retry_pending_writer_cleanup(
+                        camera_id=source.camera_id,
+                        writer=evidence_sink,
+                    )
+                except BaseException:
+                    self._evidence_attachment_failures += 1
+            raise
 
     @staticmethod
     def _make_element(gst: Any, factory: str, name: str) -> Any:
@@ -1047,18 +1749,323 @@ class DeepStreamDataPlane:
         queue.set_property("leaky", 2)  # GstQueueLeaky.DOWNSTREAM
         return queue
 
-    @staticmethod
     def _link_dynamic_rtsp_pad(
-        _: Any, pad: Any, depay: Any, codec: Literal["h264", "h265"]
+        self,
+        _: Any,
+        pad: Any,
+        depay: Any,
+        codec: Literal["h264", "h265"],
+        camera_id: str | None = None,
+        lease: SourceProbeLease | None = None,
+        gst: Any | None = None,
     ) -> None:
-        caps = pad.get_current_caps() or pad.query_caps(None)
+        try:
+            caps = pad.get_current_caps() or pad.query_caps(None)
+        except (AttributeError, IndexError, KeyError, OverflowError, TypeError, ValueError):
+            caps = None
         fields = rtsp_caps_fields(caps)
-        if fields is None or not should_link_rtsp_video_pad(fields, codec):
+        if lease is None:
+            if fields is None or not should_link_rtsp_video_pad(fields, codec):
+                return
+        else:
+            assert camera_id is not None
+            assert gst is not None
+            if (
+                fields is not None
+                and fields.get("name") == "application/x-rtp"
+                and fields.get("media", "").lower() != "video"
+            ):
+                return
+            encoding = "" if fields is None else fields.get("encoding-name", "").upper()
+            observed_codec = {"H264": "h264", "H265": "h265"}.get(encoding, "")
+            valid = (
+                fields is not None
+                and fields.get("name") == "application/x-rtp"
+                and fields.get("media", "").lower() == "video"
+                and observed_codec in {"h264", "h265"}
+            )
+            accepted = self._observe_native_primitive(
+                camera_id,
+                lease,
+                lambda: lease.observe_rtp_caps(
+                    observed_codec,
+                    self._monotonic_ns(),
+                ),
+                valid=valid,
+            )
+            if not accepted or observed_codec != codec:
+                return
+        assert fields is not None
+        if not should_link_rtsp_video_pad(fields, codec):
             return
         sink = depay.get_static_pad("sink")
         if not sink.is_linked():
             if int(pad.link(sink)) != 0:
+                if camera_id is not None and lease is not None:
+                    self._camera_local_probe_failure(
+                        camera_id,
+                        lease,
+                        "rtsp_video_pad_link_failed",
+                    )
+                    return
                 raise RuntimeError("failed to link validated RTSP video pad")
+
+    def _decoder_caps_probe(
+        self,
+        _: Any,
+        info: Any,
+        camera_id: str,
+        lease: SourceProbeLease,
+        gst: Any,
+    ) -> Any:
+        try:
+            event = info.get_event()
+            if event is None or event.type != gst.EventType.CAPS:
+                return gst.PadProbeReturn.OK
+            fields = decoder_caps_fields(event.parse_caps())
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            OverflowError,
+            TypeError,
+            ValueError,
+        ):
+            fields = None
+        width, height, numerator, denominator = (0, 0, 0, 0) if fields is None else fields
+        self._observe_native_primitive(
+            camera_id,
+            lease,
+            lambda: lease.observe_decoder_caps(
+                width,
+                height,
+                numerator,
+                denominator,
+                self._monotonic_ns(),
+            ),
+            valid=fields is not None,
+        )
+        return gst.PadProbeReturn.OK
+
+    def _parser_buffer_probe(
+        self,
+        _: Any,
+        info: Any,
+        camera_id: str,
+        lease: SourceProbeLease,
+        gst: Any,
+    ) -> Any:
+        buffer = None
+        try:
+            buffer = info.get_buffer()
+            byte_size = buffer.get_size()
+            source_timestamp_ns = buffer.dts
+            pts_ns = buffer.pts
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            byte_size = source_timestamp_ns = pts_ns = 0
+        valid = all(
+            type(value) is int and 0 < value <= 2**63 - 1
+            for value in (byte_size, source_timestamp_ns, pts_ns)
+        ) and all(
+            value != getattr(gst, "CLOCK_TIME_NONE", 2**64 - 1)
+            for value in (source_timestamp_ns, pts_ns)
+        )
+        self._observe_native_primitive(
+            camera_id,
+            lease,
+            lambda: lease.observe_parser_buffer(
+                byte_size if type(byte_size) is int else 0,
+                source_timestamp_ns if type(source_timestamp_ns) is int else 0,
+                pts_ns if type(pts_ns) is int else 0,
+                self._monotonic_ns(),
+            ),
+            valid=valid,
+        )
+        return gst.PadProbeReturn.OK
+
+    def _decoder_buffer_probe(
+        self,
+        _: Any,
+        info: Any,
+        camera_id: str,
+        lease: SourceProbeLease,
+        gst: Any,
+    ) -> Any:
+        try:
+            buffer = info.get_buffer()
+            pts_ns = buffer.pts
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            pts_ns = 0
+        valid = (
+            type(pts_ns) is int
+            and 0 < pts_ns <= 2**63 - 1
+            and pts_ns != getattr(gst, "CLOCK_TIME_NONE", 2**64 - 1)
+        )
+        accepted = self._observe_native_primitive(
+            camera_id,
+            lease,
+            lambda: lease.observe_decoded_buffer(
+                pts_ns if type(pts_ns) is int else 0,
+                self._monotonic_ns(),
+            ),
+            valid=valid,
+        )
+        if accepted:
+            self._record_metadata_owner(camera_id, lease, pts_ns)
+        return gst.PadProbeReturn.OK
+
+    def _generation_for_lease(
+        self,
+        camera_id: str,
+        lease: SourceProbeLease,
+    ) -> _SourceGeneration | None:
+        candidates = (
+            self._active_source_generations.get(camera_id),
+            self._staged_source_generations.get(camera_id),
+            self._metadata_source_generations.get(camera_id),
+        )
+        return next(
+            (
+                generation
+                for generation in candidates
+                if generation is not None and generation.lease is lease
+            ),
+            None,
+        )
+
+    def _record_metadata_owner(
+        self,
+        camera_id: str,
+        lease: SourceProbeLease,
+        pts_ns: int,
+    ) -> None:
+        if type(pts_ns) is not int or not 0 < pts_ns <= 2**63 - 1:
+            return
+        with self._generation_state_lock:
+            generation = self._generation_for_lease(camera_id, lease)
+            if generation is None or not self._generation_accepts_frame_locked(generation):
+                return
+            key = (generation.source_id, pts_ns)
+            with self._metadata_owner_lock:
+                existing = self._metadata_owners.get(key)
+                if existing is None:
+                    self._metadata_owners[key] = generation
+                elif existing is not generation:
+                    self._metadata_owners[key] = _AMBIGUOUS_METADATA_OWNER
+                self._metadata_owners.move_to_end(key)
+                while len(self._metadata_owners) > _MAX_METADATA_OWNER_ENTRIES:
+                    self._metadata_owners.popitem(last=False)
+
+    def _take_metadata_owner(
+        self,
+        source_id: int,
+        pts_ns: int,
+    ) -> _SourceGeneration | None:
+        with self._metadata_owner_lock:
+            generation = self._metadata_owners.pop((source_id, pts_ns), None)
+        return generation if isinstance(generation, _SourceGeneration) else None
+
+    def _current_stream_epoch(self, camera_id: str) -> str | None:
+        supervisor = self._supervisor
+        if supervisor is None:
+            return None
+        return str(supervisor.health_for(camera_id).stream_epoch)
+
+    def _generation_accepts_frame_locked(
+        self,
+        generation: _SourceGeneration,
+    ) -> bool:
+        if self._active_source_generations.get(generation.camera_id) is not generation:
+            return False
+        if generation.lifecycle == "live_unauthorized":
+            return True
+        if generation.lifecycle != "authorized" or not generation._writer_bound:
+            return False
+        current_epoch = self._current_stream_epoch(generation.camera_id)
+        return current_epoch is not None and generation.authorized_stream_epoch == current_epoch
+
+    def _clear_metadata_owners(self, camera_id: str) -> None:
+        source_ids = {
+            generation.source_id
+            for generation in (
+                self._active_source_generations.get(camera_id),
+                self._staged_source_generations.get(camera_id),
+                self._metadata_source_generations.get(camera_id),
+            )
+            if generation is not None
+        }
+        with self._metadata_owner_lock:
+            self._metadata_owners = OrderedDict(
+                (key, generation)
+                for key, generation in self._metadata_owners.items()
+                if key[0] not in source_ids
+            )
+
+    def _observe_native_primitive(
+        self,
+        camera_id: str,
+        lease: SourceProbeLease,
+        observation: Callable[[], bool],
+        *,
+        valid: bool,
+        failure_reason: str = "native_source_profile_failed",
+    ) -> bool:
+        with self._generation_state_lock:
+            generation = self._generation_for_lease(camera_id, lease)
+            if generation is None or not self._native_probe_is_admissible_locked(camera_id, lease):
+                return False
+            authority_revision = generation.authority_revision
+        try:
+            accepted = observation()
+        except (OverflowError, TypeError, ValueError):
+            accepted = False
+        with self._generation_state_lock:
+            if (
+                generation.authority_revision != authority_revision
+                or not self._native_probe_is_admissible_locked(camera_id, lease)
+            ):
+                return False
+        if valid and accepted:
+            return True
+        self._camera_local_probe_failure(
+            camera_id,
+            lease,
+            failure_reason,
+        )
+        return False
+
+    def _native_probe_is_admissible_locked(
+        self,
+        camera_id: str,
+        lease: SourceProbeLease,
+    ) -> bool:
+        active = self._active_source_generations.get(camera_id)
+        if active is not None and active.lease is lease:
+            return self._generation_accepts_frame_locked(active)
+        staged = self._staged_source_generations.get(camera_id)
+        return (
+            staged is not None
+            and staged.lease is lease
+            and staged.lifecycle == "staged"
+            and lease.active
+        )
+
+    def _camera_local_probe_failure(
+        self,
+        camera_id: str,
+        lease: SourceProbeLease,
+        reason: str,
+    ) -> None:
+        with self._generation_state_lock:
+            if (
+                self._native_probe_is_admissible_locked(camera_id, lease)
+                and self._recovery is not None
+            ):
+                self._recovery.handle_camera_failure(
+                    camera_id,
+                    reason,
+                    force=True,
+                )
 
     def _metadata_probe(self, _: Any, info: Any, bindings: _NvidiaBindings) -> Any:
         """Publish scalar metadata only; surfaces are neither mapped nor copied to CPU memory."""
@@ -1092,57 +2099,85 @@ class DeepStreamDataPlane:
         assert self._graph is not None
         assert self._metadata_publisher is not None
         source_id = getattr(frame_meta, "source_id", getattr(frame_meta, "pad_index", -1))
-        if not isinstance(source_id, int) or not 0 <= source_id < len(self._graph.sources):
+        if type(source_id) is not int or source_id < 0:
             raise ValueError("invalid source ID")
+        source = next(
+            (candidate for candidate in self._graph.sources if candidate.source_id == source_id),
+            None,
+        )
+        if source is None:
+            raise ValueError("invalid source ID")
+        camera_id = source.camera_id
         raw_ntp_timestamp = getattr(frame_meta, "ntp_timestamp", 0)
-        ntp_timestamp = (
-            raw_ntp_timestamp
-            if type(raw_ntp_timestamp) is int
-            and 0 < raw_ntp_timestamp < 2**64 - 1
-            else 0
-        )
-        source_time = (
-            datetime.fromtimestamp(ntp_timestamp / 1_000_000_000, UTC)
-            if ntp_timestamp > 0
-            else datetime.now(UTC)
-        )
-        timestamp_quality = "camera_rtcp" if ntp_timestamp > 0 else "host_ntp_fallback"
-        frame_width = int(getattr(frame_meta, "source_frame_width", 0))
-        frame_height = int(getattr(frame_meta, "source_frame_height", 0))
-        frame_number = int(frame_meta.frame_num)
-        if frame_width <= 0 or frame_height <= 0 or frame_number < 0:
-            raise ValueError("invalid frame metadata")
-        camera_id = self._graph.sources[source_id].camera_id
-        if not self._metadata_publisher.record_frame(
-            camera_id=camera_id, source_time=source_time, monotonic_seq=frame_number
-        ):
-            if self._recovery is not None:
-                self._recovery.handle_camera_failure(camera_id, "invalid_frame_heartbeat")
-            return
-        running_time_ns = getattr(frame_meta, "buf_pts", -1)
-        if ntp_timestamp <= 0 and self._evidence_sink_factory is not None:
-            if self._recovery is not None:
-                self._recovery.handle_camera_failure(
-                    camera_id,
-                    "evidence_source_time_unavailable",
-                )
-            return
+        raw_running_time_ns = getattr(frame_meta, "buf_pts", 0)
+        ntp_is_valid = type(raw_ntp_timestamp) is int and 0 < raw_ntp_timestamp <= 2**63 - 1
         running_time_is_valid = (
-            type(running_time_ns) is int and 0 <= running_time_ns < 2**64 - 1
+            type(raw_running_time_ns) is int and 0 < raw_running_time_ns <= 2**63 - 1
         )
-        if (
-            ntp_timestamp > 0
-            and not running_time_is_valid
-            and self._evidence_sink_factory is not None
-        ):
-            if self._recovery is not None:
-                self._recovery.handle_camera_failure(
-                    camera_id,
-                    "evidence_source_time_mapping_failed",
-                )
+        if not running_time_is_valid:
             return
-        if ntp_timestamp > 0 and running_time_is_valid and self._supervisor is not None:
-            stream_epoch = str(self._supervisor.health_for(camera_id).stream_epoch)
+        generation = self._take_metadata_owner(source_id, raw_running_time_ns)
+        if (
+            generation is None
+            or generation.camera_id != camera_id
+            or generation.source_id != source_id
+        ):
+            return
+        with self._generation_state_lock:
+            if not self._generation_accepts_frame_locked(generation):
+                return
+            authority_revision = generation.authority_revision
+        native_accepted = self._observe_native_primitive(
+            camera_id,
+            generation.lease,
+            lambda: generation.lease.observe_nvds_ntp(
+                raw_running_time_ns,
+                raw_ntp_timestamp if type(raw_ntp_timestamp) is int else 0,
+                self._monotonic_ns(),
+            ),
+            valid=ntp_is_valid,
+            failure_reason="camera_rtcp_time_unavailable",
+        )
+        if not ntp_is_valid or not native_accepted:
+            return
+        correlated_ntp = generation.lease.correlated_ntp(
+            raw_running_time_ns,
+            raw_ntp_timestamp,
+        )
+        if not isinstance(correlated_ntp, CorrelatedNtpV1):
+            return
+        ntp_timestamp = raw_ntp_timestamp
+        running_time_ns = raw_running_time_ns
+        source_time = datetime.fromtimestamp(ntp_timestamp / 1_000_000_000, UTC)
+        frame_width = getattr(frame_meta, "source_frame_width", 0)
+        frame_height = getattr(frame_meta, "source_frame_height", 0)
+        frame_number = getattr(frame_meta, "frame_num", -1)
+        if (
+            type(frame_width) is not int
+            or type(frame_height) is not int
+            or type(frame_number) is not int
+            or frame_width <= 0
+            or frame_height <= 0
+            or frame_number < 0
+        ):
+            raise ValueError("invalid frame metadata")
+        with self._generation_state_lock:
+            stream_epoch = self._current_stream_epoch(camera_id)
+            if (
+                stream_epoch is None
+                or generation.authority_revision != authority_revision
+                or any(
+                    observed_monotonic_ns <= generation.correlation_not_before_monotonic_ns
+                    for observed_monotonic_ns in (
+                        correlated_ntp.parser_observed_monotonic_ns,
+                        correlated_ntp.decoded_observed_monotonic_ns,
+                        correlated_ntp.ntp_observed_monotonic_ns,
+                        correlated_ntp.completed_monotonic_ns,
+                    )
+                )
+                or not self._generation_accepts_frame_locked(generation)
+            ):
+                return
             try:
                 self._source_time_mapper.anchor(
                     camera_id=camera_id,
@@ -1157,40 +2192,119 @@ class DeepStreamDataPlane:
                         "evidence_source_time_mapping_failed",
                     )
                 return
-        object_node = frame_meta.obj_meta_list
-        object_ordinal = 0
-        while object_node is not None:
-            try:
-                object_meta = pyds.NvDsObjectMeta.cast(object_node.data)
-                rect = object_meta.rect_params
-                raw = (float(rect.left), float(rect.top), float(rect.width), float(rect.height))
-                confidence = float(object_meta.confidence)
-                if not all(math.isfinite(value) for value in (*raw, confidence)):
-                    raise ValueError("non-finite metadata")
-                if not 0.0 <= confidence <= 1.0 or raw[2] <= 0.0 or raw[3] <= 0.0:
-                    raise ValueError("invalid detection metadata")
-                left = max(0.0, min(1.0, raw[0] / frame_width))
-                top = max(0.0, min(1.0, raw[1] / frame_height))
-                right = max(0.0, min(1.0, (raw[0] + raw[2]) / frame_width))
-                bottom = max(0.0, min(1.0, (raw[1] + raw[3]) / frame_height))
-                if not (left < right and top < bottom):
-                    raise ValueError("invalid normalised bbox")
-                self._metadata_publisher.publish(
-                    FrameMetadataV1(
-                        camera_id=camera_id,
-                        source_time=source_time,
-                        timestamp_quality=timestamp_quality,
-                        monotonic_seq=metadata_observation_sequence(frame_number, object_ordinal),
-                        class_name="person",
-                        confidence=confidence,
-                        bbox=(left, top, right, bottom),
-                        track_id=str(object_meta.object_id),
+            if not self._authorize_generation(
+                generation,
+                running_time_ns=running_time_ns,
+                stream_epoch=stream_epoch,
+            ):
+                return
+            if not self._metadata_publisher.record_frame(
+                camera_id=camera_id,
+                source_time=source_time,
+                monotonic_seq=frame_number,
+            ):
+                if self._recovery is not None:
+                    self._recovery.handle_camera_failure(
+                        camera_id,
+                        "invalid_frame_heartbeat",
+                        force=True,
                     )
+                return
+            object_node = frame_meta.obj_meta_list
+            object_ordinal = 0
+            while object_node is not None:
+                try:
+                    object_meta = pyds.NvDsObjectMeta.cast(object_node.data)
+                    rect = object_meta.rect_params
+                    raw = (
+                        float(rect.left),
+                        float(rect.top),
+                        float(rect.width),
+                        float(rect.height),
+                    )
+                    confidence = float(object_meta.confidence)
+                    if not all(math.isfinite(value) for value in (*raw, confidence)):
+                        raise ValueError("non-finite metadata")
+                    if not 0.0 <= confidence <= 1.0 or raw[2] <= 0.0 or raw[3] <= 0.0:
+                        raise ValueError("invalid detection metadata")
+                    left = max(0.0, min(1.0, raw[0] / frame_width))
+                    top = max(0.0, min(1.0, raw[1] / frame_height))
+                    right = max(
+                        0.0,
+                        min(1.0, (raw[0] + raw[2]) / frame_width),
+                    )
+                    bottom = max(
+                        0.0,
+                        min(1.0, (raw[1] + raw[3]) / frame_height),
+                    )
+                    if not (left < right and top < bottom):
+                        raise ValueError("invalid normalised bbox")
+                    self._metadata_publisher.publish(
+                        FrameMetadataV1(
+                            camera_id=camera_id,
+                            source_time=source_time,
+                            timestamp_quality="camera_rtcp",
+                            monotonic_seq=metadata_observation_sequence(
+                                frame_number,
+                                object_ordinal,
+                            ),
+                            class_name="person",
+                            confidence=confidence,
+                            bbox=(left, top, right, bottom),
+                            track_id=str(object_meta.object_id),
+                        )
+                    )
+                except (
+                    AttributeError,
+                    OSError,
+                    OverflowError,
+                    StopIteration,
+                    TypeError,
+                    ValueError,
+                ):
+                    self._invalid_metadata_count += 1
+                object_ordinal += 1
+                object_node = self._next_metadata_node(object_node)
+
+    def _authorize_generation(
+        self,
+        generation: _SourceGeneration,
+        *,
+        running_time_ns: int,
+        stream_epoch: str,
+    ) -> bool:
+        with self._generation_state_lock:
+            if (
+                self._active_source_generations.get(generation.camera_id) is not generation
+                or self._current_stream_epoch(generation.camera_id) != stream_epoch
+                or generation.lifecycle not in {"live_unauthorized", "authorized"}
+            ):
+                return False
+            if generation.lifecycle == "authorized":
+                return (
+                    generation._writer_bound and generation.authorized_stream_epoch == stream_epoch
                 )
-            except (AttributeError, OSError, OverflowError, StopIteration, TypeError, ValueError):
-                self._invalid_metadata_count += 1
-            object_ordinal += 1
-            object_node = self._next_metadata_node(object_node)
+            try:
+                self._bind_generation_writer(
+                    generation,
+                    stream_epoch=stream_epoch,
+                )
+            except Exception:
+                if self._recovery is not None:
+                    self._recovery.handle_camera_failure(
+                        generation.camera_id,
+                        "evidence_writer_bind_failed",
+                        force=True,
+                    )
+                return False
+            if self._current_stream_epoch(generation.camera_id) != stream_epoch:
+                generation._writer_bound = False
+                return False
+            generation.authorized_running_time_ns = running_time_ns
+            generation.authorized_stream_epoch = stream_epoch
+            generation.evidence_open_location = None
+            generation.lifecycle = "authorized"
+            return True
 
     @staticmethod
     def _next_metadata_node(node: Any) -> Any:
@@ -1224,35 +2338,92 @@ class DeepStreamDataPlane:
 
     def _handle_evidence_message(self, message: Any, structure: Any) -> None:
         factory = self._evidence_sink_factory
-        if factory is None or not hasattr(factory, "handle_splitmux_message"):
-            self._evidence_attachment_failures += 1
-            return
-        camera_id = self._camera_for_evidence_element(message.src)
-        if camera_id is None or self._graph is None or self._supervisor is None:
+        if factory is None or not hasattr(factory, "handle_writer_message"):
             self._evidence_attachment_failures += 1
             return
         try:
-            factory.handle_writer_message(  # type: ignore[attr-defined]
-                writer=message.src,
-                structure=structure,
-                source_time_mapper=self._source_time_mapper,
+            structure_name = structure.get_name()
+            running_time_ns = structure.get_value("running-time")
+            location = structure.get_value("location")
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return
+        if (
+            type(structure_name) is not str
+            or type(running_time_ns) is not int
+            or running_time_ns < 0
+            or running_time_ns >= 2**63
+            or type(location) is not str
+            or not location
+        ):
+            return
+        with self._generation_state_lock:
+            generation = next(
+                (
+                    candidate
+                    for candidate in self._active_source_generations.values()
+                    if candidate.writer is message.src
+                ),
+                None,
             )
-        except Exception:
-            self._evidence_attachment_failures += 1
-            factory.disable(camera_id)  # type: ignore[attr-defined]
-            if self._bindings is not None and hasattr(message.src, "set_state"):
-                message.src.set_state(self._bindings.gst.State.NULL)
-            if self._recovery is not None:
-                self._recovery.handle_camera_failure(
-                    camera_id,
-                    "evidence_fragment_adoption_failed",
-                    force=True,
-                )
+            if (
+                generation is None
+                or generation.lifecycle != "authorized"
+                or not generation._writer_bound
+                or generation.authorized_running_time_ns is None
+                or generation.authorized_stream_epoch
+                != self._current_stream_epoch(generation.camera_id)
+            ):
+                return
+            camera_id = generation.camera_id
+            if structure_name == "splitmuxsink-fragment-opened":
+                if running_time_ns < generation.authorized_running_time_ns:
+                    return
+                generation.evidence_open_location = location
+            elif structure_name == "splitmuxsink-fragment-closed":
+                if generation.evidence_open_location != location:
+                    return
+                generation.evidence_open_location = None
             else:
-                self._supervisor.disconnect(
-                    camera_id,
-                    "evidence_fragment_adoption_failed",
+                return
+            try:
+                factory.handle_writer_message(  # type: ignore[attr-defined]
+                    writer=message.src,
+                    structure=structure,
+                    source_time_mapper=self._source_time_mapper,
                 )
+            except Exception:
+                self._evidence_attachment_failures += 1
+
+                def cleanup(action: Callable[[], None]) -> None:
+                    try:
+                        action()
+                    except BaseException:
+                        return
+
+                cleanup(
+                    lambda: self._revoke_generation_authority(
+                        generation,
+                        lifecycle="quiescing",
+                    )
+                )
+                cleanup(lambda: self._disable_evidence(camera_id))
+                if self._bindings is not None and hasattr(message.src, "set_state"):
+                    cleanup(lambda: message.src.set_state(self._bindings.gst.State.NULL))
+                if self._recovery is not None:
+                    cleanup(
+                        lambda: self._recovery.handle_camera_failure(
+                            camera_id,
+                            "evidence_fragment_adoption_failed",
+                            force=True,
+                        )
+                    )
+                elif self._supervisor is not None:
+                    cleanup(
+                        lambda: self._supervisor.disconnect(
+                            camera_id,
+                            "evidence_fragment_adoption_failed",
+                        )
+                    )
 
     def _camera_for_evidence_element(self, element: Any) -> str | None:
         if self._recovery is not None:
@@ -1267,96 +2438,434 @@ class DeepStreamDataPlane:
         except (AttributeError, TypeError, ValueError):
             return None
         return next(
-            (
-                source.camera_id
-                for source in self._graph.sources
-                if source.source_id == source_id
-            ),
+            (source.camera_id for source in self._graph.sources if source.source_id == source_id),
             None,
         )
 
-    def _rebuild_source(self, camera_id: str) -> None:
-        """Placeholder for a target-only source-bin rebuild after local backoff.
+    def _block_and_flush_generation(
+        self,
+        generation: _SourceGeneration,
+        source_pad: Any,
+        mux_sink_pad: Any,
+    ) -> int:
+        assert self._bindings is not None
+        gst = self._bindings.gst
+        blocked = ThreadEvent()
 
-        Task 7 replaces the source bin's discard sink with an evidence writer.
-        Rebuilding stays camera-local so an RTSP error never reconstructs the
-        shared model, tracker, or other camera source bins.
-        """
+        def acknowledge_block(_: Any, __: Any) -> Any:
+            blocked.set()
+            return gst.PadProbeReturn.OK
+
+        probe_id = source_pad.add_probe(
+            gst.PadProbeType.IDLE | gst.PadProbeType.BLOCK_DOWNSTREAM,
+            acknowledge_block,
+        )
+        if type(probe_id) is not int or probe_id <= 0:
+            raise RuntimeError(f"failed to block old source bin for {generation.camera_id}")
+        flush_started = False
+        try:
+            if not blocked.wait(timeout=2.0):
+                raise RuntimeError(f"timed out blocking old source bin for {generation.camera_id}")
+            if mux_sink_pad.send_event(gst.Event.new_flush_start()) is not True:
+                raise RuntimeError(
+                    f"failed to acknowledge source flush start for {generation.camera_id}"
+                )
+            flush_started = True
+            with self._generation_state_lock:
+                generation._cutover_source_pad = source_pad
+                generation._cutover_mux_sink_pad = mux_sink_pad
+                generation._cutover_probe_id = probe_id
+                generation._flush_stop_pending = True
+                if mux_sink_pad.send_event(gst.Event.new_flush_stop(True)) is not True:
+                    raise RuntimeError(
+                        f"failed to acknowledge source flush stop for {generation.camera_id}"
+                    )
+                generation._flush_stop_pending = False
+            self._clear_metadata_owners(generation.camera_id)
+            return probe_id
+        except BaseException:
+            if not flush_started:
+                source_pad.remove_probe(probe_id)
+            raise
+
+    def _retry_pending_flush_stop(
+        self,
+        generation: _SourceGeneration,
+        *,
+        release_block: bool,
+    ) -> None:
+        with self._generation_state_lock:
+            probe_id = generation._cutover_probe_id
+            source_pad = generation._cutover_source_pad
+            mux_sink_pad = generation._cutover_mux_sink_pad
+            if probe_id is None:
+                return
+            if source_pad is None or mux_sink_pad is None:
+                raise RuntimeError(f"camera {generation.camera_id} lost source flush ownership")
+            if generation._flush_stop_pending:
+                if self._bindings is None:
+                    raise RuntimeError(
+                        f"camera {generation.camera_id} cannot complete source flush stop"
+                    )
+                if (
+                    mux_sink_pad.send_event(self._bindings.gst.Event.new_flush_stop(True))
+                    is not True
+                ):
+                    raise RuntimeError(
+                        f"failed to acknowledge source flush stop for {generation.camera_id}"
+                    )
+                generation._flush_stop_pending = False
+            if release_block:
+                source_pad.remove_probe(probe_id)
+                generation._cutover_source_pad = None
+                generation._cutover_mux_sink_pad = None
+                generation._cutover_probe_id = None
+
+    def _discard_generation_source_block(
+        self,
+        generation: _SourceGeneration,
+    ) -> None:
+        with self._generation_state_lock:
+            source_pad = generation._cutover_source_pad
+            probe_id = generation._cutover_probe_id
+            if source_pad is not None and probe_id is not None:
+                source_pad.remove_probe(probe_id)
+            generation._cutover_source_pad = None
+            generation._cutover_mux_sink_pad = None
+            generation._cutover_probe_id = None
+            generation._flush_stop_pending = False
+
+    def _rebuild_source(self, camera_id: str) -> None:
+        """Replace one camera generation while retaining a rollback-capable old path."""
         if self._pipeline is None or self._graph is None or self._bindings is None:
             return
-        source = next(item for item in self._graph.sources if item.camera_id == camera_id)
-        source_name = f"source-{source.source_id}"
-        old_bin = self._pipeline.get_by_name(source_name)
-        old_writer = (
-            None
-            if old_bin is None or not hasattr(old_bin, "get_by_name")
-            else old_bin.get_by_name(f"evidence-writer-{source.source_id}")
-        )
-        old_source_pad = None if old_bin is None else old_bin.get_static_pad("decoded_src")
-        mux = self._pipeline.get_by_name("streammux")
-        mux_sink_pad = (
-            None if mux is None else mux.get_static_pad(f"sink_{source.source_id}")
-        )
-        if mux_sink_pad is None and old_source_pad is not None:
-            mux_sink_pad = old_source_pad.get_peer()
-        if mux_sink_pad is None:
-            raise RuntimeError(f"source bin {camera_id} has no streammux pad")
-        replacement = self._build_source_bin(
-            self._bindings.gst, source, self._locations[camera_id]
-        )
-        replacement_writer = (
-            None
-            if not hasattr(replacement, "get_by_name")
-            else replacement.get_by_name(f"evidence-writer-{source.source_id}")
-        )
-        if old_bin is not None and old_source_pad is not None:
-            old_bin.set_state(self._bindings.gst.State.NULL)
-            if old_writer is not None and hasattr(
-                self._evidence_sink_factory,
-                "unbind_writer",
-            ):
-                self._evidence_sink_factory.unbind_writer(old_writer)  # type: ignore[attr-defined]
-            if old_source_pad.unlink(mux_sink_pad) is False:
-                replacement.set_state(self._bindings.gst.State.NULL)
-                raise RuntimeError(f"failed to unlink old source bin for {camera_id}")
-            self._pipeline.remove(old_bin)
-        if self._pipeline.add(replacement) is False:
-            replacement.set_state(self._bindings.gst.State.NULL)
-            if replacement_writer is not None and hasattr(
-                self._evidence_sink_factory,
-                "unbind_writer",
-            ):
-                self._evidence_sink_factory.unbind_writer(replacement_writer)  # type: ignore[attr-defined]
-            raise RuntimeError(f"failed to add rebuilt source bin for {camera_id}")
-        replacement_pad = replacement.get_static_pad("decoded_src")
-        replacement_linked = False
+        with self._generation_state_lock:
+            old_generation = self._active_source_generations.get(camera_id)
+            if old_generation is None:
+                raise RuntimeError(f"source bin {camera_id} has no active generation")
+            try:
+                if old_generation.lifecycle != "quiescing":
+                    self._revoke_generation_authority(
+                        old_generation,
+                        lifecycle="quiescing",
+                    )
+            except BaseException:
+                self._restore_generation_after_failed_rebuild_locked(old_generation)
+                raise
+
+        replacement: _SourceGeneration | None = None
         try:
+            self._retry_pending_generation_cleanup(camera_id)
+            source = next(item for item in self._graph.sources if item.camera_id == camera_id)
+            old_bin = old_generation.source_bin
+            old_source_pad = old_bin.get_static_pad("decoded_src")
+            mux = self._pipeline.get_by_name("streammux")
+            mux_sink_pad = None if mux is None else mux.get_static_pad(f"sink_{source.source_id}")
+            if mux_sink_pad is None:
+                mux_sink_pad = old_source_pad.get_peer()
+            if mux_sink_pad is None:
+                raise RuntimeError(f"source bin {camera_id} has no streammux pad")
+            replacement = self._build_source_generation(
+                self._bindings.gst,
+                source,
+                self._locations[camera_id],
+                activate_lease=False,
+            )
+            with self._generation_state_lock:
+                self._staged_source_generations[camera_id] = replacement
+            replacement_bin = replacement.source_bin
+            replacement_pad = replacement_bin.get_static_pad("decoded_src")
+        except BaseException:
+            if replacement is not None:
+                replacement_cleanup_failed = False
+                try:
+                    self._cleanup_replacement_generation(
+                        replacement,
+                        added=replacement._added_to_pipeline,
+                    )
+                except BaseException:
+                    replacement_cleanup_failed = True
+                if not replacement_cleanup_failed:
+                    with self._generation_state_lock:
+                        if self._staged_source_generations.get(camera_id) is replacement:
+                            self._staged_source_generations.pop(camera_id, None)
+            with self._generation_state_lock:
+                if (
+                    self._active_source_generations.get(camera_id) is old_generation
+                    and old_generation._cutover_probe_id is None
+                ):
+                    self._restore_generation_after_failed_rebuild_locked(old_generation)
+            raise
+
+        replacement_added = False
+        old_unlinked = False
+        replacement_linked = False
+        old_lease_deactivated = False
+        replacement_lease_activated = False
+        cutover_probe_id: int | None = None
+        try:
+            if self._pipeline.add(replacement_bin) is False:
+                raise RuntimeError(f"failed to add rebuilt source bin for {camera_id}")
+            replacement_added = True
+            replacement._added_to_pipeline = True
+            cutover_probe_id = self._block_and_flush_generation(
+                old_generation,
+                old_source_pad,
+                mux_sink_pad,
+            )
+            if old_source_pad.unlink(mux_sink_pad) is False:
+                raise RuntimeError(f"failed to unlink old source bin for {camera_id}")
+            old_unlinked = True
             if replacement_pad.link(mux_sink_pad) != self._bindings.gst.PadLinkReturn.OK:
                 raise RuntimeError(f"failed to relink rebuilt source bin for {camera_id}")
             replacement_linked = True
-            if not replacement.sync_state_with_parent():
+            old_lease_deactivated = True
+            old_generation.lease.deactivate()
+            replacement.lease.activate()
+            replacement_lease_activated = True
+            if not replacement_bin.sync_state_with_parent():
                 raise RuntimeError(f"failed to sync rebuilt source bin for {camera_id}")
-        except Exception:
+        except BaseException as primary_error:
+            rollback_error: BaseException | None = None
+            replacement_cleanup_failed = False
+            old_lease_restored = not old_lease_deactivated
+
+            def rollback(action: Callable[[], None]) -> None:
+                nonlocal rollback_error
+                try:
+                    action()
+                except BaseException as exc:
+                    if rollback_error is None:
+                        rollback_error = exc
+
+            if replacement_lease_activated:
+                rollback(replacement.lease.deactivate)
+            if old_lease_deactivated:
+                try:
+                    old_generation.lease.activate()
+                    old_lease_restored = True
+                except BaseException as exc:
+                    old_lease_restored = False
+                    if rollback_error is None:
+                        rollback_error = exc
             if replacement_linked:
-                replacement_pad.unlink(mux_sink_pad)
-            replacement.set_state(self._bindings.gst.State.NULL)
-            self._pipeline.remove(replacement)
-            if replacement_writer is not None and hasattr(
-                self._evidence_sink_factory,
-                "unbind_writer",
-            ):
-                self._evidence_sink_factory.unbind_writer(replacement_writer)  # type: ignore[attr-defined]
-            raise
+                rollback(
+                    lambda: self._require_unlink(
+                        replacement_pad,
+                        mux_sink_pad,
+                        f"replacement source bin {camera_id}",
+                    )
+                )
+            try:
+                old_peer = old_source_pad.get_peer()
+            except (AttributeError, TypeError):
+                old_peer = None
+            if old_unlinked or old_peer is not mux_sink_pad:
+                rollback(
+                    lambda: self._require_link(
+                        old_source_pad,
+                        mux_sink_pad,
+                        f"old source bin {camera_id}",
+                    )
+                )
+            with self._generation_state_lock:
+                self._metadata_source_generations[camera_id] = old_generation
+            if old_lease_restored and rollback_error is None:
+                rollback(
+                    lambda: self._require_sync(
+                        old_bin,
+                        f"old source bin {camera_id}",
+                    )
+                )
+            if old_lease_restored and rollback_error is None and cutover_probe_id is not None:
+                rollback(
+                    lambda: self._retry_pending_flush_stop(
+                        old_generation,
+                        release_block=True,
+                    )
+                )
+            if rollback_error is not None and old_lease_deactivated and old_lease_restored:
+                try:
+                    old_generation.lease.deactivate()
+                except BaseException:
+                    pass
+            try:
+                self._cleanup_replacement_generation(
+                    replacement,
+                    added=replacement_added,
+                )
+            except BaseException as exc:
+                replacement_cleanup_failed = True
+                if rollback_error is None:
+                    rollback_error = exc
+            if not replacement_cleanup_failed:
+                with self._generation_state_lock:
+                    self._staged_source_generations.pop(camera_id, None)
+            if rollback_error is not None:
+                if self._recovery is not None:
+                    self._recovery.handle_camera_failure(
+                        camera_id,
+                        "rtsp_rebuild_rollback_failed",
+                        force=True,
+                    )
+                raise RuntimeError(
+                    f"failed to restore old source generation for {camera_id}"
+                ) from rollback_error
+            with self._generation_state_lock:
+                if (
+                    self._active_source_generations.get(camera_id) is old_generation
+                    and old_generation._cutover_probe_id is None
+                ):
+                    self._restore_generation_after_failed_rebuild_locked(old_generation)
+            raise primary_error
+
+        with self._generation_state_lock:
+            replacement.correlation_not_before_monotonic_ns = max(
+                replacement.correlation_not_before_monotonic_ns,
+                self._monotonic_ns(),
+            )
+            replacement.authority_revision += 1
+            replacement.lifecycle = "live_unauthorized"
+            self._active_source_generations[camera_id] = replacement
+            self._metadata_source_generations[camera_id] = replacement
+            self._staged_source_generations.pop(camera_id, None)
+        retirement_error: BaseException | None = None
+
+        def retire(action: Callable[[], None]) -> None:
+            nonlocal retirement_error
+            try:
+                action()
+            except BaseException as exc:
+                if retirement_error is None:
+                    retirement_error = exc
+
+        with self._generation_state_lock:
+            old_generation.lifecycle = "retired"
+            self._retired_source_generations[camera_id] = old_generation
+        if cutover_probe_id is not None:
+            retire(
+                lambda: self._retry_pending_flush_stop(
+                    old_generation,
+                    release_block=True,
+                )
+            )
+        retire(lambda: old_bin.set_state(self._bindings.gst.State.NULL))
+        retire(
+            lambda: self._remove_generation_from_pipeline(
+                old_generation,
+                f"old source bin {camera_id}",
+            )
+        )
+        retire(lambda: self._unbind_generation_writer(old_generation))
+        retire(old_generation.close_lease)
+        if retirement_error is not None:
+            if self._recovery is not None:
+                self._recovery.handle_camera_failure(
+                    camera_id,
+                    "rtsp_rebuild_retirement_failed",
+                    force=True,
+                )
+            raise RuntimeError(
+                f"failed to retire old source generation for {camera_id}"
+            ) from retirement_error
+        with self._generation_state_lock:
+            self._retired_source_generations.pop(camera_id, None)
+
+    def _retry_pending_generation_cleanup(self, camera_id: str) -> None:
+        self._retry_pending_writer_cleanup(camera_id=camera_id)
+        active = self._active_source_generations.get(camera_id)
+        if active is not None:
+            self._retry_pending_flush_stop(
+                active,
+                release_block=True,
+            )
+        staged = self._staged_source_generations.get(camera_id)
+        if staged is not None:
+            self._cleanup_replacement_generation(
+                staged,
+                added=staged._added_to_pipeline,
+            )
+            self._staged_source_generations.pop(camera_id, None)
+        retired = self._retired_source_generations.get(camera_id)
+        if retired is not None:
+            self._cleanup_replacement_generation(
+                retired,
+                added=retired._added_to_pipeline,
+            )
+            self._retired_source_generations.pop(camera_id, None)
+
+    def _cleanup_replacement_generation(
+        self,
+        generation: _SourceGeneration,
+        *,
+        added: bool,
+    ) -> None:
+        cleanup_error: BaseException | None = None
+
+        def cleanup(action: Callable[[], None]) -> None:
+            nonlocal cleanup_error
+            try:
+                action()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+
+        if self._bindings is not None:
+            cleanup(lambda: generation.source_bin.set_state(self._bindings.gst.State.NULL))
+        if added:
+            cleanup(
+                lambda: self._remove_generation_from_pipeline(
+                    generation,
+                    f"replacement source bin {generation.camera_id}",
+                )
+            )
+        generation.lifecycle = "retired"
+        cleanup(lambda: self._unbind_generation_writer(generation))
+        cleanup(generation.close_lease)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _require_link(self, source_pad: Any, sink_pad: Any, label: str) -> None:
+        assert self._bindings is not None
+        if source_pad.link(sink_pad) != self._bindings.gst.PadLinkReturn.OK:
+            raise RuntimeError(f"failed to relink {label}")
+
+    @staticmethod
+    def _require_unlink(source_pad: Any, sink_pad: Any, label: str) -> None:
+        if source_pad.unlink(sink_pad) is False:
+            raise RuntimeError(f"failed to unlink {label}")
+
+    @staticmethod
+    def _require_sync(source_bin: Any, label: str) -> None:
+        if source_bin.sync_state_with_parent() is False:
+            raise RuntimeError(f"failed to sync {label}")
+
+    def _require_remove(self, source_bin: Any, label: str) -> None:
+        assert self._pipeline is not None
+        if self._pipeline.remove(source_bin) is False:
+            raise RuntimeError(f"failed to remove {label}")
+
+    def _remove_generation_from_pipeline(
+        self,
+        generation: _SourceGeneration,
+        label: str,
+    ) -> None:
+        self._require_remove(generation.source_bin, label)
+        generation._added_to_pipeline = False
 
 
 def _target_runtime_info() -> tuple[str, str]:
     """Read target facts only after this fail-closed image has been scheduled on NVIDIA."""
-    compute_capability = subprocess.run(
-        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip().splitlines()
+    compute_capability = (
+        subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        .stdout.strip()
+        .splitlines()
+    )
     if len(compute_capability) != 1:
         raise RuntimeError("target runtime must expose exactly one NVIDIA GPU")
     tensorrt_version = subprocess.run(
@@ -1412,12 +2921,36 @@ def _read_reviewed_file(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if (
-        len(payload) > max_bytes
-        or hashlib.sha256(payload).hexdigest() != expected_sha256
-    ):
+    if len(payload) > max_bytes or hashlib.sha256(payload).hexdigest() != expected_sha256:
         raise RuntimeError(f"reviewed {label} digest mismatch")
     return payload
+
+
+def _run_main_loop_with_graceful_signals(
+    runtime: DeepStreamDataPlane,
+    loop: Any,
+    *,
+    signal_module: Any = signal,
+) -> int:
+    """Translate operator termination into a clean pipeline drain and exit."""
+    previous_handlers: dict[int, Any] = {}
+
+    def request_shutdown(_signum: int, _frame: Any) -> None:
+        loop.quit()
+
+    try:
+        for signum in (signal_module.SIGTERM, signal_module.SIGINT):
+            previous_handlers[signum] = signal_module.getsignal(signum)
+            signal_module.signal(signum, request_shutdown)
+        if runtime.failed_reason is None:
+            loop.run()
+    finally:
+        try:
+            runtime.stop()
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal_module.signal(signum, handler)
+    return 1 if runtime.failed_reason is not None else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1429,12 +2962,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-manifest-sha256", required=True)
     parser.add_argument("--measured-capacity-report", type=Path, required=True)
     parser.add_argument("--measured-capacity-sha256", required=True)
+    parser.add_argument("--measured-capacity-signature", type=Path, required=True)
+    parser.add_argument("--capacity-authority-public-key", type=Path, required=True)
+    parser.add_argument("--runtime-image-id-sha256", required=True)
+    parser.add_argument("--runtime-image-config-sha256", required=True)
+    parser.add_argument("--runtime-code-sha256", required=True)
+    parser.add_argument("--mount-contract-sha256", required=True)
+    parser.add_argument("--runtime-launch-nonce", required=True)
     parser.add_argument("--control-plane-url", required=True)
     parser.add_argument("--machine-token-file", type=Path, required=True)
     arguments = parser.parse_args(argv)
     try:
         import yaml
 
+        if re.fullmatch(r"[a-f0-9]{32}", arguments.runtime_launch_nonce) is None:
+            raise ValueError("runtime launch nonce is invalid")
         site_payload = _read_reviewed_file(
             arguments.site_config,
             expected_sha256=arguments.site_config_sha256,
@@ -1445,22 +2987,28 @@ def main(argv: list[str] | None = None) -> int:
             expected_sha256=arguments.runtime_manifest_sha256,
             label="runtime manifest",
         )
-        capacity_payload = _read_reviewed_file(
-            arguments.measured_capacity_report,
-            expected_sha256=arguments.measured_capacity_sha256,
+        verified_capacity = verify_detached_artifact(
+            payload_path=arguments.measured_capacity_report,
+            signature_path=arguments.measured_capacity_signature,
+            trusted_public_key_path=arguments.capacity_authority_public_key,
+            expected_payload_sha256=arguments.measured_capacity_sha256,
+            max_payload_bytes=8 * 1024 * 1024,
             label="measured capacity report",
         )
         site = SiteConfig.model_validate(yaml.safe_load(site_payload))
-        runtime_manifest = RuntimeModelManifestV1.model_validate(
-            yaml.safe_load(runtime_payload)
-        )
+        runtime_manifest = RuntimeModelManifestV1.model_validate(yaml.safe_load(runtime_payload))
         measured_capacity = MeasuredCapacityReportV1.model_validate(
-            yaml.safe_load(capacity_payload)
+            yaml.safe_load(verified_capacity.payload)
         )
         require_measured_primary_capacity(
             site_config=site,
             runtime_manifest=runtime_manifest,
             report=measured_capacity,
+            runtime_image_id_sha256=arguments.runtime_image_id_sha256,
+            runtime_image_config_sha256=arguments.runtime_image_config_sha256,
+            runtime_code_sha256=arguments.runtime_code_sha256,
+            mount_contract_sha256=arguments.mount_contract_sha256,
+            runtime_manifest_file_sha256=arguments.runtime_manifest_sha256,
         )
         telemetry_client = AuthenticatedTelemetryClient(
             base_url=arguments.control_plane_url,
@@ -1479,6 +3027,7 @@ def main(argv: list[str] | None = None) -> int:
                     spool_root=site.storage.retention.encoded_spool_root,
                 ),
             ),
+            runtime_session_seed_factory=lambda: f"{arguments.runtime_launch_nonce}.{uuid4().hex}",
         )
         runtime.start(site)
     except (
@@ -1489,15 +3038,10 @@ def main(argv: list[str] | None = None) -> int:
         ValueError,
     ) as exc:
         parser.error(str(exc))
-    try:
-        assert runtime._bindings is not None
-        loop = runtime._bindings.glib.MainLoop()
-        runtime._fatal_callback = loop.quit
-        if runtime.failed_reason is None:
-            loop.run()
-    finally:
-        runtime.stop()
-    return 1 if runtime.failed_reason is not None else 0
+    assert runtime._bindings is not None
+    loop = runtime._bindings.glib.MainLoop()
+    runtime._fatal_callback = loop.quit
+    return _run_main_loop_with_graceful_signals(runtime, loop)
 
 
 if __name__ == "__main__":  # pragma: no cover - target process entrypoint.

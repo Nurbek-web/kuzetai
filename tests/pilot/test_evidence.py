@@ -1579,6 +1579,404 @@ def test_delayed_old_writer_close_cannot_inherit_replacement_stream_epoch(
 
 
 @pytest.mark.parametrize(
+    ("failure_stage", "expected_rmtree_calls", "expected_fsync_calls"),
+    (
+        ("rmtree", 2, 1),
+        ("fsync", 1, 2),
+    ),
+)
+def test_splitmux_unbind_retries_filesystem_cleanup_before_dropping_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    expected_rmtree_calls: int,
+    expected_fsync_calls: int,
+) -> None:
+    class Element:
+        def __init__(self) -> None:
+            self.properties: dict[str, object] = {}
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+    class Gst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                return Element()
+
+    ring = _ring(tmp_path / "spool", Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
+    writer = factory(Gst, source)
+    incoming_directory = Path(writer.properties["location"]).parent
+    (incoming_directory / "00001.part.mp4").write_bytes(b"pending")
+    original_rmtree = evidence_runtime.shutil.rmtree
+    original_fsync_directory = evidence_runtime._fsync_directory
+    rmtree_calls = 0
+    fsync_calls = 0
+
+    def flaky_rmtree(path: Path) -> None:
+        nonlocal rmtree_calls
+        rmtree_calls += 1
+        if failure_stage == "rmtree" and rmtree_calls == 1:
+            raise OSError("simulated rmtree failure")
+        original_rmtree(path)
+
+    def flaky_fsync_directory(path: Path) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if failure_stage == "fsync" and fsync_calls == 1:
+            raise OSError("simulated directory fsync failure")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(evidence_runtime.shutil, "rmtree", flaky_rmtree)
+    monkeypatch.setattr(evidence_runtime, "_fsync_directory", flaky_fsync_directory)
+
+    with pytest.raises(OSError, match="simulated"):
+        factory.unbind_writer(writer)
+
+    assert ring.used_bytes == 100
+    factory.unbind_writer(writer)
+
+    assert not incoming_directory.exists()
+    assert ring.used_bytes == 0
+    assert rmtree_calls == expected_rmtree_calls
+    assert fsync_calls == expected_fsync_calls
+
+
+@pytest.mark.parametrize("failure_stage", ("sink", "property"))
+def test_splitmux_construction_failure_removes_generation_directory(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    class Element:
+        def set_property(self, _: str, __: object) -> None:
+            if failure_stage == "property":
+                raise RuntimeError("property configuration failed")
+
+    class Gst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element | None:
+                return None if failure_stage == "sink" else Element()
+
+    ring = _ring(tmp_path / "spool", Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
+
+    with pytest.raises(RuntimeError):
+        factory(Gst, source)
+
+    incoming_root = ring.root / ".incoming"
+    assert [
+        path
+        for path in incoming_root.glob("*/*")
+        if path.is_dir()
+    ] == []
+    assert ring.used_bytes == 0
+
+
+@pytest.mark.parametrize("create_generation", (False, True))
+def test_splitmux_generation_mkdir_failure_remains_owned_for_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    create_generation: bool,
+) -> None:
+    class Gst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> object:
+                raise AssertionError("sink construction must follow generation mkdir")
+
+    ring = _ring(tmp_path / "spool", Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
+    generation_directories: list[Path] = []
+    original_mkdir = Path.mkdir
+
+    def partially_failing_mkdir(
+        path: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        if path.name == "generation0001":
+            generation_directories.append(path)
+            if create_generation:
+                original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+            raise OSError("simulated partial generation mkdir failure")
+        original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(
+        evidence_runtime,
+        "uuid4",
+        lambda: SimpleNamespace(hex="generation0001"),
+    )
+    monkeypatch.setattr(Path, "mkdir", partially_failing_mkdir)
+
+    with pytest.raises(OSError, match="partial generation mkdir failure"):
+        factory(Gst, source)
+
+    assert generation_directories
+    assert len(set(generation_directories)) == 1
+    assert not generation_directories[0].exists()
+    assert ring.used_bytes == 0
+
+
+def test_splitmux_rejects_concurrent_same_camera_construction_without_path_mutation(
+    tmp_path: Path,
+) -> None:
+    class Element:
+        def __init__(self) -> None:
+            self.properties: dict[str, object] = {}
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+    first_make_entered = threading.Event()
+    release_first_make = threading.Event()
+    make_lock = threading.Lock()
+    make_calls = 0
+
+    class Gst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                nonlocal make_calls
+                with make_lock:
+                    make_calls += 1
+                    call_number = make_calls
+                if call_number == 1:
+                    first_make_entered.set()
+                    assert release_first_make.wait(timeout=5)
+                return Element()
+
+    ring = _ring(tmp_path / "spool", Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
+    writers: list[Element] = []
+    errors: list[BaseException] = []
+
+    def construct_first_writer() -> None:
+        try:
+            writers.append(factory(Gst, source))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=construct_first_writer)
+    worker.start()
+    assert first_make_entered.wait(timeout=2)
+    first_generation = next((ring.root / ".incoming").glob("*/*"))
+
+    try:
+        with pytest.raises(RuntimeError, match="construction is already in progress"):
+            factory(Gst, source)
+        assert first_generation.is_dir()
+        assert make_calls == 1
+    finally:
+        release_first_make.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(writers) == 1
+    factory.unbind_writer(writers[0])
+    assert ring.used_bytes == 0
+
+
+def test_splitmux_allows_concurrent_construction_for_different_cameras(
+    tmp_path: Path,
+) -> None:
+    class Element:
+        def __init__(self) -> None:
+            self.properties: dict[str, object] = {}
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+    both_makes_entered = threading.Event()
+    release_makes = threading.Event()
+    entered_names: set[str] = set()
+    entered_lock = threading.Lock()
+
+    class Gst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, name: str) -> Element:
+                with entered_lock:
+                    entered_names.add(name)
+                    if len(entered_names) == 2:
+                        both_makes_entered.set()
+                assert release_makes.wait(timeout=5)
+                return Element()
+
+    ring = _ring(tmp_path / "spool", Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    sources = (
+        SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264"),
+        SimpleNamespace(camera_id="camera-02", source_id=1, codec="h264"),
+    )
+    writers: list[Element] = []
+    errors: list[BaseException] = []
+
+    def construct_writer(source: SimpleNamespace) -> None:
+        try:
+            writers.append(factory(Gst, source))
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [
+        threading.Thread(target=construct_writer, args=(source,))
+        for source in sources
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        assert both_makes_entered.wait(timeout=2)
+    finally:
+        release_makes.set()
+        for worker in workers:
+            worker.join(timeout=2)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(writers) == 2
+    for writer in writers:
+        factory.unbind_writer(writer)
+    assert ring.used_bytes == 0
+
+
+@pytest.mark.parametrize("failure_stage", ("rmtree", "fsync"))
+@pytest.mark.parametrize("retry_via", ("construction", "disable"))
+def test_splitmux_failed_construction_cleanup_is_owned_until_bounded_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    retry_via: str,
+) -> None:
+    class Element:
+        def __init__(self, *, fail_property: bool) -> None:
+            self.fail_property = fail_property
+            self.properties: dict[str, object] = {}
+
+        def set_property(self, name: str, value: object) -> None:
+            if self.fail_property:
+                raise RuntimeError("property configuration failed")
+            self.properties[name] = value
+
+    class FailingGst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                return Element(fail_property=True)
+
+    class SuccessfulGst:
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                return Element(fail_property=False)
+
+    ring = _ring(tmp_path / "spool", Clock())
+    factory = SplitMuxEvidenceSinkFactory(
+        ring=ring,
+        fragment_seconds=2,
+        max_fragment_bytes=100,
+    )
+    source = SimpleNamespace(camera_id="camera-01", source_id=0, codec="h264")
+    events: list[str] = []
+    uuid_count = 0
+    rmtree_calls = 0
+    fsync_calls = 0
+    original_rmtree = evidence_runtime.shutil.rmtree
+    original_fsync_directory = evidence_runtime._fsync_directory
+
+    def recording_uuid() -> SimpleNamespace:
+        nonlocal uuid_count
+        uuid_count += 1
+        events.append(f"uuid-{uuid_count}")
+        return SimpleNamespace(hex=f"generation{uuid_count:04d}")
+
+    def flaky_rmtree(path: Path) -> None:
+        nonlocal rmtree_calls
+        rmtree_calls += 1
+        events.append("rmtree")
+        if failure_stage == "rmtree" and rmtree_calls == 1:
+            raise OSError("simulated rmtree failure")
+        original_rmtree(path)
+
+    def flaky_fsync_directory(path: Path) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        events.append("fsync")
+        if failure_stage == "fsync" and fsync_calls == 1:
+            raise OSError("simulated directory fsync failure")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(evidence_runtime, "uuid4", recording_uuid)
+    monkeypatch.setattr(evidence_runtime.shutil, "rmtree", flaky_rmtree)
+    monkeypatch.setattr(evidence_runtime, "_fsync_directory", flaky_fsync_directory)
+
+    with pytest.raises(RuntimeError, match="property configuration failed"):
+        factory(FailingGst, source)
+
+    assert uuid_count == 1
+    assert ring.used_bytes == 100
+
+    if retry_via == "construction":
+        writer = factory(SuccessfulGst, source)
+        expected_prefix = (
+            ["uuid-1", "rmtree", "rmtree", "fsync", "uuid-2"]
+            if failure_stage == "rmtree"
+            else ["uuid-1", "rmtree", "fsync", "fsync", "uuid-2"]
+        )
+        assert events[:5] == expected_prefix
+        incoming_directories = [
+            path
+            for path in (ring.root / ".incoming").glob("*/*")
+            if path.is_dir()
+        ]
+        assert len(incoming_directories) == 1
+        assert ring.used_bytes == 100
+        factory.unbind_writer(writer)
+    else:
+        factory.disable("camera-01")
+        expected_events = (
+            ["uuid-1", "rmtree", "rmtree", "fsync"]
+            if failure_stage == "rmtree"
+            else ["uuid-1", "rmtree", "fsync", "fsync"]
+        )
+        assert events == expected_events
+
+    assert [
+        path
+        for path in (ring.root / ".incoming").glob("*/*")
+        if path.is_dir()
+    ] == []
+    assert ring.used_bytes == 0
+
+
+@pytest.mark.parametrize(
     ("ring_seconds", "max_camera_bytes", "max_spool_bytes"),
     [(16, 100, 100), (15, 0, 100), (15, 100, 0)],
 )

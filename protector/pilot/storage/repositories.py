@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, and_, or_, select, update
+from sqlalchemy import Select, and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
+from protector.pilot.api.auth import prepare_username
 from protector.pilot.domain import (
     CandidateEventV1,
     NotificationOutboxRecordV1,
@@ -50,6 +51,31 @@ class StaleStateError(ValueError):
         self.expected = expected
         self.actual = actual
         super().__init__(f"expected {expected}, found {actual}")
+
+
+class SoleSiteRequiredError(RuntimeError):
+    """Auth lifecycle writes require exactly one authoritative site."""
+
+
+class BootstrapAlreadyCompletedError(RuntimeError):
+    """The one-shot first-admin bootstrap has already been consumed."""
+
+
+class LastActiveAdminError(ValueError):
+    """A mutation would leave the pilot without an active administrator."""
+
+
+class UsernameConflictError(ValueError):
+    """A canonical username identity is already assigned."""
+
+
+class StaleAuthGenerationError(ValueError):
+    """An auth mutation targeted an outdated durable generation."""
+
+    def __init__(self, *, expected: int, actual: int) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"expected auth generation {expected}, found {actual}")
 
 
 def _audit_site_id(session: Session, entity_type: str, entity_id: str) -> str | None:
@@ -690,30 +716,412 @@ class PilotRepository:
         role: Literal["viewer", "operator", "admin"],
         totp_secret_encrypted: str | None = None,
         is_active: bool = True,
+        auth_generation: int = 1,
     ) -> UserModel:
-        if totp_secret_encrypted is not None:
-            if self._totp_envelopes is None:
-                raise ValueError(
-                    "TOTP protection key is required to authenticate a seed before persistence"
-                )
-            try:
-                self._totp_envelopes.authenticate(totp_secret_encrypted)
-            except ValueError as exc:
-                raise ValueError(
-                    f"invalid encrypted TOTP secret; {TOTP_ROTATION_INSTRUCTION}"
-                ) from exc
+        display_username, normalized_username = prepare_username(username)
+        self._authenticate_totp_envelope(totp_secret_encrypted)
+        if auth_generation < 1:
+            raise ValueError("auth generation must be positive")
         with self.session_factory.begin() as session:
             row = UserModel(
                 user_id=user_id,
-                username=username,
+                username=display_username,
+                normalized_username=normalized_username,
                 password_hash=password_hash,
                 role=role,
                 totp_secret_encrypted=totp_secret_encrypted,
                 is_active=is_active,
+                auth_generation=auth_generation,
             )
             session.add(row)
             session.flush()
             return row
+
+    def _authenticate_totp_envelope(self, encrypted: str | None) -> None:
+        if encrypted is None:
+            return
+        if self._totp_envelopes is None:
+            raise ValueError(
+                "TOTP protection key is required to authenticate a seed before persistence"
+            )
+        try:
+            self._totp_envelopes.authenticate(encrypted)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid encrypted TOTP secret; {TOTP_ROTATION_INSTRUCTION}"
+            ) from exc
+
+    @staticmethod
+    def _begin_auth_write(session: Session) -> None:
+        if session.get_bind().dialect.name == "sqlite":
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            session.begin()
+
+    @staticmethod
+    def _lock_sole_site(session: Session) -> str:
+        sites = list(
+            session.scalars(
+                select(SiteModel)
+                .order_by(SiteModel.site_id)
+                .with_for_update()
+            )
+        )
+        if len(sites) != 1:
+            raise SoleSiteRequiredError("auth lifecycle requires exactly one site")
+        return sites[0].site_id
+
+    @staticmethod
+    def _load_auth_user(
+        session: Session,
+        *,
+        user_id: str,
+        expected_auth_generation: int,
+    ) -> UserModel:
+        row = session.scalar(
+            select(UserModel)
+            .where(UserModel.user_id == user_id)
+            .with_for_update()
+        )
+        if row is None:
+            raise KeyError(f"unknown user: {user_id}")
+        if row.auth_generation != expected_auth_generation:
+            raise StaleAuthGenerationError(
+                expected=expected_auth_generation,
+                actual=row.auth_generation,
+            )
+        return row
+
+    @staticmethod
+    def _append_auth_audit(
+        session: Session,
+        *,
+        site_id: str,
+        actor_user_id: str | None,
+        action: str,
+        user_id: str,
+        payload: dict[str, Any],
+        occurred_at: datetime,
+    ) -> None:
+        session.add(
+            AuditEntryModel(
+                audit_id=str(uuid4()),
+                site_id=site_id,
+                occurred_at=occurred_at,
+                actor_user_id=actor_user_id,
+                action=action,
+                entity_type="user",
+                entity_id=user_id,
+                payload=payload,
+                idempotency_key=None,
+            )
+        )
+
+    @staticmethod
+    def _ensure_admin_survives(session: Session, row: UserModel, *, remains_admin: bool) -> None:
+        if row.role != "admin" or not row.is_active or remains_admin:
+            return
+        other_active_admins = session.scalar(
+            select(func.count())
+            .select_from(UserModel)
+            .where(
+                UserModel.user_id != row.user_id,
+                UserModel.role == "admin",
+                UserModel.is_active.is_(True),
+            )
+        )
+        if int(other_active_admins or 0) < 1:
+            raise LastActiveAdminError("at least one active admin is required")
+
+    def bootstrap_first_admin(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        password_hash: str,
+        totp_secret_encrypted: str,
+        occurred_at: datetime,
+    ) -> UserModel:
+        display_username, normalized_username = prepare_username(username)
+        self._authenticate_totp_envelope(totp_secret_encrypted)
+        with self.session_factory() as session:
+            self._begin_auth_write(session)
+            try:
+                site_id = self._lock_sole_site(session)
+                user_count = session.scalar(select(func.count()).select_from(UserModel))
+                if int(user_count or 0) != 0:
+                    raise BootstrapAlreadyCompletedError(
+                        "first-admin bootstrap requires an empty user table"
+                    )
+                row = UserModel(
+                    user_id=user_id,
+                    username=display_username,
+                    normalized_username=normalized_username,
+                    password_hash=password_hash,
+                    totp_secret_encrypted=totp_secret_encrypted,
+                    totp_last_accepted_counter=None,
+                    auth_generation=1,
+                    role="admin",
+                    is_active=True,
+                )
+                session.add(row)
+                self._append_auth_audit(
+                    session,
+                    site_id=site_id,
+                    actor_user_id=None,
+                    action="auth.first_admin_bootstrapped",
+                    user_id=user_id,
+                    payload={
+                        "role": "admin",
+                        "auth_generation": 1,
+                        "normalized_username_sha256": hashlib.sha256(
+                            normalized_username.encode()
+                        ).hexdigest(),
+                    },
+                    occurred_at=occurred_at,
+                )
+                session.flush()
+                session.commit()
+                return row
+            except BaseException:
+                session.rollback()
+                raise
+
+    def list_users(self) -> list[UserModel]:
+        with self.session_factory() as session:
+            sites = list(session.scalars(select(SiteModel.site_id)))
+            if len(sites) != 1:
+                raise SoleSiteRequiredError("auth lifecycle requires exactly one site")
+            return list(
+                session.scalars(
+                    select(UserModel).order_by(
+                        UserModel.normalized_username,
+                        UserModel.user_id,
+                    )
+                )
+            )
+
+    def create_user(
+        self,
+        *,
+        actor_user_id: str,
+        user_id: str,
+        username: str,
+        password_hash: str,
+        role: Literal["viewer", "operator", "admin"],
+        totp_secret_encrypted: str,
+        occurred_at: datetime,
+    ) -> UserModel:
+        display_username, normalized_username = prepare_username(username)
+        self._authenticate_totp_envelope(totp_secret_encrypted)
+        with self.session_factory() as session:
+            self._begin_auth_write(session)
+            try:
+                site_id = self._lock_sole_site(session)
+                row = UserModel(
+                    user_id=user_id,
+                    username=display_username,
+                    normalized_username=normalized_username,
+                    password_hash=password_hash,
+                    totp_secret_encrypted=totp_secret_encrypted,
+                    totp_last_accepted_counter=None,
+                    auth_generation=1,
+                    role=role,
+                    is_active=True,
+                )
+                session.add(row)
+                self._append_auth_audit(
+                    session,
+                    site_id=site_id,
+                    actor_user_id=actor_user_id,
+                    action="auth.user.created",
+                    user_id=user_id,
+                    payload={
+                        "role": role,
+                        "is_active": True,
+                        "auth_generation": 1,
+                        "normalized_username_sha256": hashlib.sha256(
+                            normalized_username.encode()
+                        ).hexdigest(),
+                    },
+                    occurred_at=occurred_at,
+                )
+                session.flush()
+                session.commit()
+                return row
+            except IntegrityError as exc:
+                session.rollback()
+                raise UsernameConflictError("username or user identity already exists") from exc
+            except BaseException:
+                session.rollback()
+                raise
+
+    def set_user_role(
+        self,
+        *,
+        actor_user_id: str,
+        user_id: str,
+        role: Literal["viewer", "operator", "admin"],
+        expected_auth_generation: int,
+        occurred_at: datetime,
+    ) -> UserModel:
+        return self._mutate_user(
+            actor_user_id=actor_user_id,
+            user_id=user_id,
+            expected_auth_generation=expected_auth_generation,
+            occurred_at=occurred_at,
+            action="auth.user.role_changed",
+            mutation=lambda row: self._set_role(row, role),
+        )
+
+    def set_user_active(
+        self,
+        *,
+        actor_user_id: str,
+        user_id: str,
+        is_active: bool,
+        expected_auth_generation: int,
+        occurred_at: datetime,
+    ) -> UserModel:
+        return self._mutate_user(
+            actor_user_id=actor_user_id,
+            user_id=user_id,
+            expected_auth_generation=expected_auth_generation,
+            occurred_at=occurred_at,
+            action="auth.user.active_changed",
+            mutation=lambda row: self._set_active(row, is_active),
+        )
+
+    def set_user_password(
+        self,
+        *,
+        actor_user_id: str,
+        user_id: str,
+        password_hash: str,
+        expected_auth_generation: int,
+        occurred_at: datetime,
+    ) -> UserModel:
+        if not password_hash:
+            raise ValueError("password hash must not be empty")
+        return self._mutate_user(
+            actor_user_id=actor_user_id,
+            user_id=user_id,
+            expected_auth_generation=expected_auth_generation,
+            occurred_at=occurred_at,
+            action="auth.user.password_changed",
+            mutation=lambda row: self._set_password(row, password_hash),
+        )
+
+    def reset_user_totp(
+        self,
+        *,
+        actor_user_id: str,
+        user_id: str,
+        totp_secret_encrypted: str,
+        expected_auth_generation: int,
+        occurred_at: datetime,
+    ) -> UserModel:
+        self._authenticate_totp_envelope(totp_secret_encrypted)
+        return self._mutate_user(
+            actor_user_id=actor_user_id,
+            user_id=user_id,
+            expected_auth_generation=expected_auth_generation,
+            occurred_at=occurred_at,
+            action="auth.user.totp_reset",
+            mutation=lambda row: self._set_totp(row, totp_secret_encrypted),
+        )
+
+    def revoke_user_sessions(
+        self,
+        *,
+        actor_user_id: str,
+        user_id: str,
+        expected_auth_generation: int,
+        occurred_at: datetime,
+    ) -> UserModel:
+        return self._mutate_user(
+            actor_user_id=actor_user_id,
+            user_id=user_id,
+            expected_auth_generation=expected_auth_generation,
+            occurred_at=occurred_at,
+            action="auth.user.sessions_revoked",
+            mutation=lambda row: {},
+        )
+
+    def _mutate_user(
+        self,
+        *,
+        actor_user_id: str,
+        user_id: str,
+        expected_auth_generation: int,
+        occurred_at: datetime,
+        action: str,
+        mutation: Callable[[UserModel], dict[str, Any]],
+    ) -> UserModel:
+        if expected_auth_generation < 1:
+            raise ValueError("expected auth generation must be positive")
+        with self.session_factory() as session:
+            self._begin_auth_write(session)
+            try:
+                site_id = self._lock_sole_site(session)
+                row = self._load_auth_user(
+                    session,
+                    user_id=user_id,
+                    expected_auth_generation=expected_auth_generation,
+                )
+                payload = mutation(row)
+                row.auth_generation += 1
+                payload["auth_generation"] = row.auth_generation
+                self._append_auth_audit(
+                    session,
+                    site_id=site_id,
+                    actor_user_id=actor_user_id,
+                    action=action,
+                    user_id=user_id,
+                    payload=payload,
+                    occurred_at=occurred_at,
+                )
+                session.flush()
+                session.commit()
+                return row
+            except BaseException:
+                session.rollback()
+                raise
+
+    def _set_role(
+        self,
+        row: UserModel,
+        role: Literal["viewer", "operator", "admin"],
+    ) -> dict[str, Any]:
+        self._ensure_admin_survives(
+            object_session(row),
+            row,
+            remains_admin=role == "admin",
+        )
+        previous = row.role
+        row.role = role
+        return {"from_role": previous, "to_role": role}
+
+    def _set_active(self, row: UserModel, is_active: bool) -> dict[str, Any]:
+        self._ensure_admin_survives(
+            object_session(row),
+            row,
+            remains_admin=is_active,
+        )
+        previous = row.is_active
+        row.is_active = is_active
+        return {"from_active": previous, "to_active": is_active}
+
+    @staticmethod
+    def _set_password(row: UserModel, password_hash: str) -> dict[str, Any]:
+        row.password_hash = password_hash
+        return {}
+
+    @staticmethod
+    def _set_totp(row: UserModel, encrypted: str) -> dict[str, Any]:
+        row.totp_secret_encrypted = encrypted
+        row.totp_last_accepted_counter = None
+        return {}
 
     def accept_totp_counter(
         self,

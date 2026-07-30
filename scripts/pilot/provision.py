@@ -40,8 +40,14 @@ def main() -> int:
     parser.add_argument("--runtime-manifest-sha256", required=True)
     parser.add_argument("--measured-capacity-report", type=Path, required=True)
     parser.add_argument("--measured-capacity-sha256", required=True)
+    parser.add_argument("--measured-capacity-signature", type=Path, required=True)
+    parser.add_argument("--capacity-authority-public-key", type=Path, required=True)
+    parser.add_argument("--runtime-image-id-sha256", required=True)
+    parser.add_argument("--runtime-image-config-sha256", required=True)
+    parser.add_argument("--runtime-code-sha256", required=True)
+    parser.add_argument("--mount-contract-sha256", required=True)
     arguments = parser.parse_args()
-    site_config, runtime_manifest, _ = load_reviewed_inputs(
+    site_config, runtime_manifest, _, _ = load_reviewed_inputs(
         site_id=arguments.site_id,
         site_config_path=arguments.site_config,
         site_config_sha256=arguments.site_config_sha256,
@@ -49,6 +55,14 @@ def main() -> int:
         runtime_manifest_sha256=arguments.runtime_manifest_sha256,
         measured_capacity_path=arguments.measured_capacity_report,
         measured_capacity_sha256=arguments.measured_capacity_sha256,
+        measured_capacity_signature_path=arguments.measured_capacity_signature,
+        capacity_authority_public_key_path=(
+            arguments.capacity_authority_public_key
+        ),
+        runtime_image_id_sha256=arguments.runtime_image_id_sha256,
+        runtime_image_config_sha256=arguments.runtime_image_config_sha256,
+        runtime_code_sha256=arguments.runtime_code_sha256,
+        mount_contract_sha256=arguments.mount_contract_sha256,
     )
     engine = create_engine(_read_secret(arguments.database_url_secret))
     try:

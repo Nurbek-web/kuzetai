@@ -31,6 +31,7 @@ export PILOT_RUNTIME_IMAGE=kuzet-pilot-runtime:review
 docker build \
   --platform linux/amd64 \
   --file deploy/pilot/Dockerfile.runtime \
+  --build-arg KUZET_RUNTIME_CODE_SHA256="$PILOT_RUNTIME_CODE_SHA256" \
   --tag "$PILOT_RUNTIME_IMAGE" \
   .
 export PILOT_RUNTIME_IMAGE_ID="$(
@@ -54,11 +55,17 @@ export PILOT_CAMERA_LAN_NETWORK=kuzet-camera-lan
 export PILOT_SITE_CONFIG=/srv/kuzet/reviewed/site.yaml
 export PILOT_RUNTIME_MANIFEST=/srv/kuzet/reviewed/runtime-manifest.yaml
 export PILOT_CAPACITY_REPORT=/srv/kuzet/reviewed/measured-capacity.yaml
+export PILOT_CAPACITY_SIGNATURE=/srv/kuzet/reviewed/measured-capacity.sig
+export PILOT_CAPACITY_AUTHORITY_PUBLIC_KEY=/srv/kuzet/reviewed/capacity-authority.pem
 export PILOT_MOUNT_CONTRACT=/srv/kuzet/reviewed/runtime-mount-contract.yaml
 export PILOT_SITE_CONFIG_SHA256=REPLACE_WITH_64_HEX
 export PILOT_RUNTIME_MANIFEST_SHA256=REPLACE_WITH_64_HEX
 export PILOT_MEASURED_CAPACITY_SHA256=REPLACE_WITH_64_HEX
 export PILOT_MOUNT_CONTRACT_SHA256=REPLACE_WITH_64_HEX
+export PILOT_RUNTIME_CODE_SHA256=REPLACE_WITH_64_HEX
+export PILOT_RUNTIME_IMAGE_CONFIG_SHA256=REPLACE_WITH_64_HEX
+export PILOT_GPU_UUID=GPU-REPLACE_WITH_REVIEWED_UUID
+export PILOT_RUNTIME_LAUNCH_NONCE=REPLACE_WITH_32_LOWER_HEX
 
 # The validator reads only bounded regular files and emits one safe argv item
 # per line. It hashes model/engine/config sources, verifies the captured image
@@ -71,16 +78,18 @@ mapfile -t PILOT_RUNTIME_MOUNT_ARGV < <(
     --runtime-manifest-sha256 "$PILOT_RUNTIME_MANIFEST_SHA256" \
     --measured-capacity-report "$PILOT_CAPACITY_REPORT" \
     --measured-capacity-sha256 "$PILOT_MEASURED_CAPACITY_SHA256" \
+    --measured-capacity-signature "$PILOT_CAPACITY_SIGNATURE" \
+    --capacity-authority-public-key "$PILOT_CAPACITY_AUTHORITY_PUBLIC_KEY" \
     --mount-contract "$PILOT_MOUNT_CONTRACT" \
     --mount-contract-sha256 "$PILOT_MOUNT_CONTRACT_SHA256" \
     --image-id "$PILOT_RUNTIME_IMAGE_ID"
 )
-test "${#PILOT_RUNTIME_MOUNT_ARGV[@]}" -eq 56
+test "${#PILOT_RUNTIME_MOUNT_ARGV[@]}" -eq 60
 
 runtime_id=$(
   docker create \
     --name kuzet-pilot-runtime-acceptance \
-    --gpus all \
+    --gpus "device=$PILOT_GPU_UUID,capabilities=compute,utility,video" \
     --read-only \
     --cap-drop ALL \
     --security-opt no-new-privileges:true \
@@ -96,6 +105,13 @@ runtime_id=$(
     --runtime-manifest-sha256 "$PILOT_RUNTIME_MANIFEST_SHA256" \
     --measured-capacity-report /run/config/measured-capacity.yaml \
     --measured-capacity-sha256 "$PILOT_MEASURED_CAPACITY_SHA256" \
+    --measured-capacity-signature /run/config/measured-capacity.sig \
+    --capacity-authority-public-key /run/config/capacity-authority.pem \
+    --runtime-image-id-sha256 "${PILOT_RUNTIME_IMAGE_ID#sha256:}" \
+    --runtime-image-config-sha256 "$PILOT_RUNTIME_IMAGE_CONFIG_SHA256" \
+    --runtime-code-sha256 "$PILOT_RUNTIME_CODE_SHA256" \
+    --mount-contract-sha256 "$PILOT_MOUNT_CONTRACT_SHA256" \
+    --runtime-launch-nonce "$PILOT_RUNTIME_LAUNCH_NONCE" \
     --control-plane-url http://api:8000 \
     --machine-token-file /run/secrets/machine_token
 )

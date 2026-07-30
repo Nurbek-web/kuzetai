@@ -18,9 +18,11 @@ from protector.pilot.config import (
 def _feed(number: int) -> dict[str, object]:
     return {
         "camera_id": f"camera-{number:02d}",
+        "source_index": number - 1,
         "rtsp_url": {"environment": f"PILOT_CAMERA_{number:02d}_RTSP_URL"},
         "codec": "h264",
         "resolution": {"width": 1920, "height": 1080},
+        "fps": 25.0,
         "bitrate_kbps": 2_000,
         "analytics_hz": {"person": 10.0, "fire_smoke": 1.0, "weapon": 1.0},
     }
@@ -81,6 +83,12 @@ def test_site_requires_exactly_twenty_unique_camera_ids():
     duplicate["ready_to_start"]["feeds"][19]["camera_id"] = "camera-01"
     with pytest.raises(ValidationError):
         SiteConfig.model_validate(duplicate)
+
+    reordered = _site_payload()
+    reordered["ready_to_start"]["feeds"][0]["source_index"] = 1
+    reordered["ready_to_start"]["feeds"][1]["source_index"] = 0
+    with pytest.raises(ValidationError):
+        SiteConfig.model_validate(reordered)
 
 
 @pytest.mark.parametrize("codec", ["h264", "h265"])

@@ -1,0 +1,54 @@
+{
+  "schema_version": "acceptance-v1-golden-fixture-manifest.v1",
+  "source_commit": "400fe18",
+  "source_commit_full": "400fe18f739db96d535dba6b729284c4d206f5e6",
+  "historical_generator": "scripts/pilot/acceptance_report.py",
+  "historical_report_schema": "acceptance-report.v1",
+  "historical_envelope_schema": "signed-acceptance-envelope.v1",
+  "historical_verification_schema": "acceptance-verification.v1",
+  "input_provenance": {
+    "factory": "tests/pilot/test_acceptance_report.py::_manifest + _run",
+    "retained": false,
+    "description": "The deterministic passing 72-hour target record and its 20 minimal lawful local fixtures were created only inside the isolated archive workspace."
+  },
+  "signing": {
+    "algorithm": "Ed25519",
+    "public_key_file": "public-key.pem",
+    "public_key_sha256": "917144a9280af6fffbdde1a92c0d9c6a291036d2a7f1b0d853bcf9fe060b86c5",
+    "public_key_sha256_semantics": "SHA-256 of the exact raw PEM file bytes, matching the historical V1 verifier.",
+    "secret_key_retained": false
+  },
+  "artifacts": [
+    {
+      "file": "acceptance-report.html",
+      "bytes": 1380,
+      "sha256": "a24b26e0dad8b5bc3f66c0b5a7649779c13e5496344c45fd6904000933668bf0"
+    },
+    {
+      "file": "acceptance-report.json",
+      "bytes": 1765,
+      "sha256": "d3e82dec3a2dc97d271fea4579e2d3dbbfe99af1dd33cbcbc525eabcf7ad0c34"
+    },
+    {
+      "file": "acceptance-report.sig",
+      "bytes": 64,
+      "sha256": "ba7ee0b378e18e1e68bed42be4143bb8a39fa8e4fb85a428804071f5ed8f408c"
+    },
+    {
+      "file": "acceptance-verification.json",
+      "bytes": 437,
+      "sha256": "897490149d9be4c1512c00594ba5b38ed84bd5bb76367b46d4401737d4c75083"
+    },
+    {
+      "file": "public-key.pem",
+      "bytes": 113,
+      "sha256": "917144a9280af6fffbdde1a92c0d9c6a291036d2a7f1b0d853bcf9fe060b86c5"
+    }
+  ],
+  "artifact_hash_scope": "Every retained golden verification artifact is listed above. This manifest is descriptive metadata and is intentionally excluded from its own non-recursive hash table.",
+  "generation_isolation": {
+    "source_material": "git archive 400fe18",
+    "archive_workspace_retained": false,
+    "secret_key_retained": false
+  }
+}

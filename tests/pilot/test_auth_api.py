@@ -18,6 +18,7 @@ UTC = timezone.utc
 NOW = datetime(2026, 7, 22, 8, 0, tzinfo=UTC)
 SESSION_SECRET = "test-session-signing-key-that-is-never-returned"
 MACHINE_TOKEN = "test-machine-token-that-is-never-returned"
+ACCEPTANCE_TOKEN = "test-acceptance-token-that-is-never-returned"
 TOTP_KEY = base64.urlsafe_b64encode(b"t" * 32).decode()
 
 
@@ -263,3 +264,40 @@ def test_viewer_cannot_review_and_browser_session_cannot_ingest_internal_data(
 
     assert review.status_code == 403
     assert client.post("/api/internal/observations", json={}).status_code == 401
+
+
+def test_acceptance_collector_route_is_absent_from_main_api(
+    auth_context: tuple[TestClient, PilotRepository, dict[str, str]],
+) -> None:
+    client, _, _ = auth_context
+    response = client.post(
+        "/api/internal/acceptance/start",
+        headers={"Authorization": f"Bearer {ACCEPTANCE_TOKEN}"},
+        json={
+            "schema_version": "acceptance-collector-start.v1",
+            "collector_id": "collector-test",
+            "site_id": "school-01",
+            "manifest_sha256": "a" * 64,
+            "gate": "8h",
+            "launch_attestation_sha256": "b" * 64,
+            "fault_schedule_sha256": "c" * 64,
+        },
+    )
+
+    assert response.status_code == 404
+    assert (
+        client.post(
+            "/api/internal/acceptance/start",
+            headers={"Authorization": f"Bearer {MACHINE_TOKEN}"},
+            json={},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            "/api/internal/observations",
+            headers={"Authorization": f"Bearer {ACCEPTANCE_TOKEN}"},
+            json={},
+        ).status_code
+        == 401
+    )

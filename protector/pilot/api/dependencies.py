@@ -108,6 +108,7 @@ def get_current_session(
             or not user.is_active
             or user.username != current.user.username
             or user.role != current.user.role
+            or user.auth_generation != current.user.auth_generation
         ):
             context.sessions.revoke(token)
             raise HTTPException(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import time
+import unicodedata
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,6 +19,21 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from protector.pilot.totp_envelope import TotpEnvelopeProtector
 
 Role = Literal["viewer", "operator", "admin"]
+
+
+def prepare_username(username: str) -> tuple[str, str]:
+    """Return the display and durable identity forms for one username."""
+    display = unicodedata.normalize("NFKC", username).strip()
+    normalized = display.casefold()
+    if not display or not normalized:
+        raise ValueError("username must not be empty")
+    if len(display) > 255 or len(normalized) > 255:
+        raise ValueError("username must contain at most 255 characters")
+    return display, normalized
+
+
+def normalize_username(username: str) -> str:
+    return prepare_username(username)[1]
 
 
 @dataclass(frozen=True)
@@ -59,9 +75,7 @@ class TotpService:
         self._envelopes = TotpEnvelopeProtector(encryption_key)
 
     def enrol(self, username: str) -> TotpEnrolment:
-        normalized = username.strip()
-        if not normalized:
-            raise ValueError("username must not be empty")
+        normalized, _ = prepare_username(username)
         secret = pyotp.random_base32()
         uri = pyotp.TOTP(secret).provisioning_uri(name=normalized, issuer_name=self._issuer)
         return TotpEnrolment(secret=secret, provisioning_uri=uri)
@@ -90,11 +104,13 @@ class TotpService:
             return None
         return int(totp.timecode(checked_at))
 
+
 @dataclass(frozen=True)
 class SessionUser:
     user_id: str
     username: str
     role: Role
+    auth_generation: int = 1
 
 
 @dataclass(frozen=True)
@@ -176,6 +192,16 @@ class SessionManager:
             with self._lock:
                 self._sessions.pop(session_id, None)
 
+    def revoke_user(self, user_id: str) -> None:
+        with self._lock:
+            revoked = [
+                session_id
+                for session_id, session in self._sessions.items()
+                if session.user.user_id == user_id
+            ]
+            for session_id in revoked:
+                self._sessions.pop(session_id, None)
+
     def _purge_expired(self, now: float) -> None:
         expired = [
             session_id
@@ -220,8 +246,12 @@ class LoginThrottle:
     def admit_attempt(self, username: str, client_context: str) -> bool:
         """Atomically reserve one attempt, failing closed at either limit or capacity."""
         now = time.monotonic()
+        try:
+            account_identity = normalize_username(username)
+        except ValueError:
+            account_identity = ""
         keys = (
-            (("account", username.strip().casefold()), self.max_attempts),
+            (("account", account_identity), self.max_attempts),
             (("client", client_context), self.client_max_attempts),
         )
         with self._lock:
@@ -247,8 +277,12 @@ class LoginThrottle:
 
     def record_success(self, username: str) -> None:
         """Clear the account bucket; client pressure remains independent."""
+        try:
+            account_identity = normalize_username(username)
+        except ValueError:
+            account_identity = ""
         with self._lock:
-            self._entries.pop(("account", username.strip().casefold()), None)
+            self._entries.pop(("account", account_identity), None)
 
     def _trim(self, entry: _ThrottleEntry, now: float) -> None:
         cutoff = now - self.window_seconds

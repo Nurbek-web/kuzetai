@@ -30,7 +30,17 @@ RUN command -v age >/dev/null && command -v openssl >/dev/null
 RUN groupadd --gid 10001 kuzet \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent kuzet \
     && mkdir -p /run/kuzet/health \
-    && chown -R 10001:10001 /run/kuzet
+    && chown -R 10001:10001 /run/kuzet \
+    && install -d -o root -g root -m 0755 /run/config/acceptance \
+    && install -d -o root -g root -m 0755 /run/keys/acceptance \
+    && install -d -o root -g root -m 0755 /var/lib/kuzet/acceptance \
+    && install -d -o 10001 -g 10001 -m 0700 /var/lib/kuzet/acceptance-proofs \
+    && install -o root -g root -m 0400 /dev/null \
+      /var/lib/kuzet/acceptance/authority.sqlite3 \
+    && install -o root -g root -m 0400 /dev/null \
+      /var/lib/kuzet/acceptance/authority.sqlite3-wal \
+    && install -o root -g root -m 0400 /dev/null \
+      /var/lib/kuzet/acceptance/authority.sqlite3-shm
 
 USER 10001:10001
 EXPOSE 8000

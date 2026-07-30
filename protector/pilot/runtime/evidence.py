@@ -1059,6 +1059,7 @@ class _WriterBinding:
     codec: Codec
     incoming_directory: Path
     stream_epoch: str | None = None
+    cleanup_pending: bool = False
 
 
 class SplitMuxEvidenceSinkFactory:
@@ -1082,45 +1083,75 @@ class SplitMuxEvidenceSinkFactory:
         self._packet_probe = packet_probe or self._probe_first_packet_keyframe
         self._opened: dict[tuple[str, Path], _OpenedSplitMuxFragment] = {}
         self._writers: dict[int, _WriterBinding] = {}
+        self._pending_construction_cleanup: dict[str, Path] = {}
+        self._constructing_cameras: set[str] = set()
         self._lock = threading.RLock()
 
     def __call__(self, gst: object, source: object) -> object:
         camera_id = str(getattr(source, "camera_id"))
         source_id = int(getattr(source, "source_id"))
         codec = getattr(source, "codec")
-        self.ring.reserve_staging(camera_id, self.max_fragment_bytes)
-        writer_generation = uuid4().hex
-        spec = gstreamer_splitmux_sink_spec(
-            spool_root=self.ring.root,
-            camera_id=camera_id,
-            codec=codec,
-            fragment_seconds=self.fragment_seconds,
-            max_fragment_bytes=self.max_fragment_bytes,
-            ring_seconds=self.ring.ring_seconds,
-            max_camera_bytes=self.ring.max_camera_bytes,
-            writer_generation=writer_generation,
-        )
+        self._begin_construction(camera_id)
         try:
-            location = Path(spec.properties["location"])
-            location.parent.mkdir(parents=True, exist_ok=True)
-            sink = gst.ElementFactory.make(spec.factory, f"evidence-writer-{source_id}")  # type: ignore[attr-defined]
-            if sink is None:
-                raise RuntimeError("required GStreamer splitmuxsink is unavailable")
-            for name, value in spec.properties.items():
-                sink.set_property(name, str(value) if name == "location" else value)
-            with self._lock:
-                self._writers[id(sink)] = _WriterBinding(
+            self._retry_pending_construction_cleanup(camera_id)
+            self.ring.reserve_staging(camera_id, self.max_fragment_bytes)
+            try:
+                writer_generation = uuid4().hex
+                spec = gstreamer_splitmux_sink_spec(
+                    spool_root=self.ring.root,
                     camera_id=camera_id,
                     codec=codec,
-                    incoming_directory=location.parent,
+                    fragment_seconds=self.fragment_seconds,
+                    max_fragment_bytes=self.max_fragment_bytes,
+                    ring_seconds=self.ring.ring_seconds,
+                    max_camera_bytes=self.ring.max_camera_bytes,
+                    writer_generation=writer_generation,
                 )
-            return sink
-        except BaseException:
-            self.ring.release_staging(camera_id)
-            raise
+                location = Path(spec.properties["location"])
+                with self._lock:
+                    if camera_id in self._pending_construction_cleanup:
+                        raise RuntimeError(
+                            f"camera {camera_id} already owns pending writer cleanup"
+                        )
+                    self._pending_construction_cleanup[camera_id] = location.parent
+                location.parent.mkdir(parents=True, exist_ok=True)
+                sink = gst.ElementFactory.make(spec.factory, f"evidence-writer-{source_id}")  # type: ignore[attr-defined]
+                if sink is None:
+                    raise RuntimeError("required GStreamer splitmuxsink is unavailable")
+                for name, value in spec.properties.items():
+                    sink.set_property(name, str(value) if name == "location" else value)
+                with self._lock:
+                    if (
+                        self._pending_construction_cleanup.get(camera_id)
+                        != location.parent
+                    ):
+                        raise RuntimeError(
+                            f"camera {camera_id} lost pending writer cleanup ownership"
+                        )
+                    self._writers[id(sink)] = _WriterBinding(
+                        camera_id=camera_id,
+                        codec=codec,
+                        incoming_directory=location.parent,
+                    )
+                    self._pending_construction_cleanup.pop(camera_id, None)
+                return sink
+            except BaseException as primary_error:
+                cleanup_error: BaseException | None = None
+                try:
+                    self._retry_pending_construction_cleanup(camera_id)
+                except BaseException as exc:
+                    cleanup_error = exc
+                if cleanup_error is None:
+                    self._release_staging_if_unowned(camera_id)
+                else:
+                    raise primary_error from cleanup_error
+                raise
+        finally:
+            self._end_construction(camera_id)
 
     def disable(self, camera_id: str) -> None:
         """Release the open-fragment reservation after the writer is stopped."""
+        self._retry_pending_construction_cleanup(camera_id)
         self.reset_camera(camera_id)
         with self._lock:
             writer_ids = [
@@ -1148,6 +1179,8 @@ class SplitMuxEvidenceSinkFactory:
             binding = self._writers.get(id(writer))
             if binding is None:
                 raise ValueError("evidence writer was not created by this factory")
+            if binding.cleanup_pending:
+                raise ValueError("evidence writer cleanup is already pending")
             self._writers[id(writer)] = _WriterBinding(
                 camera_id=binding.camera_id,
                 codec=binding.codec,
@@ -1158,24 +1191,78 @@ class SplitMuxEvidenceSinkFactory:
     def unbind_writer(self, writer: object) -> None:
         self._unbind_writer_id(id(writer))
 
+    def _retry_pending_construction_cleanup(self, camera_id: str) -> None:
+        with self._lock:
+            incoming_directory = self._pending_construction_cleanup.get(camera_id)
+        if incoming_directory is None:
+            return
+        if incoming_directory.exists():
+            shutil.rmtree(incoming_directory)
+        if incoming_directory.parent.exists():
+            _fsync_directory(incoming_directory.parent)
+        with self._lock:
+            if self._pending_construction_cleanup.get(camera_id) != incoming_directory:
+                return
+            has_writer = any(
+                binding.camera_id == camera_id for binding in self._writers.values()
+            )
+            if not has_writer:
+                self.ring.release_staging(camera_id)
+            self._pending_construction_cleanup.pop(camera_id, None)
+
+    def _begin_construction(self, camera_id: str) -> None:
+        with self._lock:
+            if camera_id in self._constructing_cameras:
+                raise RuntimeError(
+                    f"camera {camera_id} writer construction is already in progress"
+                )
+            self._constructing_cameras.add(camera_id)
+
+    def _end_construction(self, camera_id: str) -> None:
+        with self._lock:
+            self._constructing_cameras.discard(camera_id)
+
+    def _release_staging_if_unowned(self, camera_id: str) -> None:
+        with self._lock:
+            has_owner = camera_id in self._pending_construction_cleanup or any(
+                binding.camera_id == camera_id for binding in self._writers.values()
+            )
+            if not has_owner:
+                self.ring.release_staging(camera_id)
+
     def _unbind_writer_id(self, writer_id: int) -> None:
         with self._lock:
-            binding = self._writers.pop(writer_id, None)
+            binding = self._writers.get(writer_id)
             if binding is None:
                 return
+            if not binding.cleanup_pending:
+                binding = _WriterBinding(
+                    camera_id=binding.camera_id,
+                    codec=binding.codec,
+                    incoming_directory=binding.incoming_directory,
+                    stream_epoch=binding.stream_epoch,
+                    cleanup_pending=True,
+                )
+                self._writers[writer_id] = binding
             self._opened = {
                 key: opened
                 for key, opened in self._opened.items()
                 if not opened.location.is_relative_to(binding.incoming_directory)
             }
-            has_replacement = any(
-                item.camera_id == binding.camera_id for item in self._writers.values()
-            )
         if binding.incoming_directory.exists():
             shutil.rmtree(binding.incoming_directory)
-            _fsync_directory(binding.incoming_directory.parent)
-        if not has_replacement:
-            self.ring.release_staging(binding.camera_id)
+        _fsync_directory(binding.incoming_directory.parent)
+        with self._lock:
+            current = self._writers.get(writer_id)
+            if current is not binding:
+                return
+            has_replacement = any(
+                other_id != writer_id and item.camera_id == binding.camera_id
+                for other_id, item in self._writers.items()
+            )
+            if not has_replacement:
+                self.ring.release_staging(binding.camera_id)
+            self._writers.pop(writer_id, None)
 
     def handle_writer_message(
         self,
@@ -1186,7 +1273,7 @@ class SplitMuxEvidenceSinkFactory:
     ) -> EncodedFragment | None:
         with self._lock:
             binding = self._writers.get(id(writer))
-        if binding is None:
+        if binding is None or binding.cleanup_pending:
             # Delayed messages from a stopped/rebuilt writer are stale by
             # construction and must never inherit a replacement's epoch.
             return None

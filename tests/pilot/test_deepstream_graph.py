@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -60,6 +62,7 @@ from protector.pilot.runtime.mount_contract import (
     RuntimeMountContractV1,
     validate_runtime_mount_contract,
 )
+from protector.pilot.runtime.source_probe import CorrelatedNtpV1
 from protector.pilot.runtime.supervisor import CameraSupervisor
 
 
@@ -67,9 +70,11 @@ def _site(*, feed_count: int = 20) -> SiteConfig:
     feeds = tuple(
         CameraFeed(
             camera_id=f"camera-{number:02d}",
+            source_index=number - 1,
             rtsp_url=SecretReference(environment=f"PILOT_CAMERA_{number:02d}_RTSP"),
             codec="h264" if number % 2 else "h265",
             resolution=Resolution(width=1920, height=1080),
+            fps=25.0,
             bitrate_kbps=2048,
             analytics_hz={"person": 5.0, "fire_smoke": 1.0, "weapon": 1.0},
         )
@@ -144,9 +149,7 @@ def _manifest() -> RuntimeModelManifestV1:
         capacity_report=CapacityReportV1(
             schema_version="capacity-report.v1", stream_count=20, **report
         ),
-        shadow_stage_report=ShadowStageReportV1(
-            schema_version="shadow-stage-report.v1", **report
-        ),
+        shadow_stage_report=ShadowStageReportV1(schema_version="shadow-stage-report.v1", **report),
     )
 
 
@@ -336,9 +339,16 @@ def test_pre_evidence_source_branch_has_nonblocking_discard_placeholder() -> Non
 
 def test_encoded_writer_replaces_discard_only_after_factory_succeeds() -> None:
     class Element:
-        def __init__(self, factory: str, name: str) -> None:
+        def __init__(
+            self,
+            factory: str,
+            name: str,
+            *,
+            link_result: bool = True,
+        ) -> None:
             self.factory = factory
             self.name = name
+            self.link_result = link_result
             self.properties: dict[str, object] = {}
             self.links: list[Element] = []
 
@@ -350,7 +360,7 @@ def test_encoded_writer_replaces_discard_only_after_factory_succeeds() -> None:
 
         def link(self, other: Element) -> bool:
             self.links.append(other)
-            return True
+            return self.link_result
 
         def get_static_pad(self, name: str) -> tuple[str, str]:
             return self.name, name
@@ -424,6 +434,101 @@ def test_encoded_writer_replaces_discard_only_after_factory_succeeds() -> None:
     discard = development_runtime._build_source_bin(Gst, source, "rtsp://redacted")
     assert discard.elements["evidence-0"].links == [discard.elements["evidence-discard-0"]]
 
+    class FailingGst(Gst):
+        class ElementFactory:
+            @staticmethod
+            def make(factory: str, name: str) -> Element:
+                return Element(factory, name, link_result=name != "decode-0")
+
+    class RecordingWriterFactory:
+        def __init__(self) -> None:
+            self.writer = Element("splitmuxsink", "evidence-writer-0")
+            self.unbound: list[Element] = []
+            self.disabled: list[str] = []
+
+        def __call__(self, _: object, __: object) -> Element:
+            return self.writer
+
+        def unbind_writer(self, writer: Element) -> None:
+            self.unbound.append(writer)
+
+        def disable(self, camera_id: str) -> None:
+            self.disabled.append(camera_id)
+
+    recording_factory = RecordingWriterFactory()
+    failed_generation = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        evidence_sink_factory=recording_factory,
+    )
+    with pytest.raises(RuntimeError, match="evidence/NVDEC"):
+        failed_generation._build_source_bin(
+            FailingGst,
+            source,
+            "rtsp://redacted",
+        )
+
+    assert recording_factory.unbound == [recording_factory.writer]
+    assert recording_factory.disabled == []
+
+    for retry_via in ("rebuild", "stop"):
+
+        class RetryingWriterFactory:
+            def __init__(self) -> None:
+                self.writer = Element("splitmuxsink", "evidence-writer-0")
+                self.unbind_attempts: list[Element] = []
+                self.disabled: list[str] = []
+
+            def __call__(self, _: object, __: object) -> Element:
+                return self.writer
+
+            def unbind_writer(self, writer: Element) -> None:
+                self.unbind_attempts.append(writer)
+                if len(self.unbind_attempts) == 1:
+                    raise RuntimeError("transient writer cleanup failure")
+
+            def disable(self, camera_id: str) -> None:
+                self.disabled.append(camera_id)
+
+        retrying_factory = RetryingWriterFactory()
+        retrying_runtime = DeepStreamDataPlane(
+            runtime_manifest=_manifest(),
+            runtime_info=lambda: ("8.9", "10.16.0.72"),
+            evidence_sink_factory=retrying_factory,
+        )
+        with pytest.raises(RuntimeError, match="evidence/NVDEC"):
+            retrying_runtime._build_source_bin(
+                FailingGst,
+                source,
+                "rtsp://redacted",
+            )
+        assert retrying_factory.unbind_attempts == [retrying_factory.writer]
+
+        healthy_writer = Element("splitmuxsink", "healthy-old-writer")
+        if retry_via == "rebuild":
+            retrying_runtime._active_source_generations[source.camera_id] = (
+                deepstream_module._SourceGeneration(
+                    camera_id=source.camera_id,
+                    source_id=source.source_id,
+                    ordinal=1,
+                    source_bin=object(),
+                    writer=healthy_writer,
+                    lease=object(),  # type: ignore[arg-type]
+                    lifecycle="authorized",
+                    _writer_bound=True,
+                )
+            )
+            retrying_runtime._retry_pending_generation_cleanup(source.camera_id)
+        else:
+            retrying_runtime.stop()
+
+        assert retrying_factory.unbind_attempts == [
+            retrying_factory.writer,
+            retrying_factory.writer,
+        ]
+        assert healthy_writer not in retrying_factory.unbind_attempts
+        assert retrying_factory.disabled == []
+
 
 def test_rtsp_dynamic_pad_accepts_only_matching_video_rtp_caps() -> None:
     assert should_link_rtsp_video_pad(
@@ -454,9 +559,433 @@ def test_rtsp_caps_reader_ignores_missing_empty_and_structureless_caps() -> None
     assert rtsp_caps_fields(MissingStructureCaps()) is None
 
 
+def test_native_source_generation_wires_only_observed_gstreamer_primitives() -> None:
+    observed_times = iter((101, 102, 103, 104, 105))
+
+    class Lease:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+            self.close_calls = 0
+            self.last_ntp_observed_monotonic_ns: int | None = None
+
+        def observe_rtp_caps(self, codec: str, observed_monotonic_ns: int) -> bool:
+            self.calls.append(("rtp", codec, observed_monotonic_ns))
+            return True
+
+        def observe_decoder_caps(
+            self,
+            width: int,
+            height: int,
+            fps_numerator: int,
+            fps_denominator: int,
+            observed_monotonic_ns: int,
+        ) -> bool:
+            self.calls.append(
+                (
+                    "decoder_caps",
+                    width,
+                    height,
+                    fps_numerator,
+                    fps_denominator,
+                    observed_monotonic_ns,
+                )
+            )
+            return True
+
+        def observe_parser_buffer(
+            self,
+            byte_size: int,
+            source_timestamp_ns: int,
+            pts_ns: int,
+            observed_monotonic_ns: int,
+        ) -> bool:
+            self.calls.append(
+                (
+                    "parser",
+                    byte_size,
+                    source_timestamp_ns,
+                    pts_ns,
+                    observed_monotonic_ns,
+                )
+            )
+            return True
+
+        def observe_decoded_buffer(
+            self,
+            pts_ns: int,
+            observed_monotonic_ns: int,
+        ) -> bool:
+            self.calls.append(("decoded", pts_ns, observed_monotonic_ns))
+            return True
+
+        def observe_nvds_ntp(
+            self,
+            pts_ns: int,
+            source_ntp_ns: int,
+            observed_monotonic_ns: int,
+        ) -> bool:
+            self.calls.append(("ntp", pts_ns, source_ntp_ns, observed_monotonic_ns))
+            self.last_ntp_observed_monotonic_ns = observed_monotonic_ns
+            return True
+
+        def correlated_ntp(
+            self,
+            pts_ns: int,
+            source_ntp_ns: int,
+        ) -> CorrelatedNtpV1 | None:
+            if self.last_ntp_observed_monotonic_ns is None:
+                return None
+            return CorrelatedNtpV1(
+                pts_ns=pts_ns,
+                source_ntp_ns=source_ntp_ns,
+                parser_observed_monotonic_ns=self.last_ntp_observed_monotonic_ns,
+                decoded_observed_monotonic_ns=self.last_ntp_observed_monotonic_ns,
+                ntp_observed_monotonic_ns=self.last_ntp_observed_monotonic_ns,
+                completed_monotonic_ns=self.last_ntp_observed_monotonic_ns,
+            )
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class LeaseFactory:
+        def __init__(self, lease: Lease) -> None:
+            self.lease = lease
+            self.acquisitions: list[tuple[str, int]] = []
+
+        def acquire(self, camera_id: str, source_id: int) -> Lease:
+            self.acquisitions.append((camera_id, source_id))
+            return self.lease
+
+    class Structure:
+        def __init__(self, name: str, values: dict[str, object]) -> None:
+            self._name = name
+            self._values = values
+
+        def get_name(self) -> str:
+            return self._name
+
+        def get_string(self, name: str) -> str | None:
+            value = self._values.get(name)
+            return value if isinstance(value, str) else None
+
+        def get_value(self, name: str) -> object:
+            return self._values[name]
+
+    class Caps:
+        def __init__(self, structure: Structure) -> None:
+            self.structure = structure
+
+        def get_size(self) -> int:
+            return 1
+
+        def get_structure(self, _: int) -> Structure:
+            return self.structure
+
+    class Pad:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.probes: list[tuple[object, object, tuple[object, ...]]] = []
+            self.current_caps: Caps | None = None
+            self.linked = False
+
+        def add_probe(
+            self,
+            probe_type: object,
+            callback: object,
+            *arguments: object,
+        ) -> None:
+            self.probes.append((probe_type, callback, arguments))
+
+        def get_current_caps(self) -> Caps | None:
+            return self.current_caps
+
+        def query_caps(self, _: object) -> Caps | None:
+            return self.current_caps
+
+        def is_linked(self) -> bool:
+            return self.linked
+
+        def link(self, _: Pad) -> int:
+            self.linked = True
+            return 0
+
+    class Element:
+        def __init__(self, factory: str, name: str) -> None:
+            self.factory = factory
+            self.name = name
+            self.properties: dict[str, object] = {}
+            self.links: list[Element] = []
+            self.pads = {"src": Pad(f"{name}:src"), "sink": Pad(f"{name}:sink")}
+            self.connections: list[tuple[str, object, tuple[object, ...]]] = []
+
+        def set_property(self, name: str, value: object) -> None:
+            self.properties[name] = value
+
+        def connect(self, signal_name: str, callback: object, *arguments: object) -> None:
+            self.connections.append((signal_name, callback, arguments))
+
+        def link(self, other: Element) -> bool:
+            self.links.append(other)
+            return True
+
+        def get_static_pad(self, name: str) -> Pad:
+            return self.pads[name]
+
+    class Bin:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.elements: dict[str, Element] = {}
+            self.ghost_pads: dict[str, Pad] = {}
+
+        def add(self, element: Element) -> None:
+            self.elements[element.name] = element
+
+        def add_pad(self, pad: tuple[str, Pad]) -> None:
+            self.ghost_pads[pad[0]] = pad[1]
+
+        def get_by_name(self, name: str) -> Element | None:
+            return self.elements.get(name)
+
+        def get_static_pad(self, name: str) -> Pad:
+            return self.ghost_pads[name]
+
+    class Gst:
+        CLOCK_TIME_NONE = 2**64 - 1
+
+        class PadProbeType:
+            BUFFER = "buffer"
+            EVENT_DOWNSTREAM = "event-downstream"
+
+        class PadProbeReturn:
+            OK = "ok"
+
+        class EventType:
+            CAPS = "caps"
+
+        class Bin:
+            @staticmethod
+            def new(name: str) -> Bin:
+                return Bin(name)
+
+        class ElementFactory:
+            @staticmethod
+            def make(factory: str, name: str) -> Element:
+                return Element(factory, name)
+
+        class Element:
+            @staticmethod
+            def link_many(*elements: Element) -> bool:
+                return all(left.link(right) for left, right in zip(elements, elements[1:]))
+
+        class GhostPad:
+            @staticmethod
+            def new(name: str, pad: Pad) -> tuple[str, Pad]:
+                return name, pad
+
+    class Pyds:
+        configured: list[int] = []
+
+        @classmethod
+        def configure_source_for_ntp_sync(cls, source_hash: int) -> None:
+            cls.configured.append(source_hash)
+
+    class Info:
+        def __init__(self, *, buffer: object | None = None, event: object | None = None) -> None:
+            self.buffer = buffer
+            self.event = event
+
+        def get_buffer(self) -> object | None:
+            return self.buffer
+
+        def get_event(self) -> object | None:
+            return self.event
+
+    class Buffer:
+        def __init__(self, *, size: int, dts: int, pts: int) -> None:
+            self.size = size
+            self.dts = dts
+            self.pts = pts
+
+        def get_size(self) -> int:
+            return self.size
+
+    class Event:
+        type = Gst.EventType.CAPS
+
+        def __init__(self, caps: Caps) -> None:
+            self.caps = caps
+
+        def parse_caps(self) -> Caps:
+            return self.caps
+
+    lease = Lease()
+    factory = LeaseFactory(lease)
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        native_probe_lease_factory=factory,
+        monotonic_ns=lambda: next(observed_times),
+    )
+    runtime._bindings = deepstream_module._NvidiaBindings(
+        gst=Gst,
+        glib=object(),
+        pyds=Pyds,
+    )
+    graph = DeepStreamGraphSpec.from_site(_site())
+    source = graph.sources[0]
+    generation = runtime._build_source_generation(
+        Gst,
+        source,
+        "rtsp://redacted",
+    )
+    runtime._graph = graph
+    generation.lifecycle = "live_unauthorized"
+    runtime._active_source_generations[source.camera_id] = generation
+    clocks = Clocks()
+    supervisor = CameraSupervisor(
+        camera_ids=tuple(item.camera_id for item in graph.sources),
+        observation_queue_size=4,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    runtime._supervisor = supervisor
+    runtime._metadata_publisher = MetadataPublisher(
+        supervisor=supervisor,
+        model_artifact_id="person-primary-v1",
+    )
+
+    source_bin = generation.source_bin
+    rtspsrc = source_bin.elements["rtsp-0"]
+    dynamic_pad = Pad("rtsp-video")
+    dynamic_pad.current_caps = Caps(
+        Structure(
+            "application/x-rtp",
+            {"media": "video", "encoding-name": "H264"},
+        )
+    )
+    _, pad_added, pad_arguments = rtspsrc.connections[0]
+    pad_added(rtspsrc, dynamic_pad, *pad_arguments)
+
+    decoder_src = source_bin.elements["nvdec-0"].get_static_pad("src")
+    decoder_caps_probe = next(
+        probe for probe in decoder_src.probes if probe[0] == Gst.PadProbeType.EVENT_DOWNSTREAM
+    )
+    decoder_caps_probe[1](
+        decoder_src,
+        Info(
+            event=Event(
+                Caps(
+                    Structure(
+                        "video/x-raw",
+                        {"width": 1280, "height": 720, "framerate": (30000, 1001)},
+                    )
+                )
+            )
+        ),
+        *decoder_caps_probe[2],
+    )
+    decoder_buffer_probe = next(
+        probe for probe in decoder_src.probes if probe[0] == Gst.PadProbeType.BUFFER
+    )
+    decoder_buffer_probe[1](
+        decoder_src,
+        Info(buffer=Buffer(size=1, dts=0, pts=7_000_000_000)),
+        *decoder_buffer_probe[2],
+    )
+    parser_src = source_bin.elements["parse-0"].get_static_pad("src")
+    parser_probe = next(probe for probe in parser_src.probes if probe[0] == Gst.PadProbeType.BUFFER)
+    parser_probe[1](
+        parser_src,
+        Info(buffer=Buffer(size=4096, dts=6_960_000_000, pts=7_000_000_000)),
+        *parser_probe[2],
+    )
+    ntp_timestamp = int(clocks.wall().timestamp() * 1_000_000_000)
+    runtime._publish_frame_metadata(
+        type(
+            "Frame",
+            (),
+            {
+                "source_id": 0,
+                "ntp_timestamp": ntp_timestamp,
+                "buf_pts": 7_000_000_000,
+                "source_frame_width": 1280,
+                "source_frame_height": 720,
+                "frame_num": 1,
+                "obj_meta_list": None,
+            },
+        )(),
+        type("PydsMetadata", (), {})(),
+    )
+
+    assert factory.acquisitions == [("camera-01", 0)]
+    assert Pyds.configured == [hash(rtspsrc)]
+    assert lease.calls == [
+        ("rtp", "h264", 101),
+        ("decoder_caps", 1280, 720, 30000, 1001, 102),
+        ("decoded", 7_000_000_000, 103),
+        ("parser", 4096, 6_960_000_000, 7_000_000_000, 104),
+        ("ntp", 7_000_000_000, ntp_timestamp, 105),
+    ]
+    assert supervisor.health_for(source.camera_id).state == "online"
+
+
+def test_missing_native_ntp_configuration_closes_the_acquired_generation() -> None:
+    class Lease:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class Factory:
+        def __init__(self, lease: Lease) -> None:
+            self.lease = lease
+
+        def acquire(self, camera_id: str, source_id: int) -> Lease:
+            assert (camera_id, source_id) == ("camera-01", 0)
+            return self.lease
+
+    class Element:
+        def set_property(self, _: str, __: object) -> None:
+            return None
+
+    class Gst:
+        class Bin:
+            @staticmethod
+            def new(_: str) -> object:
+                return object()
+
+        class ElementFactory:
+            @staticmethod
+            def make(_: str, __: str) -> Element:
+                return Element()
+
+    lease = Lease()
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        native_probe_lease_factory=Factory(lease),
+    )
+    runtime._bindings = deepstream_module._NvidiaBindings(
+        gst=Gst,
+        glib=object(),
+        pyds=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="NTP sync"):
+        runtime._build_source_generation(
+            Gst,
+            DeepStreamGraphSpec.from_site(_site()).sources[0],
+            "rtsp://redacted",
+        )
+
+    assert lease.close_calls == 1
+
+
 def test_runtime_manifest_fails_closed_for_missing_rights_hashes_or_target_mismatch() -> None:
     manifest = _manifest()
-    assert manifest.validate_for_host(compute_capability="8.9", tensorrt_version="10.16.0.72") is None
+    assert (
+        manifest.validate_for_host(compute_capability="8.9", tensorrt_version="10.16.0.72") is None
+    )
 
     with pytest.raises(GraphContractError, match="engine sha256"):
         manifest.model_copy(update={"engine_sha256": None}).validate_for_host(
@@ -476,7 +1005,9 @@ def test_runtime_manifest_fails_closed_for_missing_rights_hashes_or_target_misma
         ).validate_for_host(compute_capability="8.9", tensorrt_version="10.16.0.72")
     with pytest.raises(GraphContractError, match="person class list"):
         manifest.model_copy(
-            update={"artifact": manifest.artifact.model_copy(update={"class_list": ("person", "bag")})}
+            update={
+                "artifact": manifest.artifact.model_copy(update={"class_list": ("person", "bag")})
+            }
         ).validate_for_host(compute_capability="8.9", tensorrt_version="10.16.0.72")
 
 
@@ -557,6 +1088,10 @@ def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
         def close(self) -> None:
             return None
 
+    class LeaseFactory:
+        def acquire(self, camera_id: str, source_id: int) -> object:
+            raise AssertionError(f"stubbed pipeline unexpectedly acquired {camera_id}/{source_id}")
+
     runtime = DeepStreamDataPlane(
         runtime_manifest=_manifest_with_files(tmp_path),
         runtime_info=lambda: ("8.9", "10.16.0.72"),
@@ -567,6 +1102,7 @@ def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
         ),
         runtime_session_seed_factory=lambda: next(seeds),
         telemetry_publisher_factory=lambda _: Publisher(),
+        native_probe_lease_factory=LeaseFactory(),  # type: ignore[arg-type]
     )
     monkeypatch.setattr(
         runtime,
@@ -621,6 +1157,75 @@ class Clocks:
     def advance(self, seconds: float) -> None:
         self.monotonic_seconds += seconds
         self.wall_time += timedelta(seconds=seconds)
+
+
+class _CorrelatedLease:
+    def __init__(self) -> None:
+        self.ntp_calls: list[tuple[int, int, int]] = []
+        self.close_calls = 0
+        self.last_ntp_observed_monotonic_ns: int | None = None
+
+    def observe_nvds_ntp(
+        self,
+        pts_ns: int,
+        source_ntp_ns: int,
+        observed_monotonic_ns: int,
+    ) -> bool:
+        self.ntp_calls.append((pts_ns, source_ntp_ns, observed_monotonic_ns))
+        self.last_ntp_observed_monotonic_ns = observed_monotonic_ns
+        return True
+
+    def correlated_ntp(
+        self,
+        pts_ns: int,
+        source_ntp_ns: int,
+    ) -> CorrelatedNtpV1 | None:
+        if self.last_ntp_observed_monotonic_ns is None:
+            return None
+        return CorrelatedNtpV1(
+            pts_ns=pts_ns,
+            source_ntp_ns=source_ntp_ns,
+            parser_observed_monotonic_ns=self.last_ntp_observed_monotonic_ns,
+            decoded_observed_monotonic_ns=self.last_ntp_observed_monotonic_ns,
+            ntp_observed_monotonic_ns=self.last_ntp_observed_monotonic_ns,
+            completed_monotonic_ns=self.last_ntp_observed_monotonic_ns,
+        )
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _own_metadata_frame(
+    runtime: DeepStreamDataPlane,
+    graph: DeepStreamGraphSpec,
+    *,
+    source_id: int,
+    pts_ns: int,
+) -> _CorrelatedLease:
+    source = next(item for item in graph.sources if item.source_id == source_id)
+    generation = runtime._active_source_generations.get(source.camera_id)
+    if generation is None:
+        lease = _CorrelatedLease()
+        generation = deepstream_module._SourceGeneration(
+            camera_id=source.camera_id,
+            source_id=source.source_id,
+            ordinal=1,
+            source_bin=object(),
+            writer=None,
+            lease=lease,  # type: ignore[arg-type]
+            lifecycle="live_unauthorized",
+        )
+        runtime._active_source_generations[source.camera_id] = generation
+        runtime._metadata_source_generations[source.camera_id] = generation
+    else:
+        lease = generation.lease
+        assert isinstance(lease, _CorrelatedLease)
+    runtime._record_metadata_owner(  # noqa: SLF001
+        source.camera_id,
+        lease,  # type: ignore[arg-type]
+        pts_ns,
+    )
+    return lease
 
 
 def test_inner_rtsp_error_routes_to_its_camera_and_rebuilds_only_after_backoff() -> None:
@@ -707,9 +1312,7 @@ def test_startup_watchdog_treats_monotonic_zero_as_a_valid_start(
     runtime._supervisor = supervisor
     runtime._recovery = recovery
     runtime._started_monotonic = 0.0
-    monkeypatch.setattr(
-        "protector.pilot.runtime.deepstream.time.monotonic", clocks.monotonic
-    )
+    monkeypatch.setattr("protector.pilot.runtime.deepstream.time.monotonic", clocks.monotonic)
 
     clocks.advance(5.1)
     runtime._advance_recovery()
@@ -849,6 +1452,18 @@ def test_splitmux_bus_close_maps_source_time_and_adopts_through_live_runtime(
     runtime._bindings = type("Bindings", (), {"gst": Gst})()
     epoch = str(supervisor.health_for(source.camera_id).stream_epoch)
     factory.bind_writer(sink, stream_epoch=epoch)
+    runtime._active_source_generations[source.camera_id] = deepstream_module._SourceGeneration(
+        camera_id=source.camera_id,
+        source_id=source.source_id,
+        ordinal=1,
+        source_bin=object(),
+        writer=sink,
+        lease=_CorrelatedLease(),  # type: ignore[arg-type]
+        lifecycle="authorized",
+        authorized_running_time_ns=8_000_000_000,
+        authorized_stream_epoch=epoch,
+        _writer_bound=True,
+    )
     runtime._source_time_mapper.anchor(
         camera_id=source.camera_id,
         stream_epoch=epoch,
@@ -993,9 +1608,7 @@ def test_runtime_stop_clears_writer_generation_and_allows_clean_restart(
     old_writer = factory(Gst, source)
     epoch = "epoch-before-stop"
     factory.bind_writer(old_writer, stream_epoch=epoch)
-    open_part = Path(
-        str(old_writer.properties["location"]).replace("%05d", "00001")
-    )
+    open_part = Path(str(old_writer.properties["location"]).replace("%05d", "00001"))
     open_part.write_bytes(b"unadopted")
     runtime = DeepStreamDataPlane(
         runtime_manifest=_manifest(),
@@ -1048,23 +1661,41 @@ def test_failed_camera_local_rebuild_returns_only_that_camera_to_backoff() -> No
     assert supervisor.health_for("camera-02").state == "starting"
 
 
-def test_source_rebuild_retries_after_replacement_link_failed_and_old_bin_was_removed(
+def test_source_rebuild_link_failure_restores_old_generation_before_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Pad:
         def __init__(self, *, peer: Pad | None = None, link_result: int = 0) -> None:
             self._peer = peer
             self._link_result = link_result
+            self.linked_to: list[Pad] = []
+            self.unlinked_from: list[Pad] = []
 
         def get_peer(self) -> Pad | None:
             return self._peer
 
-        def unlink(self, _: Pad) -> bool:
+        def unlink(self, other: Pad) -> bool:
+            self.unlinked_from.append(other)
             self._peer = None
             return True
 
-        def link(self, _: Pad) -> int:
+        def link(self, other: Pad) -> int:
+            self.linked_to.append(other)
+            if self._link_result == 0:
+                self._peer = other
             return self._link_result
+
+        def add_probe(self, _: object, callback: object) -> int:
+            callback(self, object())  # type: ignore[operator]
+            return 1
+
+        @staticmethod
+        def remove_probe(_: int) -> None:
+            return None
+
+        @staticmethod
+        def send_event(_: object) -> bool:
+            return True
 
     mux_pad = Pad()
 
@@ -1073,12 +1704,16 @@ def test_source_rebuild_retries_after_replacement_link_failed_and_old_bin_was_re
             self.name = name
             self.pad = pad
             self.sync_result = sync_result
+            self.states: list[object] = []
 
         def get_static_pad(self, _: str) -> Pad:
             return self.pad
 
-        def set_state(self, _: object) -> None:
+        def get_by_name(self, _: str) -> None:
             return None
+
+        def set_state(self, state: object) -> None:
+            self.states.append(state)
 
         def sync_state_with_parent(self) -> bool:
             return self.sync_result
@@ -1093,15 +1728,21 @@ def test_source_rebuild_retries_after_replacement_link_failed_and_old_bin_was_re
                 "source-0": Bin("source-0", Pad(peer=mux_pad)),
                 "streammux": Mux(),
             }
+            self.added: list[Bin] = []
+            self.removed: list[Bin] = []
 
         def get_by_name(self, name: str) -> object | None:
             return self.elements.get(name)
 
-        def add(self, element: Bin) -> None:
+        def add(self, element: Bin) -> bool:
+            self.added.append(element)
             self.elements[element.name] = element
+            return True
 
-        def remove(self, element: Bin) -> None:
+        def remove(self, element: Bin) -> bool:
+            self.removed.append(element)
             self.elements.pop(element.name, None)
+            return True
 
     class Gst:
         class State:
@@ -1110,26 +1751,90 @@ def test_source_rebuild_retries_after_replacement_link_failed_and_old_bin_was_re
         class PadLinkReturn:
             OK = 0
 
+        class PadProbeType:
+            IDLE = 1
+            BLOCK_DOWNSTREAM = 2
+
+        class PadProbeReturn:
+            OK = "ok"
+
+        class Event:
+            @staticmethod
+            def new_flush_start() -> str:
+                return "flush-start"
+
+            @staticmethod
+            def new_flush_stop(reset_time: bool) -> tuple[str, bool]:
+                return "flush-stop", reset_time
+
+    class Lease:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class Factory:
+        def __init__(self, leases: list[Lease]) -> None:
+            self.leases = iter(leases)
+            self.acquisitions: list[tuple[str, int]] = []
+
+        def acquire(self, camera_id: str, source_id: int) -> Lease:
+            self.acquisitions.append((camera_id, source_id))
+            return next(self.leases)
+
+    old_lease = Lease()
+    successful_lease = Lease()
+    factory = Factory([old_lease, successful_lease])
     runtime = DeepStreamDataPlane(
-        runtime_manifest=_manifest(), runtime_info=lambda: ("8.9", "10.16.0.72")
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+        native_probe_lease_factory=factory,
     )
     runtime._graph = DeepStreamGraphSpec.from_site(_site())
-    runtime._pipeline = Pipeline()
+    pipeline = Pipeline()
+    runtime._pipeline = pipeline
     runtime._bindings = type("Bindings", (), {"gst": Gst})()
     runtime._locations = {"camera-01": "rtsp://redacted"}
+    old_bin = pipeline.get_by_name("source-0")
+    assert isinstance(old_bin, Bin)
+    old_facade = deepstream_module._TransactionalSourceProbeLease(
+        factory=factory,  # type: ignore[arg-type]
+        camera_id="camera-01",
+        source_id=0,
+    )
+    old_facade.activate()
+    runtime._active_source_generations["camera-01"] = deepstream_module._SourceGeneration(
+        camera_id="camera-01",
+        source_id=0,
+        ordinal=1,
+        source_bin=old_bin,
+        writer=None,
+        lease=old_facade,
+    )
     replacements = iter(
         (
-            Bin("source-0", Pad(link_result=1)),
-            Bin("source-0", Pad(link_result=0)),
+            Bin("source-0-generation-2", Pad(link_result=1)),
+            Bin("source-0-generation-3", Pad(link_result=0)),
         )
     )
     monkeypatch.setattr(runtime, "_build_source_bin", lambda *_: next(replacements))
 
     with pytest.raises(RuntimeError, match="relink"):
         runtime._rebuild_source("camera-01")
+    assert runtime._active_source_generations["camera-01"].source_bin is old_bin
+    assert old_lease.close_calls == 0
+    assert factory.acquisitions == [("camera-01", 0)]
+    assert old_bin.pad.linked_to[-1] is mux_pad
+
     runtime._rebuild_source("camera-01")
 
-    assert runtime._pipeline.get_by_name("source-0") is not None
+    current = runtime._active_source_generations["camera-01"]
+    assert current.source_bin.name == "source-0-generation-3"
+    assert current.lease.active
+    assert old_lease.close_calls == 1
+    assert successful_lease.close_calls == 0
+    assert factory.acquisitions == [("camera-01", 0), ("camera-01", 0)]
 
 
 def test_stale_frame_heartbeat_enters_camera_local_recovery() -> None:
@@ -1148,9 +1853,14 @@ def test_stale_frame_heartbeat_enters_camera_local_recovery() -> None:
         rebuild_source=rebuilt.append,
     )
 
-    assert supervisor.record_frame(
-        camera_id="camera-01", source_time=clocks.wall() - timedelta(seconds=10), monotonic_seq=0
-    ) is False
+    assert (
+        supervisor.record_frame(
+            camera_id="camera-01",
+            source_time=clocks.wall() - timedelta(seconds=10),
+            monotonic_seq=0,
+        )
+        is False
+    )
     recovery.handle_camera_failure("camera-01", "invalid_frame_heartbeat")
     clocks.advance(1.0)
     recovery.advance()
@@ -1282,7 +1992,7 @@ def test_deployment_artifacts_pin_the_target_and_shared_person_tracker_contract(
     assert f"FROM --platform=linux/amd64 {DEEPSTREAM_IMAGE}" in dockerfile
     assert "pydantic==2.13.4" in dockerfile
     assert "pyyaml==6.0.3" in dockerfile
-    assert "ENTRYPOINT [\"python3\", \"-m\", \"protector.pilot.runtime.deepstream\"]" in dockerfile
+    assert 'ENTRYPOINT ["python3", "-m", "protector.pilot.runtime.deepstream"]' in dockerfile
     assert "batch-size=20" in person_config
     assert "network-mode=2" in person_config
     assert "onnx-file=/models/approved/person_primary.onnx" in person_config
@@ -1357,6 +2067,7 @@ def test_frame_metadata_anchors_splitmux_running_time_to_camera_rtcp_utc() -> No
     )()
     pyds = type("Pyds", (), {})()
 
+    _own_metadata_frame(runtime, graph, source_id=0, pts_ns=7_000_000_000)
     runtime._publish_frame_metadata(frame, pyds)
 
     camera_id = graph.sources[0].camera_id
@@ -1368,7 +2079,7 @@ def test_frame_metadata_anchors_splitmux_running_time_to_camera_rtcp_utc() -> No
     ) == clocks.wall() + timedelta(seconds=1)
 
 
-def test_host_timestamp_fallback_never_claims_an_rtcp_evidence_mapping() -> None:
+def test_missing_camera_ntp_never_marks_online_publishes_or_anchors() -> None:
     clocks = Clocks()
     graph = DeepStreamGraphSpec.from_site(_site())
     camera_id = graph.sources[0].camera_id
@@ -1389,12 +2100,11 @@ def test_host_timestamp_fallback_never_claims_an_rtcp_evidence_mapping() -> None
         supervisor=supervisor,
         model_artifact_id="person-primary-v1",
     )
-    runtime._evidence_sink_factory = lambda _gst, _source: None
     runtime._recovery = type(
         "Recovery",
         (),
         {
-            "handle_camera_failure": lambda _self, camera, reason: failures.append(
+            "handle_camera_failure": lambda _self, camera, reason, **_: failures.append(
                 (camera, reason)
             )
         },
@@ -1413,9 +2123,12 @@ def test_host_timestamp_fallback_never_claims_an_rtcp_evidence_mapping() -> None
         },
     )()
 
+    _own_metadata_frame(runtime, graph, source_id=0, pts_ns=7_000_000_000)
     runtime._publish_frame_metadata(frame, type("Pyds", (), {})())
 
-    assert failures == [(camera_id, "evidence_source_time_unavailable")]
+    assert failures == [(camera_id, "camera_rtcp_time_unavailable")]
+    assert supervisor.health_for(camera_id).state == "starting"
+    assert supervisor.drain_observations() == []
     with pytest.raises(SourceTimeMappingError, match="not anchored"):
         runtime._source_time_mapper.map(
             camera_id=camera_id,
@@ -1469,18 +2182,20 @@ def test_rtcp_discontinuity_enters_recovery_and_reanchors_only_in_new_epoch() ->
             },
         )()
 
-    runtime._publish_frame_metadata(
-        frame(source_time=clocks.wall(), running_time_ns=0, number=1),
-        type("Pyds", (), {})(),
+    first_frame = frame(
+        source_time=clocks.wall(),
+        running_time_ns=1_000_000_000,
+        number=1,
     )
-    runtime._publish_frame_metadata(
-        frame(
-            source_time=clocks.wall() + timedelta(seconds=3),
-            running_time_ns=2_000_000_000,
-            number=2,
-        ),
-        type("Pyds", (), {})(),
+    _own_metadata_frame(runtime, graph, source_id=0, pts_ns=1_000_000_000)
+    runtime._publish_frame_metadata(first_frame, type("Pyds", (), {})())
+    discontinuous_frame = frame(
+        source_time=clocks.wall() + timedelta(seconds=3),
+        running_time_ns=2_000_000_000,
+        number=2,
     )
+    _own_metadata_frame(runtime, graph, source_id=0, pts_ns=2_000_000_000)
+    runtime._publish_frame_metadata(discontinuous_frame, type("Pyds", (), {})())
 
     assert supervisor.health_for(camera_id).state == "offline"
     assert supervisor.health_for(camera_id).degraded_reason == (
@@ -1563,6 +2278,7 @@ def test_malformed_frame_and_object_do_not_suppress_later_valid_metadata() -> No
         {
             "source_id": 0,
             "ntp_timestamp": ntp,
+            "buf_pts": 1_000_000_000,
             "source_frame_width": 100,
             "source_frame_height": 100,
             "frame_num": 1,
@@ -1575,6 +2291,7 @@ def test_malformed_frame_and_object_do_not_suppress_later_valid_metadata() -> No
         {
             "source_id": 0,
             "ntp_timestamp": ntp,
+            "buf_pts": 500_000_000,
             "source_frame_width": 0,
             "source_frame_height": 100,
             "frame_num": 0,
@@ -1590,13 +2307,16 @@ def test_malformed_frame_and_object_do_not_suppress_later_valid_metadata() -> No
     runtime = DeepStreamDataPlane(
         runtime_manifest=_manifest(), runtime_info=lambda: ("8.9", "10.16.0.72")
     )
-    runtime._graph = DeepStreamGraphSpec.from_site(_site())
+    graph = DeepStreamGraphSpec.from_site(_site())
+    runtime._graph = graph
     runtime._supervisor = supervisor
     runtime._metadata_publisher = MetadataPublisher(
         supervisor=supervisor, model_artifact_id="person-primary-v1"
     )
     batch = type("Batch", (), {"frame_meta_list": Node(bad_frame, Node(good_frame))})()
 
+    _own_metadata_frame(runtime, graph, source_id=0, pts_ns=500_000_000)
+    _own_metadata_frame(runtime, graph, source_id=0, pts_ns=1_000_000_000)
     runtime._publish_batch_metadata(batch, Pyds)
 
     observations = runtime.drain_observations()
@@ -1610,9 +2330,12 @@ def test_manifest_compares_model_and_engine_file_hashes_before_starting(tmp_path
     manifest = _manifest_with_files(tmp_path)
     assert manifest.engine_path is not None
 
-    assert manifest.validate_for_host(
-        compute_capability="8.9", tensorrt_version="10.16.0.72", require_files=True
-    ) is None
+    assert (
+        manifest.validate_for_host(
+            compute_capability="8.9", tensorrt_version="10.16.0.72", require_files=True
+        )
+        is None
+    )
     manifest.engine_path.write_bytes(b"tampered-engine")
     with pytest.raises(GraphContractError, match="engine file sha256"):
         manifest.validate_for_host(
@@ -1729,11 +2452,7 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
         for index, feed in enumerate(_site().ready_to_start.feeds, start=1)
     )
     site = _site().model_copy(
-        update={
-            "ready_to_start": _site().ready_to_start.model_copy(
-                update={"feeds": feeds}
-            )
-        }
+        update={"ready_to_start": _site().ready_to_start.model_copy(update={"feeds": feeds})}
     )
     model_source = tmp_path / "person.onnx"
     engine_source = tmp_path / "person.engine"
@@ -1744,10 +2463,7 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
     engine_target = Path("/run/runtime/person.engine")
     config_target = Path("/run/runtime/person_primary.txt")
     config_source.write_text(
-        (
-            f"[property]\nonnx-file={model_target}\n"
-            f"model-engine-file={engine_target}\n"
-        )
+        (f"[property]\nonnx-file={model_target}\nmodel-engine-file={engine_target}\n")
     )
     base_manifest = _manifest()
     manifest = base_manifest.model_copy(
@@ -1759,21 +2475,23 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
             "engine_path": engine_target,
             "engine_sha256": hashlib.sha256(engine_source.read_bytes()).hexdigest(),
             "nvinfer_config_path": config_target,
-            "nvinfer_config_sha256": hashlib.sha256(
-                config_source.read_bytes()
-            ).hexdigest(),
+            "nvinfer_config_sha256": hashlib.sha256(config_source.read_bytes()).hexdigest(),
         }
     )
     site_source = tmp_path / "site.yaml"
     runtime_source = tmp_path / "runtime.yaml"
     capacity_source = tmp_path / "capacity.yaml"
+    capacity_signature_source = tmp_path / "capacity.sig"
+    capacity_public_key_source = tmp_path / "capacity-authority.pem"
     token_source = tmp_path / "machine_token"
     evidence_source = tmp_path / "evidence-spool"
     site_source.write_text(yaml.safe_dump(site.model_dump(mode="json")))
     runtime_source.write_text(yaml.safe_dump(manifest.model_dump(mode="json")))
     capacity_source.write_text("schema_version: measured-capacity-report.v1\n")
+    capacity_signature_source.write_bytes(b"bounded-signature")
+    capacity_public_key_source.write_bytes(b"bounded-public-key")
     token_source.write_text("machine-token-fixture")
-    evidence_source.mkdir()
+    evidence_source.mkdir(mode=0o700)
     mounts = [
         RuntimeBindMountV1(
             source=site_source,
@@ -1790,6 +2508,18 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
         RuntimeBindMountV1(
             source=capacity_source,
             target=Path("/run/config/measured-capacity.yaml"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=capacity_signature_source,
+            target=Path("/run/config/measured-capacity.sig"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=capacity_public_key_source,
+            target=Path("/run/config/capacity-authority.pem"),
             kind="file",
             read_only=True,
         ),
@@ -1849,10 +2579,14 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
         site_config_source=site_source,
         runtime_manifest_source=runtime_source,
         measured_capacity_source=capacity_source,
+        measured_capacity_signature_source=capacity_signature_source,
+        capacity_authority_public_key_source=capacity_public_key_source,
+        runtime_uid=os.geteuid(),
+        runtime_gid=os.getegid(),
     )
 
-    assert len(contract.mounts) == 28
-    assert len(argv) == 56
+    assert len(contract.mounts) == 30
+    assert len(argv) == 60
     assert all("rtsp://" not in argument for argument in argv)
     duplicate_secret_site = site.model_copy(
         update={
@@ -1885,6 +2619,8 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
             site_config_source=site_source,
             runtime_manifest_source=runtime_source,
             measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
         )
     camera_01_source = next(
         mount.source
@@ -1910,6 +2646,8 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
             site_config_source=site_source,
             runtime_manifest_source=runtime_source,
             measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
         )
     token_source_collision_contract = contract.model_copy(
         update={
@@ -1930,6 +2668,8 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
             site_config_source=site_source,
             runtime_manifest_source=runtime_source,
             measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
         )
     with pytest.raises(ValueError, match="exact required target set"):
         validate_runtime_mount_contract(
@@ -1940,6 +2680,8 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
             site_config_source=site_source,
             runtime_manifest_source=runtime_source,
             measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
         )
     with pytest.raises(ValueError, match="immutable SHA-256 image ID"):
         RuntimeMountContractV1(
@@ -1968,9 +2710,7 @@ def test_target_entrypoint_rejects_rehashed_capacity_with_tampered_inner_binding
     manifest_path = tmp_path / "runtime.yaml"
     capacity_path = tmp_path / "capacity.yaml"
     site_path.write_text(yaml.safe_dump(site.model_dump(mode="json"), sort_keys=True))
-    manifest_path.write_text(
-        yaml.safe_dump(manifest.model_dump(mode="json"), sort_keys=True)
-    )
+    manifest_path.write_text(yaml.safe_dump(manifest.model_dump(mode="json"), sort_keys=True))
     capacity = MeasuredCapacityReportV1(
         schema_version="measured-capacity-report.v1",
         site_id=manifest.site_id,
@@ -1982,9 +2722,28 @@ def test_target_entrypoint_rejects_rehashed_capacity_with_tampered_inner_binding
         target_gpu_architecture="NVIDIA L4 (Ada)",
         target_compute_capability=manifest.target_compute_capability,
         tensorrt_version=manifest.tensorrt_version,
+        nvidia_driver_version="575.57.08",
+        cuda_driver_version="13.0",
+        cuda_runtime_version="13.0",
+        nvidia_container_toolkit_version="1.17.8",
+        gpu_devices=(
+            {
+                "uuid": "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "product_name": "NVIDIA L4",
+                "pci_bus_id": "0000:01:00.0",
+                "total_vram_bytes": 24_000_000_000,
+                "compute_capability": manifest.target_compute_capability,
+                "mig_mode": "disabled",
+            },
+        ),
         site_config_sha256=site_config_sha256(site),
+        runtime_manifest_file_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         frozen_workload_sha256=manifest.frozen_workload_sha256,
         expected_workload_sha256=manifest.expected_workload_sha256,
+        runtime_image_id_sha256="1" * 64,
+        runtime_image_config_sha256="2" * 64,
+        runtime_code_sha256="3" * 64,
+        mount_contract_sha256="4" * 64,
         stream_count=20,
         effective_throughput_hz=125.0,
         required_throughput_hz=100.0,
@@ -2001,6 +2760,43 @@ def test_target_entrypoint_rejects_rehashed_capacity_with_tampered_inner_binding
     ).model_dump(mode="json")
     capacity[binding] = "0" * 64
     capacity_path.write_text(yaml.safe_dump(capacity, sort_keys=True))
+    private_key = tmp_path / "capacity-private.pem"
+    public_key = tmp_path / "capacity-public.pem"
+    signature = tmp_path / "capacity.sig"
+    subprocess.run(
+        ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private_key)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "pkey",
+            "-in",
+            str(private_key),
+            "-pubout",
+            "-out",
+            str(public_key),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "pkeyutl",
+            "-sign",
+            "-rawin",
+            "-inkey",
+            str(private_key),
+            "-in",
+            str(capacity_path),
+            "-out",
+            str(signature),
+        ],
+        check=True,
+        capture_output=True,
+    )
 
     with pytest.raises(SystemExit) as exit_status:
         main(
@@ -2017,6 +2813,20 @@ def test_target_entrypoint_rejects_rehashed_capacity_with_tampered_inner_binding
                 str(capacity_path),
                 "--measured-capacity-sha256",
                 hashlib.sha256(capacity_path.read_bytes()).hexdigest(),
+                "--measured-capacity-signature",
+                str(signature),
+                "--capacity-authority-public-key",
+                str(public_key),
+                "--runtime-image-id-sha256",
+                "1" * 64,
+                "--runtime-image-config-sha256",
+                "2" * 64,
+                "--runtime-code-sha256",
+                "3" * 64,
+                "--mount-contract-sha256",
+                "4" * 64,
+                "--runtime-launch-nonce",
+                "1" * 32,
                 "--control-plane-url",
                 "http://api:8000",
                 "--machine-token-file",
@@ -2045,3 +2855,51 @@ def test_deepstream_adapter_exposes_the_same_bounded_observation_drain_as_replay
 
     assert [item.camera_id for item in runtime.drain_observations()] == ["camera-01"]
     assert runtime.drain_observations() == []
+
+
+def test_sigterm_quits_main_loop_drains_runtime_and_exits_cleanly() -> None:
+    installed: dict[int, object] = {}
+    restored = {15: object(), 2: object()}
+
+    class FakeSignal:
+        SIGTERM = 15
+        SIGINT = 2
+
+        @staticmethod
+        def getsignal(signum: int) -> object:
+            return restored[signum]
+
+        @staticmethod
+        def signal(signum: int, handler: object) -> None:
+            installed[signum] = handler
+
+    class Runtime:
+        failed_reason = None
+        stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    class Loop:
+        quit_calls = 0
+
+        def run(self) -> None:
+            handler = installed[FakeSignal.SIGTERM]
+            assert callable(handler)
+            handler(FakeSignal.SIGTERM, None)
+
+        def quit(self) -> None:
+            self.quit_calls += 1
+
+    runtime = Runtime()
+    loop = Loop()
+    result = deepstream_module._run_main_loop_with_graceful_signals(
+        runtime,  # type: ignore[arg-type]
+        loop,
+        signal_module=FakeSignal,
+    )
+
+    assert result == 0
+    assert loop.quit_calls == 1
+    assert runtime.stop_calls == 1
+    assert installed == restored

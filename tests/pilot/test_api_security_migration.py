@@ -145,11 +145,11 @@ def test_migration_accepts_versioned_envelope_and_database_rejects_plaintext(
                 sa.text(
                     """
                     INSERT INTO users (
-                        user_id, username, password_hash, totp_secret_encrypted,
-                        role, is_active, created_at
+                        user_id, username, normalized_username, password_hash,
+                        totp_secret_encrypted, auth_generation, role, is_active, created_at
                     ) VALUES (
-                        'operator-2', 'plaintext', 'hash', 'PLAINTEXTBASE32SEED',
-                        'operator', 1, CURRENT_TIMESTAMP
+                        'operator-2', 'plaintext', 'plaintext', 'hash',
+                        'PLAINTEXTBASE32SEED', 1, 'operator', 1, CURRENT_TIMESTAMP
                     )
                     """
                 )
@@ -222,11 +222,11 @@ def test_database_rejects_malformed_urlsafe_base64_with_valid_outer_length(
                 sa.text(
                     """
                     INSERT INTO users (
-                        user_id, username, password_hash, totp_secret_encrypted,
-                        role, is_active, created_at
+                        user_id, username, normalized_username, password_hash,
+                        totp_secret_encrypted, auth_generation, role, is_active, created_at
                     ) VALUES (
-                        'operator-malformed', 'malformed', 'hash', :seed,
-                        'operator', 1, CURRENT_TIMESTAMP
+                        'operator-malformed', 'malformed', 'malformed', 'hash',
+                        :seed, 1, 'operator', 1, CURRENT_TIMESTAMP
                     )
                     """
                 ),

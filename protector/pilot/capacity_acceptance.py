@@ -29,6 +29,11 @@ def require_measured_primary_capacity(
     site_config: SiteConfig,
     runtime_manifest: PrimaryRuntimeIdentity,
     report: MeasuredCapacityReportV1,
+    runtime_image_id_sha256: str | None = None,
+    runtime_image_config_sha256: str | None = None,
+    runtime_code_sha256: str | None = None,
+    mount_contract_sha256: str | None = None,
+    runtime_manifest_file_sha256: str | None = None,
 ) -> None:
     """Fail unless the exact 20-camera person workload has measured 25%+ headroom."""
     artifact = runtime_manifest.artifact
@@ -62,6 +67,50 @@ def require_measured_primary_capacity(
         or report.queue_age_p99_seconds >= 2.0
         or report.gpu_utilization_max > 0.75
         or report.vram_utilization_max > 0.80
+        or (
+            runtime_image_id_sha256 is not None
+            and report.runtime_image_id_sha256 != runtime_image_id_sha256
+        )
+        or (
+            runtime_image_config_sha256 is not None
+            and report.runtime_image_config_sha256
+            != runtime_image_config_sha256
+        )
+        or (
+            runtime_code_sha256 is not None
+            and report.runtime_code_sha256 != runtime_code_sha256
+        )
+        or (
+            mount_contract_sha256 is not None
+            and report.mount_contract_sha256 != mount_contract_sha256
+        )
+        or (
+            runtime_manifest_file_sha256 is not None
+            and report.runtime_manifest_file_sha256
+            != runtime_manifest_file_sha256
+        )
+        or (
+            any(
+                value is not None
+                for value in (
+                    runtime_image_id_sha256,
+                    runtime_image_config_sha256,
+                    runtime_code_sha256,
+                    mount_contract_sha256,
+                    runtime_manifest_file_sha256,
+                )
+            )
+            and any(
+                value is None
+                for value in (
+                    runtime_image_id_sha256,
+                    runtime_image_config_sha256,
+                    runtime_code_sha256,
+                    mount_contract_sha256,
+                    runtime_manifest_file_sha256,
+                )
+            )
+        )
     )
     if mismatch:
         raise ValueError(

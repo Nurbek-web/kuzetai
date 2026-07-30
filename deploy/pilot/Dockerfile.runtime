@@ -3,14 +3,20 @@
 FROM --platform=linux/amd64 nvcr.io/nvidia/deepstream:9.1-samples-multiarch@sha256:10eca409b3894e91c1bac915c9f1346307e56695e552487cbe8cf2f58a3f998f
 
 ARG TARGETARCH
+ARG KUZET_RUNTIME_CODE_SHA256
 RUN test "${TARGETARCH}" = "amd64"
+RUN test "${#KUZET_RUNTIME_CODE_SHA256}" -eq 64 \
+    && case "${KUZET_RUNTIME_CODE_SHA256}" in \
+      *[!0-9a-f]*) exit 2 ;; \
+    esac
 
 # DeepStream 9.1 x86 uses CUDA 13.2 and TensorRT 10.16.0.72.  The runtime
 # manifest repeats these values and rejects mismatched serialized engines.
 LABEL org.opencontainers.image.title="Kuzet pilot DeepStream runtime" \
       org.kuzet.deepstream.version="9.1" \
       org.kuzet.cuda.compatibility="13.2" \
-      org.kuzet.tensorrt.compatibility="10.16.0.72"
+      org.kuzet.tensorrt.compatibility="10.16.0.72" \
+      ai.kuzet.runtime-code-sha256="${KUZET_RUNTIME_CODE_SHA256}"
 
 WORKDIR /app
 COPY pyproject.toml /app/pyproject.toml
@@ -21,6 +27,9 @@ COPY deploy/pilot/deepstream /app/deploy/pilot/deepstream
 # of the Apple/M2 dependency graph; this layer provides only pure-Python config
 # dependencies needed to parse the runtime manifest.
 RUN python3 -m pip install --no-cache-dir 'pydantic==2.13.4' 'pyyaml==6.0.3'
+RUN groupadd --gid 10001 kuzet-runtime \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin kuzet-runtime
 
 ENV PYTHONPATH=/app
+USER 10001:10001
 ENTRYPOINT ["python3", "-m", "protector.pilot.runtime.deepstream"]

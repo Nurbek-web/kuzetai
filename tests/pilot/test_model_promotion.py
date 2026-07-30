@@ -151,9 +151,28 @@ def _capacity(
         target_gpu_architecture=entry.engine.target_gpu_architecture,
         target_compute_capability=entry.engine.target_compute_capability,
         tensorrt_version=entry.engine.tensorrt_version,
+        nvidia_driver_version="575.57.08",
+        cuda_driver_version="13.0",
+        cuda_runtime_version="13.0",
+        nvidia_container_toolkit_version="1.17.8",
+        gpu_devices=(
+            {
+                "uuid": "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "product_name": entry.engine.target_gpu_architecture,
+                "pci_bus_id": "0000:01:00.0",
+                "total_vram_bytes": 24_000_000_000,
+                "compute_capability": entry.engine.target_compute_capability,
+                "mig_mode": "disabled",
+            },
+        ),
         site_config_sha256=workload.site_config_sha256,
+        runtime_manifest_file_sha256="7" * 64,
         frozen_workload_sha256=workload.frozen_workload_sha256,
         expected_workload_sha256=workload.expected_workload_sha256,
+        runtime_image_id_sha256="1" * 64,
+        runtime_image_config_sha256="2" * 64,
+        runtime_code_sha256="3" * 64,
+        mount_contract_sha256="4" * 64,
         stream_count=20,
         effective_throughput_hz=effective,
         required_throughput_hz=required,
@@ -241,12 +260,14 @@ def _verifier_candidate(
 
 def _site_config(*, fire_hz: float = 1.0, weapon_hz: float = 1.0) -> SiteConfig:
     feeds = [
-        {
-            "camera_id": f"camera-{index:02d}",
-            "rtsp_url": {"environment": f"PILOT_CAMERA_{index:02d}_RTSP_URL"},
-            "codec": "h264",
-            "resolution": {"width": 1920, "height": 1080},
-            "bitrate_kbps": 2_000,
+            {
+                "camera_id": f"camera-{index:02d}",
+                "source_index": index - 1,
+                "rtsp_url": {"environment": f"PILOT_CAMERA_{index:02d}_RTSP_URL"},
+                "codec": "h264",
+                "resolution": {"width": 1920, "height": 1080},
+                "fps": 25.0,
+                "bitrate_kbps": 2_000,
             "analytics_hz": {
                 "person": 10.0,
                 "fire_smoke": fire_hz,

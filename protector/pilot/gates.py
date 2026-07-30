@@ -278,6 +278,23 @@ class ShadowStageEvidenceV1(AuditedReportV1):
         return value.lower()
 
 
+class MeasuredGpuDeviceV1(FrozenModel):
+    """One exact physical GPU identity used by a capacity measurement."""
+
+    uuid: Annotated[
+        str,
+        Field(pattern=r"^GPU-[A-Fa-f0-9-]{16,64}$"),
+    ]
+    product_name: NonEmptyString
+    pci_bus_id: Annotated[
+        str,
+        Field(pattern=r"^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$"),
+    ]
+    total_vram_bytes: Annotated[int, Field(gt=0, le=1_000_000_000_000)]
+    compute_capability: NonEmptyString
+    mig_mode: Literal["disabled"]
+
+
 class MeasuredCapacityReportV1(AuditedReportV1):
     """Signed measurements for the frozen 20-stream target workload."""
 
@@ -290,9 +307,22 @@ class MeasuredCapacityReportV1(AuditedReportV1):
     target_gpu_architecture: NonEmptyString
     target_compute_capability: NonEmptyString
     tensorrt_version: NonEmptyString
+    nvidia_driver_version: NonEmptyString
+    cuda_driver_version: NonEmptyString
+    cuda_runtime_version: NonEmptyString
+    nvidia_container_toolkit_version: NonEmptyString
+    gpu_devices: Annotated[
+        tuple[MeasuredGpuDeviceV1, ...],
+        Field(min_length=1, max_length=1),
+    ]
     site_config_sha256: str
+    runtime_manifest_file_sha256: str
     frozen_workload_sha256: str
     expected_workload_sha256: str
+    runtime_image_id_sha256: str
+    runtime_image_config_sha256: str
+    runtime_code_sha256: str
+    mount_contract_sha256: str
     stream_count: Annotated[int, Field(ge=1)]
     effective_throughput_hz: Annotated[float, Field(gt=0)]
     required_throughput_hz: Annotated[float, Field(gt=0)]
@@ -307,14 +337,57 @@ class MeasuredCapacityReportV1(AuditedReportV1):
         "registry_entry_sha256",
         "engine_sha256",
         "site_config_sha256",
+        "runtime_manifest_file_sha256",
         "frozen_workload_sha256",
         "expected_workload_sha256",
+        "runtime_image_id_sha256",
+        "runtime_image_config_sha256",
+        "runtime_code_sha256",
+        "mount_contract_sha256",
     )
     @classmethod
     def hashes_are_digests(cls, value: str) -> str:
         if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
             raise ValueError("capacity hashes must be 64-character hexadecimal digests")
         return value.lower()
+
+    @model_validator(mode="after")
+    def gpu_set_is_exact_and_consistent(self) -> MeasuredCapacityReportV1:
+        if (
+            len({item.uuid for item in self.gpu_devices})
+            != len(self.gpu_devices)
+            or len({item.pci_bus_id for item in self.gpu_devices})
+            != len(self.gpu_devices)
+            or any(
+                item.compute_capability != self.target_compute_capability
+                for item in self.gpu_devices
+            )
+        ):
+            raise ValueError("capacity report GPU set is not exact or consistent")
+        return self
+
+    @property
+    def gpu_inventory_sha256(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "schema_version": "measured-gpu-inventory.v1",
+                    "devices": [
+                        item.model_dump(mode="json")
+                        for item in self.gpu_devices
+                    ],
+                    "nvidia_driver_version": self.nvidia_driver_version,
+                    "cuda_driver_version": self.cuda_driver_version,
+                    "cuda_runtime_version": self.cuda_runtime_version,
+                    "nvidia_container_toolkit_version": (
+                        self.nvidia_container_toolkit_version
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
 
 
 class CameraAnalyticScheduleV1(FrozenModel):

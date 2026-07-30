@@ -48,14 +48,16 @@ class AuthenticatedTelemetryClient:
     ) -> None:
         parsed = urllib.parse.urlsplit(base_url)
         if (
-            parsed.scheme not in {"http", "https"}
+            parsed.scheme != "http"
             or not parsed.netloc
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
+            or parsed.hostname != "api"
+            or parsed.port != 8000
         ):
-            raise ValueError("telemetry base URL must be an absolute HTTP(S) origin")
+            raise ValueError("telemetry base URL must be the reviewed internal API origin")
         if parsed.path not in {"", "/"}:
             raise ValueError("telemetry base URL must not contain a path")
         if len(machine_token) < 16 or len(machine_token.encode("utf-8")) > _MAX_TOKEN_BYTES:
@@ -67,6 +69,14 @@ class AuthenticatedTelemetryClient:
         )
         self._machine_token = machine_token
         self._timeout_seconds = timeout_seconds
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            NoRedirect(),
+        )
 
     def __repr__(self) -> str:
         return (
@@ -92,9 +102,15 @@ class AuthenticatedTelemetryClient:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
-                response.read(_MAX_RESPONSE_BYTES + 1)
-                if not 200 <= response.status < 300:
+            with self._opener.open(request, timeout=self._timeout_seconds) as response:
+                encoded = response.read(_MAX_RESPONSE_BYTES + 1)
+                final = urllib.parse.urlsplit(response.geturl())
+                if (
+                    not 200 <= response.status < 300
+                    or len(encoded) > _MAX_RESPONSE_BYTES
+                    or (final.scheme, final.hostname, final.port or 80)
+                    != ("http", "api", 8000)
+                ):
                     raise TelemetryPublishError("telemetry endpoint rejected the request")
         except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
             raise TelemetryPublishError("telemetry publication failed") from exc

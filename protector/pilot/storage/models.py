@@ -407,6 +407,7 @@ class UserModel(Base):
     __tablename__ = "users"
     __table_args__ = (
         CheckConstraint("role IN ('viewer', 'operator', 'admin')", name="ck_users_role"),
+        CheckConstraint("auth_generation > 0", name="ck_users_auth_generation"),
         CheckConstraint(
             PORTABLE_TOTP_ENVELOPE_CHECK,
             name="ck_users_totp_encrypted_envelope",
@@ -415,9 +416,13 @@ class UserModel(Base):
 
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     username: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    normalized_username: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(String(1024), nullable=False)
     totp_secret_encrypted: Mapped[str | None] = mapped_column(Text)
     totp_last_accepted_counter: Mapped[int | None] = mapped_column(BigInteger)
+    auth_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=1, server_default="1"
+    )
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
