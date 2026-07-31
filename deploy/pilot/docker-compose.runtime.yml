@@ -1,0 +1,240 @@
+# RENDER-ONLY/BLOCKED template for one shared bounded NVIDIA runtime.
+# `docker compose up runtime` exits 78 and cannot enter production_main.
+# The intended image entrypoint/argv remain below only as x-kuzet metadata.
+# Selecting this file does not prove CUDA, DeepStream, TensorRT, exact-20
+# source behavior, throughput, or headroom. Those remain target acceptance
+# gates. The runtime-spool, runtime-journal, and runtime-preview host paths
+# must be pre-created, quota-bounded, encrypted, Kazakhstan-resident paths.
+x-kuzet-render-only-runtime-entrypoint:
+  - python3
+  - -m
+  - protector.pilot.runtime.production_main
+x-kuzet-render-only-runtime-command:
+  - --site-id=${PILOT_SITE_ID:?set-authoritative-site-id}
+  - --site-config=/run/config/site.yaml
+  - --site-config-sha256=${PILOT_SITE_CONFIG_SHA256:?set-reviewed-site-config-sha256}
+  - --runtime-manifest=/run/config/runtime-manifest.yaml
+  - --runtime-manifest-sha256=${PILOT_RUNTIME_MANIFEST_SHA256:?set-reviewed-runtime-manifest-sha256}
+  - --measured-capacity-report=/run/config/measured-capacity.yaml
+  - --measured-capacity-sha256=${PILOT_MEASURED_CAPACITY_SHA256:?set-target-measured-capacity-sha256}
+  - --measured-capacity-signature=/run/config/measured-capacity.sig
+  - --capacity-authority-public-key=/run/config/capacity-authority.pem
+  - --runtime-image-id-sha256=${PILOT_RUNTIME_IMAGE_ID_SHA256:?set-measured-runtime-image-id-sha256}
+  - --runtime-image-config-sha256=${PILOT_RUNTIME_IMAGE_CONFIG_SHA256:?set-measured-runtime-image-config-sha256}
+  - --runtime-code-sha256=${PILOT_RUNTIME_CODE_SHA256:?set-reviewed-runtime-code-sha256}
+  - --mount-contract-sha256=${PILOT_MOUNT_CONTRACT_SHA256:?set-reviewed-mount-contract-sha256}
+  - --runtime-launch-nonce=${PILOT_RUNTIME_LAUNCH_NONCE:?set-unique-32hex-runtime-launch-nonce}
+  - --control-plane-url=http://api:8000
+  - --machine-token-file=/run/secrets/machine_token
+  - --database-url-secret=/run/secrets/runtime_database_url
+  - --object-store-access-key-secret=/run/secrets/runtime_object_store_access_key
+  - --object-store-secret-key-secret=/run/secrets/runtime_object_store_secret_key
+  - --object-store-region=${PILOT_RUNTIME_OBJECT_STORE_REGION:?set-reviewed-object-store-region}
+
+services:
+  # The API receives a read-only preview identity only when the runtime/evidence
+  # overlay is selected. These credentials are distinct from runtime writer
+  # credentials and must be policy-limited to bounded ranged reads.
+  api:
+    environment:
+      PILOT_SITE_CONFIG_PATH: /run/config/site.yaml
+      PILOT_SITE_CONFIG_SHA256: ${PILOT_SITE_CONFIG_SHA256:?set-reviewed-site-config-sha256}
+      PILOT_PREVIEW_OBJECT_STORE_ACCESS_KEY_FILE: /run/secrets/preview_object_store_access_key
+      PILOT_PREVIEW_OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/preview_object_store_secret_key
+      PILOT_PREVIEW_OBJECT_STORE_REGION: ${PILOT_PREVIEW_OBJECT_STORE_REGION:?set-reviewed-object-store-region}
+    secrets:
+      - preview_object_store_access_key
+      - preview_object_store_secret_key
+    volumes:
+      - type: bind
+        source: ${PILOT_SITE_CONFIG_PATH:?set-reviewed-site-config-path}
+        target: /run/config/site.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      storage-egress: {}
+
+  runtime:
+    image: ${PILOT_RUNTIME_IMAGE_REPOSITORY:?set-reviewed-runtime-repository}@sha256:${PILOT_RUNTIME_IMAGE_SHA256:?set-reviewed-64hex-runtime-content-digest}
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    stop_grace_period: 30s
+    init: true
+    ipc: private
+    gpus:
+      - driver: nvidia
+        device_ids:
+          - ${PILOT_RUNTIME_GPU_UUID:?set-reviewed-single-GPU-UUID}
+        capabilities:
+          - gpu
+    # This service is a render-only packaging template. The raw target command
+    # remains runnable through the image ENTRYPOINT; Compose activation cannot
+    # enter production_main until an attested host wrapper replaces this stub.
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - >-
+        printf '%s\n' 'BLOCKED: Compose runtime requires an attested host wrapper' >&2;
+        exit 78
+    secrets:
+      - source: runtime_machine_token
+        target: machine_token
+      - runtime_database_url
+      - runtime_object_store_access_key
+      - runtime_object_store_secret_key
+      - source: camera_01_rtsp_url
+        target: camera_01_rtsp_url
+      - source: camera_02_rtsp_url
+        target: camera_02_rtsp_url
+      - source: camera_03_rtsp_url
+        target: camera_03_rtsp_url
+      - source: camera_04_rtsp_url
+        target: camera_04_rtsp_url
+      - source: camera_05_rtsp_url
+        target: camera_05_rtsp_url
+      - source: camera_06_rtsp_url
+        target: camera_06_rtsp_url
+      - source: camera_07_rtsp_url
+        target: camera_07_rtsp_url
+      - source: camera_08_rtsp_url
+        target: camera_08_rtsp_url
+      - source: camera_09_rtsp_url
+        target: camera_09_rtsp_url
+      - source: camera_10_rtsp_url
+        target: camera_10_rtsp_url
+      - source: camera_11_rtsp_url
+        target: camera_11_rtsp_url
+      - source: camera_12_rtsp_url
+        target: camera_12_rtsp_url
+      - source: camera_13_rtsp_url
+        target: camera_13_rtsp_url
+      - source: camera_14_rtsp_url
+        target: camera_14_rtsp_url
+      - source: camera_15_rtsp_url
+        target: camera_15_rtsp_url
+      - source: camera_16_rtsp_url
+        target: camera_16_rtsp_url
+      - source: camera_17_rtsp_url
+        target: camera_17_rtsp_url
+      - source: camera_18_rtsp_url
+        target: camera_18_rtsp_url
+      - source: camera_19_rtsp_url
+        target: camera_19_rtsp_url
+      - source: camera_20_rtsp_url
+        target: camera_20_rtsp_url
+    volumes:
+      - type: bind
+        source: ${PILOT_SITE_CONFIG_PATH:?set-reviewed-site-config-path}
+        target: /run/config/site.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_RUNTIME_MANIFEST_PATH:?set-reviewed-runtime-manifest-path}
+        target: /run/config/runtime-manifest.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_MEASURED_CAPACITY_PATH:?set-signed-target-capacity-path}
+        target: /run/config/measured-capacity.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_MEASURED_CAPACITY_SIGNATURE_PATH:?set-capacity-signature-path}
+        target: /run/config/measured-capacity.sig
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_CAPACITY_AUTHORITY_PUBLIC_KEY_PATH:?set-out-of-band-capacity-authority-key}
+        target: /run/config/capacity-authority.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_RUNTIME_MODEL_PATH:?set-reviewed-model-and-engine-directory}
+        target: /run/runtime
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_RUNTIME_SPOOL_PATH:?set-finite-encrypted-runtime-spool-path}
+        target: /srv/kuzet/evidence-spool
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_RUNTIME_JOURNAL_PATH:?set-finite-encrypted-runtime-journal-path}
+        target: /var/lib/kuzet/journal
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_RUNTIME_PREVIEW_PATH:?set-finite-encrypted-runtime-preview-path}
+        target: /var/lib/kuzet/previews
+        read_only: false
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+    networks:
+      - camera-lan
+      - control
+      - data
+      - storage-egress
+    depends_on:
+      api: {condition: service_healthy}
+    pids_limit: 1024
+    mem_limit: ${PILOT_RUNTIME_MEMORY_LIMIT:?set-measured-runtime-memory-limit}
+    cpus: ${PILOT_RUNTIME_CPU_LIMIT:?set-measured-runtime-cpu-limit}
+    shm_size: ${PILOT_RUNTIME_SHM_LIMIT:-1g}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: ${PILOT_RUNTIME_CPU_LIMIT:?set-measured-runtime-cpu-limit}
+          memory: ${PILOT_RUNTIME_MEMORY_LIMIT:?set-measured-runtime-memory-limit}
+
+networks:
+  camera-lan:
+    external: true
+    name: ${PILOT_CAMERA_NETWORK:?set-precreated-camera-only-network}
+
+secrets:
+  preview_object_store_access_key: {external: true}
+  preview_object_store_secret_key: {external: true}
+  runtime_machine_token: {external: true}
+  runtime_database_url: {external: true}
+  runtime_object_store_access_key: {external: true}
+  runtime_object_store_secret_key: {external: true}
+  camera_01_rtsp_url: {external: true}
+  camera_02_rtsp_url: {external: true}
+  camera_03_rtsp_url: {external: true}
+  camera_04_rtsp_url: {external: true}
+  camera_05_rtsp_url: {external: true}
+  camera_06_rtsp_url: {external: true}
+  camera_07_rtsp_url: {external: true}
+  camera_08_rtsp_url: {external: true}
+  camera_09_rtsp_url: {external: true}
+  camera_10_rtsp_url: {external: true}
+  camera_11_rtsp_url: {external: true}
+  camera_12_rtsp_url: {external: true}
+  camera_13_rtsp_url: {external: true}
+  camera_14_rtsp_url: {external: true}
+  camera_15_rtsp_url: {external: true}
+  camera_16_rtsp_url: {external: true}
+  camera_17_rtsp_url: {external: true}
+  camera_18_rtsp_url: {external: true}
+  camera_19_rtsp_url: {external: true}
+  camera_20_rtsp_url: {external: true}

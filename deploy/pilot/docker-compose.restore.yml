@@ -1,0 +1,95 @@
+# Destructive-safe restore drill overlay. It may write only beneath a
+# separately named, absent fresh-target path and a pre-created signed
+# restore-receipt directory. Source, parent, receipt, and database names must
+# never identify live production targets.
+services:
+  restore:
+    image: ${PILOT_OPS_IMAGE_REPOSITORY:?set-reviewed-ops-repository}@sha256:${PILOT_OPS_IMAGE_SHA256:?set-reviewed-64hex-ops-content-digest}
+    user: "10002:10002"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    entrypoint: ["/app/scripts/pilot/restore.sh"]
+    environment:
+      PILOT_SITE_ID: ${PILOT_SITE_ID:?set-authoritative-site-id}
+      PILOT_RESTORE_SOURCE: ${PILOT_RESTORE_SOURCE:?set-verified-encrypted-backup-directory}
+      PILOT_RESTORE_DATABASE_NAME: ${PILOT_RESTORE_DATABASE_NAME:?set-separately-named-empty-database}
+      PILOT_RESTORE_EVIDENCE_TARGET: ${PILOT_RESTORE_EVIDENCE_PARENT:?set-encrypted-fresh-target-parent}/${PILOT_RESTORE_EVIDENCE_NAME:?set-absent-fresh-target-name}
+      PILOT_RESTORE_RECEIPT_TARGET: ${PILOT_RESTORE_RECEIPT_TARGET:?set-signed-restore-receipt-directory}
+      PILOT_EXPECTED_SCHEMA_REVISION: ${PILOT_EXPECTED_SCHEMA_REVISION:?set-exact-reviewed-migration-revision}
+      PILOT_EXPECTED_CONFIG_SHA256: ${PILOT_EXPECTED_CONFIG_SHA256:?set-exact-reviewed-config-sha256}
+      PILOT_EXPECTED_MODEL_SHA256: ${PILOT_EXPECTED_MODEL_SHA256:?set-exact-reviewed-model-sha256}
+      PILOT_RESTORE_MAX_EVIDENCE_BYTES: ${PILOT_RESTORE_MAX_EVIDENCE_BYTES:?set-finite-evidence-byte-bound}
+      PILOT_RESTORE_MAX_EVIDENCE_OBJECTS: ${PILOT_RESTORE_MAX_EVIDENCE_OBJECTS:?set-finite-evidence-object-bound}
+      PILOT_RESTORE_MAX_DATABASE_BYTES: ${PILOT_RESTORE_MAX_DATABASE_BYTES:?set-finite-database-byte-bound}
+      PILOT_RESTORE_MAX_MANIFEST_BYTES: ${PILOT_RESTORE_MAX_MANIFEST_BYTES:?set-finite-manifest-byte-bound}
+      PILOT_STORAGE_ATTESTATION_MAX_SECONDS: ${PILOT_STORAGE_ATTESTATION_MAX_SECONDS:-86400}
+    secrets:
+      - source: restore_database_url
+        target: pg_restore_service.conf
+      - source: restore_database_password
+        target: pgpass
+      - source: restore_backup_age_identity
+        target: backup_age_identity
+      - source: restore_backup_age_recipient
+        target: backup_age_recipient
+      - source: restore_backup_signing_public_key
+        target: backup_signing_public_key
+      - source: restore_kz_storage_attestation_public_key
+        target: kz_storage_attestation_public_key
+      - source: restore_kz_storage_verifier_record
+        target: kz_storage_verifier_record
+      - source: restore_receipt_signing_private_key
+        target: restore_receipt_signing_private_key
+      - source: restore_receipt_signing_public_key
+        target: restore_receipt_signing_public_key
+    volumes:
+      - type: bind
+        source: ${PILOT_RESTORE_SOURCE:?set-verified-encrypted-backup-directory}
+        target: ${PILOT_RESTORE_SOURCE:?set-verified-encrypted-backup-directory}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_RESTORE_EVIDENCE_PARENT:?set-encrypted-fresh-target-parent}
+        target: ${PILOT_RESTORE_EVIDENCE_PARENT:?set-encrypted-fresh-target-parent}
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_RESTORE_RECEIPT_TARGET:?set-signed-restore-receipt-directory}
+        target: ${PILOT_RESTORE_RECEIPT_TARGET:?set-signed-restore-receipt-directory}
+        read_only: false
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    networks:
+      - data
+    depends_on:
+      postgres: {condition: service_healthy}
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 1G}
+
+secrets:
+  restore_database_url: {external: true}
+  restore_database_password: {external: true}
+  restore_backup_age_identity: {external: true}
+  restore_backup_age_recipient: {external: true}
+  restore_backup_signing_public_key: {external: true}
+  restore_kz_storage_attestation_public_key: {external: true}
+  restore_kz_storage_verifier_record: {external: true}
+  restore_receipt_signing_private_key: {external: true}
+  restore_receipt_signing_public_key: {external: true}

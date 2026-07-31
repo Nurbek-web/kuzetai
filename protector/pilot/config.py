@@ -10,7 +10,6 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Annotated, Literal
 
-import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -23,6 +22,8 @@ from pydantic import (
     model_validator,
 )
 
+from protector.pilot.trusted_yaml import load_strict_yaml
+
 NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 PositiveBitrate = Annotated[int, Field(gt=0)]
 AnalyticsHz = Annotated[float, Field(ge=0.0, le=30.0)]
@@ -34,6 +35,7 @@ FiniteStorageBytes = Annotated[int, Field(gt=0, le=1_000_000_000_000)]
 DOCKER_SECRETS_DIR = Path("/run/secrets")
 MAX_SECRET_BYTES = 16 * 1024
 _SECRET_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_MAX_SITE_CONFIG_BYTES = 1024 * 1024
 
 
 class FrozenModel(BaseModel):
@@ -280,6 +282,13 @@ class PilotSecrets(FrozenModel):
 
 def load_site_config(path: Path) -> SiteConfig:
     """Load non-secret site settings; credential values are deliberately not a YAML field."""
-    with path.open(encoding="utf-8") as config_file:
-        raw_config = yaml.safe_load(config_file)
+    with path.open("rb") as config_file:
+        payload = config_file.read(_MAX_SITE_CONFIG_BYTES + 1)
+    raw_config = load_strict_yaml(
+        payload,
+        max_bytes=_MAX_SITE_CONFIG_BYTES,
+        max_nodes=20_000,
+        max_depth=64,
+        require_mapping=True,
+    )
     return SiteConfig.model_validate(raw_config)

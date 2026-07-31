@@ -374,3 +374,20 @@ def test_example_template_is_a_valid_nonsecret_site_configuration():
     site = load_site_config(config_path)
 
     assert len(site.ready_to_start.feeds) == 20
+
+
+def test_site_loader_rejects_yaml_aliases_and_duplicate_keys(
+    tmp_path: Path,
+) -> None:
+    duplicate = tmp_path / "duplicate.yaml"
+    duplicate.write_text("queues: {}\nqueues: {}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate YAML mapping key"):
+        load_site_config(duplicate)
+
+    alias = tmp_path / "alias.yaml"
+    alias.write_text(
+        "defaults: &defaults\n  decode: 1\nqueues: *defaults\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="anchors|aliases"):
+        load_site_config(alias)

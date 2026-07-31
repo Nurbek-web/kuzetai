@@ -1,0 +1,91 @@
+# One-shot encrypted backup overlay. PILOT_BACKUP_TARGET must be a pre-created,
+# signed, encrypted, quota-bounded target. The logical `backup_database_url`
+# Docker secret contains the complete `kuzet_backup` libpq service document;
+# `backup_object_store_access_key` contains a bounded AWS shared-credentials
+# document, never a value interpolated into Compose or the process environment.
+services:
+  backup:
+    image: ${PILOT_OPS_IMAGE_REPOSITORY:?set-reviewed-ops-repository}@sha256:${PILOT_OPS_IMAGE_SHA256:?set-reviewed-64hex-ops-content-digest}
+    user: "10002:10002"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    entrypoint: ["/app/scripts/pilot/backup.sh"]
+    environment:
+      PILOT_SITE_ID: ${PILOT_SITE_ID:?set-authoritative-site-id}
+      PILOT_BACKUP_TARGET: ${PILOT_BACKUP_TARGET:?set-signed-encrypted-finite-backup-target}
+      PILOT_KZ_OBJECT_ENDPOINT: ${PILOT_KZ_OBJECT_ENDPOINT:?set-reviewed-bare-Kazakhstan-HTTPS-endpoint}
+      PILOT_EVIDENCE_BUCKET: ${PILOT_EVIDENCE_BUCKET:?set-reviewed-site-evidence-bucket}
+      PILOT_EVIDENCE_PREFIX: ${PILOT_EVIDENCE_PREFIX:?set-site-scoped-prefix-ending-in-site-id}
+      PILOT_CONFIG_MANIFEST: /run/config/config-manifest
+      PILOT_MODEL_MANIFEST: /run/config/model-manifest
+      PILOT_BACKUP_MAX_EVIDENCE_BYTES: ${PILOT_BACKUP_MAX_EVIDENCE_BYTES:?set-finite-evidence-byte-bound}
+      PILOT_BACKUP_MAX_EVIDENCE_OBJECTS: ${PILOT_BACKUP_MAX_EVIDENCE_OBJECTS:?set-finite-evidence-object-bound}
+      PILOT_BACKUP_MAX_DATABASE_BYTES: ${PILOT_BACKUP_MAX_DATABASE_BYTES:?set-finite-database-byte-bound}
+      PILOT_BACKUP_MAX_MANIFEST_BYTES: ${PILOT_BACKUP_MAX_MANIFEST_BYTES:?set-finite-manifest-byte-bound}
+      PILOT_BACKUP_MAX_RUNS: ${PILOT_BACKUP_MAX_RUNS:?set-finite-backup-run-bound}
+      PILOT_STORAGE_ATTESTATION_MAX_SECONDS: ${PILOT_STORAGE_ATTESTATION_MAX_SECONDS:-86400}
+    secrets:
+      - source: backup_database_url
+        target: pg_service.conf
+      - source: backup_database_password
+        target: pgpass
+      - source: backup_age_recipient
+        target: backup_age_recipient
+      - source: backup_signing_private_key
+        target: backup_signing_private_key
+      - source: backup_object_store_access_key
+        target: aws_credentials
+      - source: backup_kz_storage_attestation_public_key
+        target: kz_storage_attestation_public_key
+      - source: backup_kz_storage_verifier_record
+        target: kz_storage_verifier_record
+    volumes:
+      - type: bind
+        source: ${PILOT_BACKUP_TARGET:?set-signed-encrypted-finite-backup-target}
+        target: ${PILOT_BACKUP_TARGET:?set-signed-encrypted-finite-backup-target}
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_CONFIG_MANIFEST_PATH:?set-reviewed-config-manifest-path}
+        target: /run/config/config-manifest
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_MODEL_MANIFEST_PATH:?set-reviewed-model-manifest-path}
+        target: /run/config/model-manifest
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    networks:
+      - data
+      - storage-egress
+    depends_on:
+      postgres: {condition: service_healthy}
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 1G}
+
+secrets:
+  backup_database_url: {external: true}
+  backup_database_password: {external: true}
+  backup_age_recipient: {external: true}
+  backup_signing_private_key: {external: true}
+  backup_object_store_access_key: {external: true}
+  backup_kz_storage_attestation_public_key: {external: true}
+  backup_kz_storage_verifier_record: {external: true}

@@ -1,0 +1,72 @@
+# Notification delivery is absent from the base stack. Select this overlay
+# only after both named approvals and the separately fenced egress network
+# exist. The worker still sends only human-confirmed, audit-authorized events.
+services:
+  api:
+    secrets:
+      - notification_machine_token
+
+  notifications:
+    image: ${PILOT_API_IMAGE_REPOSITORY:?set-reviewed-api-repository}@sha256:${PILOT_API_IMAGE_SHA256:?set-reviewed-64hex-content-digest}
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "protector.pilot.notifications.service"]
+    command:
+      - --database-url-secret=/run/secrets/database_url
+      - --machine-token-secret=/run/secrets/machine_token
+      - --evidence-link-secret=/run/secrets/evidence_link_signing_secret
+      - --telegram-bot-token-secret=/run/secrets/telegram_bot_token
+      - --telegram-chat-id-secret=/run/secrets/telegram_chat_id
+      - --site-id=${PILOT_SITE_ID:?set-authoritative-site-id}
+      - --public-origin=${PILOT_PUBLIC_ORIGIN:?set-https-public-origin}
+      - --control-plane-url=http://api:8000
+      - --customer-approved=${PILOT_TELEGRAM_CUSTOMER_APPROVED:?set-true-only-after-recorded-customer-approval}
+      - --network-approved=${PILOT_TELEGRAM_NETWORK_APPROVED:?set-true-only-after-recorded-network-approval}
+    secrets:
+      - source: notification_database_url
+        target: database_url
+      - source: notification_machine_token
+        target: machine_token
+      # Deliberately shared with the API for link signing/verification only.
+      - source: evidence_link_signing_secret
+        target: evidence_link_signing_secret
+      - source: notification_telegram_bot_token
+        target: telegram_bot_token
+      - source: notification_telegram_chat_id
+        target: telegram_chat_id
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - control
+      - data
+      - notification-egress
+    depends_on:
+      api: {condition: service_healthy}
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 512M}
+
+networks:
+  notification-egress:
+    external: true
+    name: ${PILOT_NOTIFICATION_EGRESS_NETWORK:?set-precreated-approved-notification-egress-network}
+
+secrets:
+  notification_database_url: {external: true}
+  notification_machine_token: {external: true}
+  evidence_link_signing_secret: {external: true}
+  notification_telegram_bot_token: {external: true}
+  notification_telegram_chat_id: {external: true}

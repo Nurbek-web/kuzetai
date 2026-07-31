@@ -1,8 +1,9 @@
 name: kuzet-controlled-pilot
 
-# The NVIDIA data plane remains a separate, digest-pinned container on the
-# target host. This project provisions one shared control plane for one exact
-# reviewed site and never launches one model stack per camera.
+# Core control-plane services for one reviewed site. Optional NVIDIA runtime,
+# acceptance, Telegram, backup, restore, and administrator-bootstrap surfaces
+# are explicit overlays so their secrets and networks are never interpolated
+# unless an operator deliberately selects that overlay.
 
 x-service-hardening: &service-hardening
   read_only: true
@@ -61,11 +62,13 @@ services:
       - --admin-database-url-secret=/run/secrets/admin_database_url
       - --migrator-password-secret=/run/secrets/migrator_database_password
       - --api-password-secret=/run/secrets/api_database_password
+      - --runtime-password-secret=/run/secrets/runtime_database_password
       - --retention-password-secret=/run/secrets/retention_database_password
     secrets:
       - admin_database_url
       - migrator_database_password
       - api_database_password
+      - runtime_database_password
       - retention_database_password
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
@@ -148,11 +151,36 @@ services:
     secrets:
       - migration_database_url
     volumes:
-      - ${PILOT_SITE_CONFIG_PATH:?set-reviewed-site-config-path}:/run/config/site.yaml:ro
-      - ${PILOT_RUNTIME_MANIFEST_PATH:?set-reviewed-runtime-manifest-path}:/run/config/runtime-manifest.yaml:ro
-      - ${PILOT_MEASURED_CAPACITY_PATH:?set-signed-target-capacity-path}:/run/config/measured-capacity.yaml:ro
-      - ${PILOT_MEASURED_CAPACITY_SIGNATURE_PATH:?set-capacity-signature-path}:/run/config/measured-capacity.sig:ro
-      - ${PILOT_CAPACITY_AUTHORITY_PUBLIC_KEY_PATH:?set-out-of-band-capacity-authority-key}:/run/config/capacity-authority.pem:ro
+      - type: bind
+        source: ${PILOT_SITE_CONFIG_PATH:?set-reviewed-site-config-path}
+        target: /run/config/site.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_RUNTIME_MANIFEST_PATH:?set-reviewed-runtime-manifest-path}
+        target: /run/config/runtime-manifest.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_MEASURED_CAPACITY_PATH:?set-signed-target-capacity-path}
+        target: /run/config/measured-capacity.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_MEASURED_CAPACITY_SIGNATURE_PATH:?set-capacity-signature-path}
+        target: /run/config/measured-capacity.sig
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PILOT_CAPACITY_AUTHORITY_PUBLIC_KEY_PATH:?set-out-of-band-capacity-authority-key}
+        target: /run/config/capacity-authority.pem
+        read_only: true
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
     networks:
@@ -176,8 +204,12 @@ services:
       - database_url
       - session_secret
       - totp_encryption_key
-      - machine_token
-      - evidence_link_secret
+      # Runtime writes and monitoring reads are separate API auth roles.
+      - runtime_machine_token
+      - monitoring_machine_token
+      # This HMAC key is not a machine credential. The Telegram overlay mounts
+      # the same external key so notification links verify at the API.
+      - evidence_link_signing_secret
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     networks:
@@ -190,7 +222,7 @@ services:
         - CMD
         - python
         - -c
-        - "import pathlib,urllib.request; token=pathlib.Path('/run/secrets/machine_token').read_text().strip(); request=urllib.request.Request('http://127.0.0.1:8000/internal/health/live',headers={'Authorization':'Bearer '+token}); urllib.request.urlopen(request,timeout=2).read()"
+        - "import pathlib,urllib.request; token=pathlib.Path('/run/secrets/monitoring_machine_token').read_text().strip(); request=urllib.request.Request('http://127.0.0.1:8000/internal/health/live',headers={'Authorization':'Bearer '+token}); urllib.request.urlopen(request,timeout=2).read()"
       interval: 15s
       timeout: 3s
       retries: 4
@@ -201,177 +233,6 @@ services:
     deploy:
       resources:
         limits: {cpus: "1.5", memory: 1G}
-
-  acceptance-controller:
-    <<: [*service-hardening, *api-image]
-    command:
-      - protector.pilot.api.acceptance_controller:create_production_acceptance_controller_app
-      - --factory
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-      - --workers
-      - "1"
-      - --no-proxy-headers
-      - --no-server-header
-    environment:
-      PILOT_SITE_ID: ${PILOT_SITE_ID:?set-authoritative-site-id}
-      PILOT_ACCEPTANCE_CAMPAIGN_ID: ${PILOT_ACCEPTANCE_CAMPAIGN_ID:?set-signed-acceptance-campaign-id}
-      PILOT_ACCEPTANCE_GATE: ${PILOT_ACCEPTANCE_GATE:?set-8h-or-72h}
-      PILOT_ACCEPTANCE_JOURNAL_PATH: /var/lib/kuzet/acceptance/authority.sqlite3
-      PILOT_ACCEPTANCE_PROOF_DIR: /var/lib/kuzet/acceptance-proofs
-      PILOT_ACCEPTANCE_OFFLINE_ROOT_SPKI_SHA256: ${PILOT_ACCEPTANCE_OFFLINE_ROOT_SPKI_SHA256:?set-out-of-band-offline-root-SPKI-sha256}
-    secrets:
-      - acceptance_controller_token
-    volumes:
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_OFFLINE_ROOT_PUBLIC_KEY_PATH:?set-offline-root-public-key-path}
-        target: /run/config/acceptance/offline-root-public.pem
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_TRUST_POLICY_PATH:?set-signed-trust-policy-path}
-        target: /run/config/acceptance/trust-policy.json
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_TRUST_POLICY_SIGNATURE_PATH:?set-trust-policy-signature-path}
-        target: /run/config/acceptance/trust-policy.sig
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_MANIFEST_PATH:?set-signed-acceptance-manifest-path}
-        target: /run/config/acceptance/acceptance-manifest.json
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_MANIFEST_SIGNATURE_PATH:?set-acceptance-manifest-signature-path}
-        target: /run/config/acceptance/acceptance-manifest.sig
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_MANIFEST_ROLE_PUBLIC_KEY_PATH:?set-manifest-role-public-key-path}
-        target: /run/config/acceptance/manifest-role-public.pem
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_CAPACITY_ROLE_PUBLIC_KEY_PATH:?set-capacity-role-public-key-path}
-        target: /run/config/acceptance/capacity-role-public.pem
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_RUN_ROLE_PUBLIC_KEY_PATH:?set-run-role-public-key-path}
-        target: /run/config/acceptance/run-role-public.pem
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_REPORT_ROLE_PUBLIC_KEY_PATH:?set-report-role-public-key-path}
-        target: /run/config/acceptance/report-role-public.pem
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_CONDITIONAL_ROLE_PUBLIC_KEY_PATH:?set-conditional-role-public-key-path}
-        target: /run/config/acceptance/conditional-role-public.pem
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_RUN_PRIVATE_KEY_PATH:?set-run-private-key-path}
-        target: /run/keys/acceptance/run-private.pem
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_STATE_PATH:?set-persistent-acceptance-state-path}/authority.sqlite3
-        target: /var/lib/kuzet/acceptance/authority.sqlite3
-        read_only: false
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_STATE_PATH:?set-persistent-acceptance-state-path}/authority.sqlite3-wal
-        target: /var/lib/kuzet/acceptance/authority.sqlite3-wal
-        read_only: false
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_STATE_PATH:?set-persistent-acceptance-state-path}/authority.sqlite3-shm
-        target: /var/lib/kuzet/acceptance/authority.sqlite3-shm
-        read_only: false
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${PILOT_ACCEPTANCE_PROOF_PATH:?set-private-gate-specific-acceptance-proof-path}
-        target: /var/lib/kuzet/acceptance-proofs
-        read_only: false
-        bind:
-          create_host_path: false
-    ports:
-      - "127.0.0.1:${PILOT_ACCEPTANCE_PORT:?set-loopback-acceptance-port}:8000"
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
-    networks:
-      - acceptance-loopback
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import pathlib,urllib.request; token=pathlib.Path('/run/secrets/acceptance_controller_token').read_text().strip(); request=urllib.request.Request('http://127.0.0.1:8000/ready',headers={'Authorization':'Bearer '+token}); urllib.request.urlopen(request,timeout=2).read()"
-      interval: 15s
-      timeout: 3s
-      retries: 4
-      start_period: 20s
-    mem_limit: 512m
-    cpus: 0.5
-    pids_limit: 128
-    deploy:
-      resources:
-        limits: {cpus: "0.5", memory: 512M}
-
-  notifications:
-    <<: [*service-hardening, *api-image]
-    entrypoint: ["python", "-m", "protector.pilot.notifications.service"]
-    command:
-      - --database-url-secret=/run/secrets/database_url
-      - --machine-token-secret=/run/secrets/machine_token
-      - --evidence-link-secret=/run/secrets/evidence_link_secret
-      - --telegram-bot-token-secret=/run/secrets/telegram_bot_token
-      - --telegram-chat-id-secret=/run/secrets/telegram_chat_id
-      - --site-id=${PILOT_SITE_ID:?set-authoritative-site-id}
-      - --public-origin=${PILOT_PUBLIC_ORIGIN:?set-https-public-origin}
-      - --control-plane-url=http://api:8000
-      - --customer-approved=${PILOT_TELEGRAM_CUSTOMER_APPROVED:?set-true-only-after-approval}
-      - --network-approved=${PILOT_TELEGRAM_NETWORK_APPROVED:?set-true-only-after-network-approval}
-    secrets:
-      - database_url
-      - machine_token
-      - evidence_link_secret
-      - telegram_bot_token
-      - telegram_chat_id
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
-    networks:
-      - control
-      - data
-      - egress
-    depends_on:
-      api: {condition: service_healthy}
-    mem_limit: 512m
-    cpus: 0.5
-    pids_limit: 128
-    deploy:
-      resources:
-        limits: {cpus: "0.5", memory: 512M}
 
   retention:
     <<: [*service-hardening, *api-image]
@@ -388,9 +249,12 @@ services:
       - --site-id=${PILOT_SITE_ID:?set-authoritative-site-id}
       - --site-config=/run/config/site.yaml
       - --site-config-sha256=${PILOT_SITE_CONFIG_SHA256:?set-reviewed-site-config-sha256}
+      - --object-store-region=${PILOT_RETENTION_OBJECT_STORE_REGION:?set-reviewed-object-store-region}
       - --interval-seconds=3600
       - --evidence-batch-size=1000
       - --audit-batch-size=10000
+      - --preview-batch-size=1000
+      - --preview-publication-grace-seconds=900
     secrets:
       - retention_database_url
       - object_store_access_key
@@ -399,7 +263,12 @@ services:
       - audit_archive_signing_private_key
       - audit_archive_signing_public_key
     volumes:
-      - ${PILOT_SITE_CONFIG_PATH:?set-reviewed-site-config-path}:/run/config/site.yaml:ro
+      - type: bind
+        source: ${PILOT_SITE_CONFIG_PATH:?set-reviewed-site-config-path}
+        target: /run/config/site.yaml
+        read_only: true
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
     networks:
@@ -425,7 +294,12 @@ services:
       - tls_certificate
       - tls_private_key
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - type: bind
+        source: ./nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+        bind:
+          create_host_path: false
     tmpfs:
       - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m,uid=101,gid=101,mode=0700
       - /var/run:rw,noexec,nosuid,nodev,size=8m,uid=101,gid=101,mode=0700
@@ -457,9 +331,14 @@ services:
       - --web.enable-lifecycle=false
       - --web.enable-admin-api=false
     secrets:
-      - machine_token
+      - monitoring_machine_token
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - type: bind
+        source: ./prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind:
+          create_host_path: false
       - prometheus_data:/prometheus
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
@@ -481,8 +360,6 @@ services:
         limits: {cpus: "1.0", memory: 1G}
 
 networks:
-  acceptance-loopback:
-    internal: true
   control:
     internal: true
     ipam:
@@ -493,9 +370,6 @@ networks:
   # These networks must be created and host-firewall-fenced before Compose.
   # See deploy/pilot/NETWORK_POLICY.md. Compose deliberately cannot create an
   # unrestricted egress bridge as a side effect.
-  egress:
-    external: true
-    name: ${PILOT_NOTIFICATION_EGRESS_NETWORK:?set-precreated-notification-egress-network}
   storage-egress:
     external: true
     name: ${PILOT_STORAGE_EGRESS_NETWORK:?set-precreated-storage-egress-network}
@@ -512,18 +386,17 @@ secrets:
   retention_database_url: {external: true}
   migrator_database_password: {external: true}
   api_database_password: {external: true}
+  runtime_database_password: {external: true}
   retention_database_password: {external: true}
   session_secret: {external: true}
   totp_encryption_key: {external: true}
-  machine_token: {external: true}
-  acceptance_controller_token: {external: true}
-  evidence_link_secret: {external: true}
+  runtime_machine_token: {external: true}
+  monitoring_machine_token: {external: true}
+  evidence_link_signing_secret: {external: true}
   object_store_access_key: {external: true}
   object_store_secret_key: {external: true}
   audit_archive_age_recipient: {external: true}
   audit_archive_signing_private_key: {external: true}
   audit_archive_signing_public_key: {external: true}
-  telegram_bot_token: {external: true}
-  telegram_chat_id: {external: true}
   tls_certificate: {external: true}
   tls_private_key: {external: true}

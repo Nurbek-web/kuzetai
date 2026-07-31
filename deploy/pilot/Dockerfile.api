@@ -25,7 +25,11 @@ COPY alembic.ini /app/alembic.ini
 COPY migrations /app/migrations
 COPY protector /app/protector
 COPY scripts/pilot /app/scripts/pilot
-RUN command -v age >/dev/null && command -v openssl >/dev/null
+RUN command -v age >/dev/null \
+    && command -v openssl >/dev/null \
+    && command -v uvicorn >/dev/null \
+    && python -c "from protector.pilot.api.production import create_production_app; assert callable(create_production_app)" \
+    && python -c "from protector.pilot.api.acceptance_controller import create_production_acceptance_controller_v3_app; assert callable(create_production_acceptance_controller_v3_app)"
 
 RUN groupadd --gid 10001 kuzet \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent kuzet \
@@ -34,7 +38,10 @@ RUN groupadd --gid 10001 kuzet \
     && install -d -o root -g root -m 0755 /run/config/acceptance \
     && install -d -o root -g root -m 0755 /run/keys/acceptance \
     && install -d -o root -g root -m 0755 /var/lib/kuzet/acceptance \
-    && install -d -o 10001 -g 10001 -m 0700 /var/lib/kuzet/acceptance-proofs \
+    && install -d -o root -g root -m 0755 /var/lib/kuzet/acceptance-capture \
+    && install -d -o root -g root -m 0755 /var/lib/kuzet/acceptance-channel \
+    && install -d -o root -g root -m 0755 /var/lib/kuzet/acceptance-snapshot \
+    && install -d -o 10001 -g 10001 -m 0700 /var/lib/kuzet/acceptance-proof \
     && install -o root -g root -m 0400 /dev/null \
       /var/lib/kuzet/acceptance/authority.sqlite3 \
     && install -o root -g root -m 0400 /dev/null \

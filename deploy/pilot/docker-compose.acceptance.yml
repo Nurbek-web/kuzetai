@@ -1,0 +1,160 @@
+# Explicit, target-only acceptance V3 overlay. It is deliberately isolated
+# from Docker control APIs: no docker.sock, host PID namespace, or host network.
+services:
+  acceptance-controller:
+    image: ${PILOT_API_IMAGE_REPOSITORY:?set-reviewed-api-repository}@sha256:${PILOT_API_IMAGE_SHA256:?set-reviewed-64hex-content-digest}
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    command:
+      - protector.pilot.api.acceptance_controller:create_production_acceptance_controller_v3_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --no-proxy-headers
+      - --no-server-header
+    environment:
+      PILOT_SITE_ID: ${PILOT_SITE_ID:?set-authoritative-site-id}
+      PILOT_ACCEPTANCE_CAMPAIGN_ID: ${PILOT_ACCEPTANCE_CAMPAIGN_ID:?set-signed-acceptance-campaign-id}
+      PILOT_ACCEPTANCE_GATE: ${PILOT_ACCEPTANCE_GATE:?set-8h-or-72h}
+      PILOT_ACCEPTANCE_JOURNAL_PATH: /var/lib/kuzet/acceptance/authority.sqlite3
+      PILOT_ACCEPTANCE_PROOF_DIR: /var/lib/kuzet/acceptance-proof
+      PILOT_ACCEPTANCE_SNAPSHOT_DIR: /var/lib/kuzet/acceptance-snapshot
+      PILOT_ACCEPTANCE_CHANNEL_DIR: /var/lib/kuzet/acceptance-channel
+      PILOT_ACCEPTANCE_CAPTURE_DIR: /var/lib/kuzet/acceptance-capture
+      PILOT_ACCEPTANCE_OFFLINE_ROOT_SPKI_SHA256: ${PILOT_ACCEPTANCE_OFFLINE_ROOT_SPKI_SHA256:?set-out-of-band-offline-root-SPKI-sha256}
+    secrets:
+      - acceptance_controller_token
+    volumes:
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_OFFLINE_ROOT_PUBLIC_KEY_PATH:?set-offline-root-public-key-path}
+        target: /run/config/acceptance/offline-root-public.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_TRUST_POLICY_PATH:?set-signed-trust-policy-path}
+        target: /run/config/acceptance/trust-policy.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_TRUST_POLICY_SIGNATURE_PATH:?set-trust-policy-signature-path}
+        target: /run/config/acceptance/trust-policy.sig
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_MANIFEST_PATH:?set-signed-acceptance-manifest-path}
+        target: /run/config/acceptance/acceptance-manifest.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_MANIFEST_SIGNATURE_PATH:?set-acceptance-manifest-signature-path}
+        target: /run/config/acceptance/acceptance-manifest.sig
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_MANIFEST_ROLE_PUBLIC_KEY_PATH:?set-manifest-role-public-key-path}
+        target: /run/config/acceptance/manifest-role-public.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_CAPACITY_ROLE_PUBLIC_KEY_PATH:?set-capacity-role-public-key-path}
+        target: /run/config/acceptance/capacity-role-public.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_RUN_ROLE_PUBLIC_KEY_PATH:?set-run-role-public-key-path}
+        target: /run/config/acceptance/run-role-public.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_REPORT_ROLE_PUBLIC_KEY_PATH:?set-report-role-public-key-path}
+        target: /run/config/acceptance/report-role-public.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_CONDITIONAL_ROLE_PUBLIC_KEY_PATH:?set-conditional-role-public-key-path}
+        target: /run/config/acceptance/conditional-role-public.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_RUN_PRIVATE_KEY_PATH:?set-run-private-key-path}
+        target: /run/keys/acceptance/run-private.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_STATE_PATH:?set-private-finite-acceptance-state-path}/authority.sqlite3
+        target: /var/lib/kuzet/acceptance/authority.sqlite3
+        read_only: false
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_STATE_PATH:?set-private-finite-acceptance-state-path}/authority.sqlite3-wal
+        target: /var/lib/kuzet/acceptance/authority.sqlite3-wal
+        read_only: false
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_STATE_PATH:?set-private-finite-acceptance-state-path}/authority.sqlite3-shm
+        target: /var/lib/kuzet/acceptance/authority.sqlite3-shm
+        read_only: false
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_PROOF_PATH:?set-private-finite-gate-proof-path}
+        target: /var/lib/kuzet/acceptance-proof
+        read_only: false
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_SNAPSHOT_PATH:?set-private-finite-gate-snapshot-path}
+        target: /var/lib/kuzet/acceptance-snapshot
+        read_only: false
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_CHANNEL_PATH:?set-private-launch-bound-channel-path}
+        target: /var/lib/kuzet/acceptance-channel
+        read_only: false
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PILOT_ACCEPTANCE_CAPTURE_PATH:?set-private-finite-acceptance-capture-path}
+        target: /var/lib/kuzet/acceptance-capture
+        read_only: false
+        bind: {create_host_path: false}
+    ports:
+      - "127.0.0.1:${PILOT_ACCEPTANCE_PORT:?set-loopback-acceptance-port}:8000"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - acceptance-loopback
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import pathlib,urllib.request; token=pathlib.Path('/run/secrets/acceptance_controller_token').read_text().strip(); request=urllib.request.Request('http://127.0.0.1:8000/ready',headers={'Authorization':'Bearer '+token}); urllib.request.urlopen(request,timeout=2).read()"
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 512M}
+
+networks:
+  acceptance-loopback:
+    internal: true
+
+secrets:
+  acceptance_controller_token: {external: true}

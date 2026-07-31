@@ -20,16 +20,47 @@ LABEL org.opencontainers.image.title="Kuzet pilot DeepStream runtime" \
 
 WORKDIR /app
 COPY pyproject.toml /app/pyproject.toml
+COPY deploy/pilot/api-requirements.lock /tmp/runtime-requirements.lock
 COPY protector /app/protector
 COPY deploy/pilot/deepstream /app/deploy/pilot/deepstream
 
-# NVIDIA bindings are supplied by the pinned DeepStream image.  Keep them out
-# of the Apple/M2 dependency graph; this layer provides only pure-Python config
-# dependencies needed to parse the runtime manifest.
-RUN python3 -m pip install --no-cache-dir 'pydantic==2.13.4' 'pyyaml==6.0.3'
+# NVIDIA bindings are supplied by the pinned DeepStream image. Runtime event,
+# journal, PostgreSQL, object-store, metrics, and preview contracts use the
+# same hash-locked pure-Python dependency set as the control plane. FFmpeg and
+# ffprobe are target tools for bounded evidence assembly/verification; their
+# presence here is not an NVENC acceptance claim.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+      ffmpeg \
+      openssl \
+    && install -d -o root -g root -m 0755 /usr/share/kuzet \
+    && dpkg-query -W -f='${binary:Package}=${Version}\n' ffmpeg openssl \
+      > /usr/share/kuzet/runtime-package-versions.txt \
+    && rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install \
+      --no-cache-dir \
+      --require-hashes \
+      --requirement /tmp/runtime-requirements.lock \
+    && rm /tmp/runtime-requirements.lock
+RUN python3 -c "import boto3, prometheus_client, psycopg, pydantic, sqlalchemy, yaml" \
+    && python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; import pyds; assert Gst.version()" \
+    && command -v ffmpeg >/dev/null \
+    && command -v ffprobe >/dev/null \
+    && command -v gst-inspect-1.0 >/dev/null \
+    && command -v openssl >/dev/null \
+    && { \
+      ffmpeg -version | sed -n '1p'; \
+      ffprobe -version | sed -n '1p'; \
+      gst-inspect-1.0 --version | sed -n '1p'; \
+      python3 --version; \
+    } > /usr/share/kuzet/runtime-tool-versions.txt \
+    && sha256sum \
+      /usr/share/kuzet/runtime-package-versions.txt \
+      /usr/share/kuzet/runtime-tool-versions.txt \
+      > /usr/share/kuzet/runtime-tool-versions.sha256
 RUN groupadd --gid 10001 kuzet-runtime \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin kuzet-runtime
 
 ENV PYTHONPATH=/app
 USER 10001:10001
-ENTRYPOINT ["python3", "-m", "protector.pilot.runtime.deepstream"]
+ENTRYPOINT ["python3", "-m", "protector.pilot.runtime.production_main"]

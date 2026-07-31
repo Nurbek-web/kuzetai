@@ -1,0 +1,65 @@
+# Operations jobs run on the same Linux/amd64 target as the controlled pilot.
+# The base manifest digest is fixed; the built image digest is separately
+# reviewed and supplied to each Compose overlay.
+FROM --platform=linux/amd64 python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+
+ARG TARGETARCH
+RUN test "${TARGETARCH}" = "amd64"
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+      age \
+      awscli \
+      ca-certificates \
+      coreutils \
+      diffutils \
+      openssl \
+      postgresql-client \
+      tar \
+      util-linux \
+    && install -d -o root -g root -m 0755 /usr/share/kuzet \
+    && dpkg-query -W \
+      -f='${binary:Package}=${Version}\n' \
+      age awscli ca-certificates coreutils diffutils openssl postgresql-client tar util-linux \
+      | LC_ALL=C sort > /usr/share/kuzet/ops-package-versions.txt \
+    && sha256sum /usr/share/kuzet/ops-package-versions.txt \
+      > /usr/share/kuzet/ops-package-versions.txt.sha256 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY deploy/pilot/ops-requirements.lock /tmp/ops-requirements.lock
+RUN python3 -m pip install \
+      --no-cache-dir \
+      --require-hashes \
+      --requirement /tmp/ops-requirements.lock \
+    && rm /tmp/ops-requirements.lock
+COPY scripts/pilot /app/scripts/pilot
+
+# Make image construction fail if a backup/restore executable is absent.
+RUN command -v age >/dev/null \
+    && command -v aws >/dev/null \
+    && command -v cmp >/dev/null \
+    && command -v findmnt >/dev/null \
+    && command -v openssl >/dev/null \
+    && command -v pg_dump >/dev/null \
+    && command -v pg_restore >/dev/null \
+    && command -v psql >/dev/null \
+    && command -v python3 >/dev/null \
+    && command -v sha256sum >/dev/null \
+    && command -v tar >/dev/null \
+    && python3 -c "import psycopg"
+
+RUN groupadd --gid 10002 kuzet-ops \
+    && useradd \
+      --uid 10002 \
+      --gid 10002 \
+      --no-create-home \
+      --home-dir /nonexistent \
+      --shell /usr/sbin/nologin \
+      kuzet-ops
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+USER 10002:10002
+ENTRYPOINT ["/bin/false"]

@@ -9,8 +9,7 @@ import os
 import stat
 import sys
 from pathlib import Path
-
-import yaml
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -20,8 +19,11 @@ from protector.pilot.runtime.mount_contract import (
     RuntimeMountContractV1,
     validate_runtime_mount_contract,
 )
+from protector.pilot.trusted_yaml import load_strict_yaml
 
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
+_MAX_YAML_NODES = 100_000
+_MAX_YAML_DEPTH = 96
 
 
 def _read_reviewed(path: Path, expected_sha256: str, label: str) -> bytes:
@@ -47,6 +49,19 @@ def _read_reviewed(path: Path, expected_sha256: str, label: str) -> bytes:
     return payload
 
 
+def _parse_reviewed_mapping(payload: bytes) -> dict[str, Any]:
+    return cast(
+        dict[str, Any],
+        load_strict_yaml(
+            payload,
+            max_bytes=_MAX_INPUT_BYTES,
+            max_nodes=_MAX_YAML_NODES,
+            max_depth=_MAX_YAML_DEPTH,
+            require_mapping=True,
+        ),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--site-config", type=Path, required=True)
@@ -57,6 +72,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--measured-capacity-sha256", required=True)
     parser.add_argument("--measured-capacity-signature", type=Path, required=True)
     parser.add_argument("--capacity-authority-public-key", type=Path, required=True)
+    parser.add_argument("--database-url-secret", type=Path, required=True)
+    parser.add_argument("--object-store-access-key-secret", type=Path, required=True)
+    parser.add_argument("--object-store-secret-key-secret", type=Path, required=True)
+    parser.add_argument("--runtime-journal-source", type=Path, required=True)
+    parser.add_argument("--runtime-preview-source", type=Path, required=True)
     parser.add_argument("--mount-contract", type=Path, required=True)
     parser.add_argument("--mount-contract-sha256", required=True)
     parser.add_argument("--image-id", required=True)
@@ -82,10 +102,14 @@ def main(argv: list[str] | None = None) -> int:
             arguments.mount_contract_sha256,
             "runtime mount contract",
         )
-        site = SiteConfig.model_validate(yaml.safe_load(site_payload))
-        runtime = RuntimeModelManifestV1.model_validate(yaml.safe_load(runtime_payload))
+        site = SiteConfig.model_validate(
+            _parse_reviewed_mapping(site_payload)
+        )
+        runtime = RuntimeModelManifestV1.model_validate(
+            _parse_reviewed_mapping(runtime_payload)
+        )
         contract = RuntimeMountContractV1.model_validate(
-            yaml.safe_load(contract_payload)
+            _parse_reviewed_mapping(contract_payload)
         )
         mount_argv = validate_runtime_mount_contract(
             site_config=site,
@@ -101,8 +125,17 @@ def main(argv: list[str] | None = None) -> int:
             capacity_authority_public_key_source=(
                 arguments.capacity_authority_public_key
             ),
+            database_url_secret_source=arguments.database_url_secret,
+            object_store_access_key_secret_source=(
+                arguments.object_store_access_key_secret
+            ),
+            object_store_secret_key_secret_source=(
+                arguments.object_store_secret_key_secret
+            ),
+            runtime_journal_source=arguments.runtime_journal_source,
+            runtime_preview_source=arguments.runtime_preview_source,
         )
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, ValueError) as exc:
         parser.error(str(exc))
     for argument in mount_argv:
         print(argument)

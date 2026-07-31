@@ -1,0 +1,48 @@
+# Deliberate one-shot first-administrator bootstrap. It has no default
+# credentials and accepts sensitive values from Docker secret files only.
+services:
+  admin-bootstrap:
+    image: ${PILOT_API_IMAGE_REPOSITORY:?set-reviewed-api-repository}@sha256:${PILOT_API_IMAGE_SHA256:?set-reviewed-64hex-content-digest}
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    entrypoint: ["python", "/app/scripts/pilot/bootstrap_admin.py"]
+    command:
+      - --database-url-secret=/run/secrets/admin_bootstrap_database_url
+      - --username-secret=/run/secrets/admin_bootstrap_username
+      - --password-secret=/run/secrets/admin_bootstrap_password
+      - --totp-secret=/run/secrets/admin_bootstrap_totp
+      - --totp-encryption-key-secret=/run/secrets/totp_encryption_key
+    secrets:
+      - admin_bootstrap_database_url
+      - admin_bootstrap_username
+      - admin_bootstrap_password
+      - admin_bootstrap_totp
+      - totp_encryption_key
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    networks:
+      - data
+    depends_on:
+      provision: {condition: service_completed_successfully}
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256M}
+
+secrets:
+  admin_bootstrap_database_url: {external: true}
+  admin_bootstrap_username: {external: true}
+  admin_bootstrap_password: {external: true}
+  admin_bootstrap_totp: {external: true}

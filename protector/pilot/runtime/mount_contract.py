@@ -9,7 +9,7 @@ import stat
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from protector.pilot.config import FrozenModel, SiteConfig
 
@@ -58,6 +58,12 @@ class RuntimeBindMountV1(FrozenModel):
     target: Path
     kind: Literal["file", "directory"]
     read_only: bool
+    storage_encryption_attested: StrictBool = False
+    storage_quota_bytes: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=1_000_000_000_000,
+    )
 
     @field_validator("source")
     @classmethod
@@ -68,6 +74,23 @@ class RuntimeBindMountV1(FrozenModel):
     @classmethod
     def target_is_canonical(cls, value: Path) -> Path:
         return _canonical_absolute_path(value, label="mount target")
+
+    @model_validator(mode="after")
+    def storage_attestation_is_coherent(self) -> RuntimeBindMountV1:
+        has_quota = self.storage_quota_bytes is not None
+        if self.kind == "file" and (
+            self.storage_encryption_attested or has_quota
+        ):
+            raise ValueError(
+                "file mounts cannot claim writable storage attestation"
+            )
+        if self.kind == "directory" and (
+            self.storage_encryption_attested != has_quota
+        ):
+            raise ValueError(
+                "directory encryption and quota attestations must be complete"
+            )
+        return self
 
 
 class RuntimeMountContractV1(FrozenModel):
@@ -259,11 +282,48 @@ def validate_runtime_mount_contract(
     measured_capacity_source: Path,
     measured_capacity_signature_source: Path,
     capacity_authority_public_key_source: Path,
+    database_url_secret_source: Path | None = None,
+    object_store_access_key_secret_source: Path | None = None,
+    object_store_secret_key_secret_source: Path | None = None,
+    runtime_journal_source: Path | None = None,
+    runtime_preview_source: Path | None = None,
     runtime_uid: int = 10_001,
     runtime_gid: int = 10_001,
 ) -> tuple[str, ...]:
     """Validate exact target coverage and return safe Docker argv pairs."""
 
+    production_secret_sources = (
+        database_url_secret_source,
+        object_store_access_key_secret_source,
+        object_store_secret_key_secret_source,
+    )
+    production_storage_sources = (
+        runtime_journal_source,
+        runtime_preview_source,
+    )
+    if any(source is not None for source in production_secret_sources) and not all(
+        source is not None for source in production_secret_sources
+    ):
+        raise ValueError(
+            "production secret mount sources must be supplied together"
+        )
+    production_mode = all(
+        source is not None for source in production_secret_sources
+    )
+    all_storage_sources = all(
+        source is not None for source in production_storage_sources
+    )
+    any_storage_sources = any(
+        source is not None for source in production_storage_sources
+    )
+    if (
+        production_mode and not all_storage_sources
+    ) or (
+        not production_mode and any_storage_sources
+    ):
+        raise ValueError(
+            "production secret and writable storage sources must be supplied together"
+        )
     if contract.image_id != expected_image_id or _IMAGE_ID.fullmatch(expected_image_id) is None:
         raise ValueError("mount contract does not match captured immutable image ID")
     feeds = site_config.ready_to_start.feeds
@@ -273,6 +333,13 @@ def validate_runtime_mount_contract(
         site_config.storage.retention.encoded_spool_root,
         label="evidence spool target",
     )
+    if (
+        production_mode
+        and spool_target != Path("/srv/kuzet/evidence-spool")
+    ):
+        raise ValueError(
+            "production evidence spool target must be /srv/kuzet/evidence-spool"
+        )
     required: dict[Path, tuple[str, bool, int | None, str | None]] = {
         Path("/run/config/site.yaml"): ("file", True, _MAX_CONFIG_BYTES, None),
         Path("/run/config/runtime-manifest.yaml"): (
@@ -312,6 +379,45 @@ def validate_runtime_mount_contract(
             None,
         ),
     }
+    production_directory_targets = {
+        Path("/var/lib/kuzet/journal"),
+        Path("/var/lib/kuzet/previews"),
+    }
+    if production_mode:
+        required.update(
+            {
+                Path("/run/secrets/runtime_database_url"): (
+                    "file",
+                    True,
+                    _MAX_SECRET_BYTES,
+                    None,
+                ),
+                Path("/run/secrets/runtime_object_store_access_key"): (
+                    "file",
+                    True,
+                    _MAX_SECRET_BYTES,
+                    None,
+                ),
+                Path("/run/secrets/runtime_object_store_secret_key"): (
+                    "file",
+                    True,
+                    _MAX_SECRET_BYTES,
+                    None,
+                ),
+                Path("/var/lib/kuzet/journal"): (
+                    "directory",
+                    False,
+                    None,
+                    None,
+                ),
+                Path("/var/lib/kuzet/previews"): (
+                    "directory",
+                    False,
+                    None,
+                    None,
+                ),
+            }
+        )
     camera_secret_targets: list[Path] = []
     for feed in feeds:
         reference = feed.rtsp_url
@@ -384,6 +490,33 @@ def validate_runtime_mount_contract(
         raise ValueError(
             "camera secret mounts require 20 unique and disjoint host source paths"
         )
+    if production_mode:
+        production_sources = tuple(mount.source for mount in contract.mounts)
+        paths_overlap = any(
+            left == right
+            or left.is_relative_to(right)
+            or right.is_relative_to(left)
+            for index, left in enumerate(production_sources)
+            for right in production_sources[index + 1 :]
+        )
+        production_identities: list[tuple[int, int]] = []
+        for source in production_sources:
+            _reject_symlink_ancestors(source)
+            try:
+                source_metadata = source.stat()
+            except OSError as exc:
+                raise ValueError(
+                    "production runtime mount source is unavailable"
+                ) from exc
+            production_identities.append(
+                (source_metadata.st_dev, source_metadata.st_ino)
+            )
+        if paths_overlap or len(production_identities) != len(
+            set(production_identities)
+        ):
+            raise ValueError(
+                "production runtime mount sources must be unique and disjoint"
+            )
     reviewed_sources = {
         Path("/run/config/site.yaml"): site_config_source,
         Path("/run/config/runtime-manifest.yaml"): runtime_manifest_source,
@@ -395,6 +528,22 @@ def validate_runtime_mount_contract(
             capacity_authority_public_key_source
         ),
     }
+    if production_mode:
+        reviewed_sources.update(
+            {
+                Path("/run/secrets/runtime_database_url"): (
+                    database_url_secret_source
+                ),
+                Path("/run/secrets/runtime_object_store_access_key"): (
+                    object_store_access_key_secret_source
+                ),
+                Path("/run/secrets/runtime_object_store_secret_key"): (
+                    object_store_secret_key_secret_source
+                ),
+                Path("/var/lib/kuzet/journal"): runtime_journal_source,
+                Path("/var/lib/kuzet/previews"): runtime_preview_source,
+            }
+        )
     for target, source in reviewed_sources.items():
         expected_source = _canonical_absolute_path(
             source,
@@ -411,17 +560,29 @@ def validate_runtime_mount_contract(
             max_bytes=max_bytes,
             expected_sha256=digest,
         )
-    spool_source_metadata = by_target[spool_target].source.stat()
-    if (
-        runtime_uid < 1
-        or runtime_gid < 1
-        or spool_source_metadata.st_uid != runtime_uid
-        or spool_source_metadata.st_gid != runtime_gid
-        or stat.S_IMODE(spool_source_metadata.st_mode) != 0o700
-    ):
-        raise ValueError(
-            "evidence spool must be private and owned by runtime UID/GID"
-        )
+    writable_targets = {spool_target}
+    if production_mode:
+        writable_targets.update(production_directory_targets)
+    for target in writable_targets:
+        mount = by_target[target]
+        source_metadata = mount.source.stat()
+        if (
+            runtime_uid < 1
+            or runtime_gid < 1
+            or source_metadata.st_uid != runtime_uid
+            or source_metadata.st_gid != runtime_gid
+            or stat.S_IMODE(source_metadata.st_mode) != 0o700
+        ):
+            raise ValueError(
+                "writable runtime storage must be private and owned by runtime UID/GID"
+            )
+        if production_mode and (
+            not mount.storage_encryption_attested
+            or mount.storage_quota_bytes is None
+        ):
+            raise ValueError(
+                "production runtime storage requires encryption and quota attestation"
+            )
     arguments: list[str] = []
     for target in sorted(by_target, key=str):
         mount = by_target[target]
