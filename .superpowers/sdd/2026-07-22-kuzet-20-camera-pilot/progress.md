@@ -4247,6 +4247,17 @@ reservation integration.
   implementation bytes: **C0 / I0 / M0**. No replacement-review minors are
   parked. Hardware, provider, and customer-acceptance gates below are explicit
   external blockers, not local review findings.
+- The first post-publication path-parity check found 143 remote changes versus
+  140 reviewed implementation paths. The three extras were mode-only drift
+  introduced by the synthetic local checkpoint:
+  `scripts/pilot/acceptance_report.py`, `scripts/pilot/backup.sh`, and
+  `scripts/pilot/restore.sh` had lost their checkpoint `100755` modes while
+  retaining identical blobs. Commit
+  `caeb385a27e3a772fe2d4f66e0589da281ea0f74` restores those executable
+  modes only. Independent bounded review was **C0 / I0 / M0**; shebangs,
+  `bash -n`, `py_compile`, blob identity, and whitespace are clean. The
+  corrected GitHub compare contains exactly the 140 reviewed paths with no
+  extra or missing path.
 
 ### Available cloud verification
 
@@ -4311,9 +4322,10 @@ Tasks 13 and 14 are complete for the safely implementable cloud scope. Human
 review starts at
 `ae18d636c2df333591bc747a855b4e4730ff3267..codex/kuzet-20-camera-pilot`.
 The exact review head is the dedicated-branch commit containing this closeout
-entry; publication is recorded by that branch ref because a commit cannot
-self-reference its own SHA. There is no remaining cloud acceptance claim to
-manufacture. After approval, resume only with the exact PostgreSQL/storage,
-NVIDIA, exact-20, 8-hour, restore-drill, and 72-hour commands in the committed
-runbooks, archive the signed artifacts and exceptions, and keep every
-conditional analytic shadowed or disabled unless its lawful site gate passes.
+and publication-fidelity entry; publication is recorded by that branch ref
+because a commit cannot self-reference its own SHA. There is no remaining
+cloud acceptance claim to manufacture. After approval, resume only with the
+exact PostgreSQL/storage, NVIDIA, exact-20, 8-hour, restore-drill, and 72-hour
+commands in the committed runbooks, archive the signed artifacts and
+exceptions, and keep every conditional analytic shadowed or disabled unless
+its lawful site gate passes.
