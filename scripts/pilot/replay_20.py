@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 from uuid import uuid4
 
-import yaml
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -53,6 +52,7 @@ from protector.pilot.acceptance import (  # noqa: E402
     source_profiles_sha256,
 )
 from protector.pilot.acceptance_authority import (  # noqa: E402
+    AcceptanceRunSigner,
     AcceptanceAuthorityTrustContextV2,
     AcceptanceFaultAckRequestV2,
     AcceptanceFaultAckResponseV2,
@@ -74,16 +74,46 @@ from protector.pilot.acceptance_authority import (  # noqa: E402
     build_acceptance_trust_binding,
     build_authority_trust_context,
 )
+from protector.pilot.acceptance_c2 import (  # noqa: E402
+    SQLiteTargetExecutionTransitionJournalV3,
+    SignedTargetAuthorityBindingV3,
+    bind_target_authority_v3,
+)
+from protector.pilot.acceptance_campaign import (  # noqa: E402
+    TargetCampaignCompletionV3,
+    TargetCampaignCoordinatorV3,
+    TargetRuntimeContinuationCoordinatorV3,
+    _advance_target_runtime_restart_v3,
+    _register_authenticated_fault_acknowledgement_source,
+    _require_distinct_authority_files,
+)
+from protector.pilot.acceptance_source_profile import (  # noqa: E402
+    TargetSourceProfileAttestationV2,
+    capture_verified_target_source_profile_attestation,
+)
+from protector.pilot.acceptance_target import (  # noqa: E402
+    TargetRuntimeLaunchRequestV2,
+    TargetSourceBindingV2,
+)
+from protector.pilot.acceptance_target_controller import (  # noqa: E402
+    TargetRuntimeControllerEnvironmentV2,
+)
+from protector.pilot.acceptance_controller_v3 import (  # noqa: E402
+    AcceptanceControllerResultV3,
+)
 from protector.pilot.acceptance_proof import (  # noqa: E402
     MAX_ACCEPTANCE_JOURNAL_PROOF_BYTES,
     AcceptanceFinalEnvelopeV2,
     TargetRunAttestationV2,
+    VerifiedAcceptanceJournalProofV2,
     verify_acceptance_journal_proof,
 )
 from protector.pilot.acceptance_trust import (  # noqa: E402
     AcceptanceGate,
     AcceptanceRolePublicKeyPathsV2,
     VerifiedAcceptanceTrustV2,
+    canonical_json_bytes,
+    load_canonical_json_bytes,
     verify_acceptance_trust_chain,
 )
 from protector.pilot.config import (  # noqa: E402
@@ -96,6 +126,15 @@ from protector.pilot.config import (  # noqa: E402
     SecretReference,
     SiteConfig,
 )
+
+# V2 replay remains a verification/evidence transport only.  Production
+# authorization is exclusively the private V3 C2 -> snapshot authority path.
+LEGACY_TARGET_REPLAY_AUTHORIZING = False
+RETAINED_V3_RUNTIME_RESTART_AUTHORIZING = False
+_TARGET_RUNTIME_UID = 10_001
+_TARGET_RUNTIME_GID = 10_001
+
+
 from protector.pilot.domain import ObservationV1  # noqa: E402
 from protector.pilot.metrics import PilotMetrics  # noqa: E402
 from protector.pilot.provisioning import (  # noqa: E402
@@ -109,6 +148,7 @@ from protector.pilot.runtime.container_runner import (  # noqa: E402
 )
 from protector.pilot.runtime.deepstream import (  # noqa: E402
     DEEPSTREAM_IMAGE,
+    DeepStreamGraphSpec,
     RuntimeModelManifestV1,
 )
 from protector.pilot.runtime.event_engine import EventEngine  # noqa: E402
@@ -124,6 +164,15 @@ from protector.pilot.trusted_artifacts import (  # noqa: E402
     read_regular_bounded,  # noqa: E402
     verify_ed25519_payload,
 )
+from protector.pilot.trusted_yaml import (  # noqa: E402
+    StrictYAMLError,
+    load_strict_yaml,
+)
+
+_MAX_RUNTIME_MOUNT_CONTRACT_YAML_BYTES = 8 * 1024 * 1024
+_MAX_RUNTIME_MOUNT_CONTRACT_YAML_NODES = 100_000
+_MAX_RUNTIME_MOUNT_CONTRACT_YAML_DEPTH = 96
+_MAX_ACCEPTANCE_CONTROLLER_V3_RESULT_BYTES = 1024 * 1024
 
 
 class ObservationConsumer(Protocol):
@@ -871,9 +920,35 @@ class TargetCollector(Protocol):
         fault_id: str,
         phase: str,
         at_offset: float,
-    ) -> None: ...
+    ) -> object: ...
 
     def finish(self) -> AcceptanceRunRecordV2: ...
+
+
+@dataclass(frozen=True)
+class TargetV3CollectedEvidence:
+    """The V2 envelope/proof observed only after V3 C2 authorization."""
+
+    final_envelope: AcceptanceFinalEnvelopeV2
+    journal_proof_path: Path
+    continuation_capability: object
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.final_envelope) is not AcceptanceFinalEnvelopeV2
+            or not isinstance(self.journal_proof_path, Path)
+            or not self.journal_proof_path.is_absolute()
+            or self.continuation_capability is None
+        ):
+            raise ValueError("V3 collector evidence must use exact durable V2 artifacts")
+
+
+class TargetV3CollectorRunner(Protocol):
+    def __call__(
+        self,
+        arguments: argparse.Namespace,
+        campaign: TargetCampaignCompletionV3,
+    ) -> TargetV3CollectedEvidence: ...
 
 
 class FaultEffectExecutor(Protocol):
@@ -1412,6 +1487,7 @@ class AuthenticatedTargetCollector:
         fault_executor: FaultEffectExecutor | None = None,
         observer: TargetAcceptanceAdapter | None = None,
         journal_path: Path | None = None,
+        collector_id: str | None = None,
         timeout_seconds: float = 5.0,
     ) -> None:
         parsed = urllib.parse.urlsplit(base_url)
@@ -1428,6 +1504,16 @@ class AuthenticatedTargetCollector:
             raise ValueError("collector URL must be the reviewed loopback API origin")
         if not 0 < timeout_seconds <= 30:
             raise ValueError("collector timeout must be finite and at most 30 seconds")
+        if collector_id is not None and (
+            type(collector_id) is not str
+            or not 1 <= len(collector_id) <= 160
+            or any(
+                character
+                not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-"
+                for character in collector_id
+            )
+        ):
+            raise ValueError("target collector identity is invalid")
         trust_context = build_authority_trust_context(
             trust=verified_trust,
             configured_site_id=configured_site_id,
@@ -1470,6 +1556,7 @@ class AuthenticatedTargetCollector:
         self._fault_acknowledgements: dict[tuple[str, str], dict[str, object]] = {}
         self._launch: LaunchAttestationV2 | None = None
         self._execution: ExecutionBindingV2 | None = None
+        self._requested_collector_id = collector_id
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(base_url={self._base_url!r})"
@@ -1482,6 +1569,28 @@ class AuthenticatedTargetCollector:
         if not isinstance(collector_id, str):
             raise RuntimeError("target collector identity is invalid")
         return collector_id
+
+    @property
+    def campaign_collector_id(self) -> str:
+        if self._binding is not None:
+            return self.collector_id
+        stored = self._journal.request("start")
+        stored_id = (
+            None
+            if stored is None
+            else AcceptanceStartRequestV2.model_validate(stored).collector_id
+        )
+        if (
+            stored_id is not None
+            and self._requested_collector_id is not None
+            and stored_id != self._requested_collector_id
+        ):
+            raise RuntimeError("durable target collector identity differs")
+        if stored_id is not None:
+            return stored_id
+        if self._requested_collector_id is None:
+            self._requested_collector_id = f"collector-{uuid4()}"
+        return self._requested_collector_id
 
     def _post(self, path: str, payload: dict[str, object], *, limit: int) -> dict[str, object]:
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -1545,9 +1654,30 @@ class AuthenticatedTargetCollector:
                 last_error = exc
         else:
             raise RuntimeError("target collector request failed") from last_error
+        def reject_duplicate_keys(
+            pairs: list[tuple[str, object]],
+        ) -> dict[str, object]:
+            decoded_object: dict[str, object] = {}
+            for key, value in pairs:
+                if key in decoded_object:
+                    raise ValueError(
+                        "target collector returned duplicate JSON keys"
+                    )
+                decoded_object[key] = value
+            return decoded_object
+
+        def reject_nonfinite(value: str) -> None:
+            raise ValueError(
+                f"target collector returned non-finite JSON: {value}"
+            )
+
         try:
-            decoded = json.loads(encoded)
-        except (UnicodeError, json.JSONDecodeError) as exc:
+            decoded = json.loads(
+                encoded,
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_nonfinite,
+            )
+        except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("target collector returned invalid JSON") from exc
         if not isinstance(decoded, dict):
             raise RuntimeError("target collector returned an invalid envelope")
@@ -1622,13 +1752,18 @@ class AuthenticatedTargetCollector:
             "site_id": site_id,
             "manifest_sha256": manifest_sha256,
             "gate": gate,
-            "collector_id": (stored_collector_id or f"collector-{uuid4()}"),
+            "collector_id": (
+                stored_collector_id
+                or self._requested_collector_id
+                or f"collector-{uuid4()}"
+            ),
             "launch_attestation_sha256": launch.attestation_sha256,
             "execution_binding_sha256": execution.binding_sha256,
             "fault_schedule_sha256": schedule_sha256,
             "trust_binding": trust_context.binding.model_dump(mode="json"),
         }
         self._schedule = {item.fault_id: item for item in schedule}
+        self._requested_collector_id = str(self._binding["collector_id"])
         self._launch = launch
         self._execution = execution
         start_request = AcceptanceStartRequestV2.model_validate(
@@ -1729,7 +1864,7 @@ class AuthenticatedTargetCollector:
         fault_id: str,
         phase: str,
         at_offset: float,
-    ) -> None:
+    ) -> object:
         if self._binding is None or phase not in {"inject", "recover"}:
             raise RuntimeError("target fault command requires an active collector session")
         fault = self._schedule.get(fault_id)
@@ -1769,7 +1904,15 @@ class AuthenticatedTargetCollector:
         ):
             raise RuntimeError("target fault preparation is invalid")
         if prepared["state"] == "COMMITTED":
-            response = prepared
+            response = {
+                **prepared,
+                "schema_version": "acceptance-fault-ack-response.v2",
+                "state": (
+                    fault.expected_degraded
+                    if phase == "inject"
+                    else fault.expected_recovery
+                ),
+            }
         else:
             if self._fault_executor is None or self._launch is None or self._execution is None:
                 raise RuntimeError("target fault executor is unavailable")
@@ -1876,7 +2019,17 @@ class AuthenticatedTargetCollector:
             or not isinstance(response.get("api_boot_id"), str)
         ):
             raise RuntimeError("target fault acknowledgement is invalid")
-        self._fault_acknowledgements[(fault_id, phase)] = response
+        acknowledgement = AcceptanceFaultAckResponseV2.model_validate_json(
+            canonical_json_bytes(response),
+            strict=True,
+        )
+        self._fault_acknowledgements[(fault_id, phase)] = (
+            acknowledgement.model_dump(mode="json")
+        )
+        return _issue_authenticated_fault_acknowledgement(
+            acknowledgement=acknowledgement,
+            collector=self,
+        )
 
     def finish(self) -> AcceptanceRunRecordV2:
         if (
@@ -1942,6 +2095,59 @@ class AuthenticatedTargetCollector:
                 raise RuntimeError("target fault evidence is not bound to commanded effects")
         return record
 
+    def finalize_v3(
+        self,
+        collector_id: str,
+    ) -> AcceptanceControllerResultV3:
+        """Ask the packaged controller to own V3 evaluation and signing."""
+
+        with self._operation_lock:
+            if (
+                self._binding is None
+                or collector_id != self.collector_id
+                or collector_id != self.campaign_collector_id
+            ):
+                raise RuntimeError(
+                    "V3 finalization requires the active exact collector"
+                )
+            encoded_collector = urllib.parse.quote(
+                collector_id,
+                safe="",
+            )
+            response = self._post(
+                (
+                    "/api/internal/acceptance/v3/collectors/"
+                    f"{encoded_collector}/finalize"
+                ),
+                {},
+                limit=_MAX_ACCEPTANCE_CONTROLLER_V3_RESULT_BYTES,
+            )
+            try:
+                result = AcceptanceControllerResultV3.model_validate_json(
+                    canonical_json_bytes(response),
+                    strict=True,
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "packaged V3 controller returned an invalid result"
+                ) from exc
+            if (
+                result.collector_id != collector_id
+                or result.accepted is not True
+                or result.pass_attestation is None
+            ):
+                raise RuntimeError(
+                    "packaged V3 controller returned no signed pass"
+                )
+            return result
+
+
+_issue_authenticated_fault_acknowledgement = (
+    _register_authenticated_fault_acknowledgement_source(
+        AuthenticatedTargetCollector
+    )
+)
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1992,9 +2198,52 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--acceptance-observer-policy-sha256")
     parser.add_argument("--acceptance-observer-work-root", type=Path)
     parser.add_argument("--collector-state", type=Path)
+    parser.add_argument("--acceptance-transition-journal", type=Path)
     parser.add_argument("--control-plane-url")
     parser.add_argument("--machine-token-file", type=Path)
     parser.add_argument("--acceptance-controller-token-file", type=Path)
+    parser.add_argument("--acceptance-channel-dir", type=Path)
+    parser.add_argument("--acceptance-source-secrets-root", type=Path)
+    parser.add_argument("--acceptance-native-projection-dir", type=Path)
+    parser.add_argument("--acceptance-work-projection-dir", type=Path)
+    parser.add_argument(
+        "--acceptance-source-profile-attestation",
+        type=Path,
+        action="append",
+        dest="acceptance_source_profile_attestations",
+    )
+    parser.add_argument(
+        "--acceptance-source-profile-signature",
+        type=Path,
+        action="append",
+        dest="acceptance_source_profile_signatures",
+    )
+    parser.add_argument(
+        "--acceptance-launch-nonce",
+        action="append",
+        dest="acceptance_launch_nonces",
+    )
+    parser.add_argument("--acceptance-first-runtime-epoch", type=int, default=1)
+    parser.add_argument("--acceptance-module-gates-sha256")
+    parser.add_argument("--controller-image-id-sha256")
+    parser.add_argument("--controller-image-config-sha256")
+    parser.add_argument("--controller-code-sha256")
+    parser.add_argument("--acceptance-run-signing-key", type=Path)
+    parser.add_argument("--acceptance-capture-dir", type=Path)
+    parser.add_argument("--acceptance-snapshot-dir", type=Path)
+    parser.add_argument("--acceptance-v3-proof-dir", type=Path)
+    parser.add_argument("--acceptance-v3-state", type=Path)
+    parser.add_argument("--acceptance-operational-limits", type=Path)
+    parser.add_argument("--acceptance-operational-evidence", type=Path)
+    parser.add_argument("--acceptance-repository-boundary", type=Path)
+    parser.add_argument(
+        "--acceptance-conditional-gate-decision",
+        type=Path,
+        action="append",
+        default=[],
+        dest="acceptance_conditional_gate_decisions",
+    )
+    parser.add_argument("--out-v3-result", type=Path)
     parser.add_argument("--out-attestation", type=Path)
     parser.add_argument("--out-signature", type=Path)
     parser.add_argument("--out-journal-proof", type=Path)
@@ -2008,6 +2257,10 @@ def target_command(
     arguments: argparse.Namespace,
     *,
     launch_nonce: str,
+    acceptance_channel: str | None = None,
+    acceptance_source_secrets: str | None = None,
+    acceptance_native_projection: str | None = None,
+    acceptance_work_projection: str | None = None,
 ) -> tuple[str, ...]:
     required = (
         "site_config",
@@ -2052,7 +2305,7 @@ def target_command(
         raise ValueError("target mode requires every reviewed DeepStream input")
     if len(launch_nonce) != 32:
         raise ValueError("target runtime launch nonce is invalid")
-    return (
+    command = (
         "--site-config",
         "/run/config/site.yaml",
         "--site-config-sha256",
@@ -2083,6 +2336,33 @@ def target_command(
         "http://api:8000",
         "--machine-token-file",
         "/run/secrets/machine_token",
+    )
+    acceptance_values = (
+        acceptance_channel,
+        acceptance_source_secrets,
+        acceptance_native_projection,
+        acceptance_work_projection,
+    )
+    if all(value is None for value in acceptance_values):
+        return command
+    if any(
+        type(value) is not str
+        or not value
+        or not value.startswith("/")
+        or "\x00" in value
+        for value in acceptance_values
+    ):
+        raise ValueError("target acceptance child paths are incomplete")
+    return (
+        *command,
+        "--acceptance-channel",
+        acceptance_channel,
+        "--acceptance-source-secrets-root",
+        acceptance_source_secrets,
+        "--acceptance-native-projection",
+        acceptance_native_projection,
+        "--acceptance-work-projection",
+        acceptance_work_projection,
     )
 
 
@@ -3582,10 +3862,7 @@ def _launch_staged_container(
     )
     if hashlib.sha256(mount_payload).hexdigest() != arguments.mount_contract_sha256:
         raise ValueError("runtime mount contract digest differs from reviewed input")
-    try:
-        contract = RuntimeMountContractV1.model_validate(yaml.safe_load(mount_payload))
-    except (ValueError, yaml.YAMLError) as exc:
-        raise ValueError("runtime mount contract is invalid") from exc
+    contract = _load_runtime_mount_contract(mount_payload)
     expected_image_id = f"sha256:{arguments.runtime_image_id_sha256}"
     if contract.image_id != expected_image_id:
         raise ValueError("runtime mount contract image differs from launch")
@@ -3667,6 +3944,113 @@ def _launch_staged_container(
     )
 
 
+def _stage_reviewed_runtime_mounts(
+    arguments: argparse.Namespace,
+    *,
+    reviewed: ReviewedTargetLaunch,
+    work_root: Path,
+) -> tuple[tuple[str, ...], frozenset[Path]]:
+    """Stage one epoch's immutable base mounts without launching a process."""
+
+    work_root.mkdir(mode=0o700)
+    mount_payload = read_regular_bounded(
+        arguments.mount_contract,
+        max_bytes=8 * 1024 * 1024,
+        label="runtime mount contract",
+    )
+    if hashlib.sha256(mount_payload).hexdigest() != arguments.mount_contract_sha256:
+        raise ValueError("runtime mount contract digest differs from reviewed input")
+    contract = _load_runtime_mount_contract(mount_payload)
+    expected_image_id = f"sha256:{arguments.runtime_image_id_sha256}"
+    if contract.image_id != expected_image_id:
+        raise ValueError("runtime mount contract image differs from launch")
+    original_by_target = {mount.target: mount for mount in contract.mounts}
+    reviewed_sources = {
+        Path("/run/config/site.yaml"): arguments.site_config,
+        Path("/run/config/runtime-manifest.yaml"): arguments.runtime_manifest,
+        Path("/run/config/measured-capacity.yaml"): (
+            arguments.measured_capacity_report
+        ),
+        Path("/run/config/measured-capacity.sig"): (
+            arguments.measured_capacity_signature
+        ),
+    }
+    if (
+        any(
+            target not in original_by_target
+            or original_by_target[target].source != source
+            for target, source in reviewed_sources.items()
+        )
+        or Path("/run/config/capacity-authority.pem")
+        not in original_by_target
+    ):
+        raise ValueError("runtime mount contract substitutes a reviewed input source")
+    staged = stage_runtime_mount_contract(
+        contract=contract,
+        work_root=work_root,
+        captured_by_target={
+            Path("/run/config/site.yaml"): reviewed.snapshots.site_config,
+            Path("/run/config/runtime-manifest.yaml"): (
+                reviewed.snapshots.runtime_manifest
+            ),
+            Path("/run/config/measured-capacity.yaml"): (
+                reviewed.snapshots.capacity.payload
+            ),
+            Path("/run/config/measured-capacity.sig"): (
+                reviewed.snapshots.capacity.signature
+            ),
+            Path("/run/config/capacity-authority.pem"): (
+                reviewed.snapshots.capacity.trust_key
+            ),
+        },
+    )
+    staged_by_target = {mount.target: mount.source for mount in staged.mounts}
+    mount_argv = validate_runtime_mount_contract(
+        site_config=reviewed.site,
+        runtime_manifest=reviewed.runtime,
+        contract=staged,
+        expected_image_id=expected_image_id,
+        site_config_source=staged_by_target[Path("/run/config/site.yaml")],
+        runtime_manifest_source=staged_by_target[
+            Path("/run/config/runtime-manifest.yaml")
+        ],
+        measured_capacity_source=staged_by_target[
+            Path("/run/config/measured-capacity.yaml")
+        ],
+        measured_capacity_signature_source=staged_by_target[
+            Path("/run/config/measured-capacity.sig")
+        ],
+        capacity_authority_public_key_source=staged_by_target[
+            Path("/run/config/capacity-authority.pem")
+        ],
+    )
+    original_sources = frozenset(
+        mount.source for mount in contract.mounts
+    )
+    return (
+        mount_argv,
+        original_sources | frozenset(staged_by_target.values()),
+    )
+
+
+def _load_runtime_mount_contract(payload: bytes) -> RuntimeMountContractV1:
+    """Parse a digest-bound runtime mount contract without YAML ambiguity."""
+    try:
+        parsed = load_strict_yaml(
+            payload,
+            max_bytes=_MAX_RUNTIME_MOUNT_CONTRACT_YAML_BYTES,
+            max_nodes=_MAX_RUNTIME_MOUNT_CONTRACT_YAML_NODES,
+            max_depth=_MAX_RUNTIME_MOUNT_CONTRACT_YAML_DEPTH,
+            require_mapping=True,
+        )
+    except StrictYAMLError as exc:
+        raise ValueError("runtime mount contract is invalid") from exc
+    try:
+        return RuntimeMountContractV1.model_validate(parsed)
+    except ValueError as exc:
+        raise ValueError("runtime mount contract is invalid") from exc
+
+
 _GATE_BY_DURATION: dict[int, AcceptanceGate] = {
     28_800: "8h",
     259_200: "72h",
@@ -3743,6 +4127,1149 @@ def _verify_target_acceptance_context(
     )
 
 
+class RetainedRuntimeTargetV3Collector:
+    """Collect the V2 compatibility graph on the C2-authorized retained epoch."""
+
+    def __init__(
+        self,
+        *,
+        collector: AuthenticatedTargetCollector,
+        trust_context: AcceptanceAuthorityTrustContextV2,
+        continuation: TargetRuntimeContinuationCoordinatorV3,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if (
+            type(collector) is not AuthenticatedTargetCollector
+            or type(continuation)
+            is not TargetRuntimeContinuationCoordinatorV3
+        ):
+            raise TypeError("retained V3 collection requires the exact collector")
+        self._collector = collector
+        self._continuation = continuation
+        self._trust_context = _require_authority_trust_context(trust_context)
+        if not callable(monotonic) or not callable(sleep):
+            raise TypeError("retained V3 collector clocks are invalid")
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self.collected: TargetV3CollectedEvidence | None = None
+
+    def __call__(
+        self,
+        arguments: argparse.Namespace,
+        campaign: TargetCampaignCompletionV3,
+    ) -> TargetV3CollectedEvidence:
+        try:
+            collected = self._collect(arguments, campaign)
+        except BaseException as primary:
+            try:
+                self._continuation.cleanup(campaign)
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "retained V3 collection and continuation cleanup failed",
+                    [primary, cleanup],
+                ) from primary
+            raise
+        self._continuation.cleanup(campaign)
+        self.collected = collected
+        return collected
+
+    def _collect(
+        self,
+        arguments: argparse.Namespace,
+        campaign: TargetCampaignCompletionV3,
+    ) -> TargetV3CollectedEvidence:
+        if type(campaign) is not TargetCampaignCompletionV3:
+            raise TypeError("retained V3 collector requires exact campaign evidence")
+        if campaign.c2_evidence.collector_id != self._collector.campaign_collector_id:
+            raise ValueError("retained V3 collector identity differs from C2")
+        context = self._trust_context
+        manifest = context.trust.manifest
+        runtime = campaign.final_runtime
+        identity = runtime.reverify_identity()
+        request = identity.launch_request
+        if (
+            identity.identity_sha256
+            != campaign.c2_evidence.epochs[-1].runtime_identity_sha256
+            or request.launch != context.launch
+        ):
+            raise ValueError("retained runtime identity differs from final C2 epoch")
+        execution = ExecutionBindingV2(
+            schema_version="acceptance-execution-binding.v2",
+            launch_attestation_sha256=request.launch.attestation_sha256,
+            launch_nonce=request.launch_nonce,
+            container_id=identity.container_id,
+            container_config_sha256=identity.container_config_sha256,
+            runtime_image_id_sha256=identity.runtime_image_id_sha256,
+            acceptance_adapter_sha256=request.launch.acceptance_adapter_sha256,
+            acceptance_adapter_policy_sha256=(
+                request.launch.acceptance_adapter_policy_sha256
+            ),
+            acceptance_observer_sha256=(
+                request.launch.acceptance_observer_sha256
+            ),
+            acceptance_observer_policy_sha256=(
+                request.launch.acceptance_observer_policy_sha256
+            ),
+            control_network_id=identity.control_network_id,
+            control_network_config_sha256=(
+                identity.control_network_config_sha256
+            ),
+            camera_network_id=identity.camera_network_id,
+            camera_network_config_sha256=(
+                identity.camera_network_config_sha256
+            ),
+            observed_gpu_inventory_sha256=(
+                identity.observed_gpu_inventory.launch_compatibility_sha256
+            ),
+        )
+        workloads = tuple(
+            CameraAcceptanceWorkloadV2(
+                camera_id=source.camera_id,
+                source_index=source.source_index,
+                source_kind=source.source.kind,
+                source_reference=(
+                    source.source.path
+                    if isinstance(source.source, LocalFixtureSourceV2)
+                    else source.source.secret_reference
+                ),
+                codec=source.codec,
+                width=source.width,
+                height=source.height,
+                fps=source.fps,
+                bitrate_kbps=source.bitrate_kbps,
+                analytics_hz=source.analytics_hz,
+            )
+            for source in manifest.sources
+        )
+        schedule = context.fault_schedule
+        restart_faults = tuple(
+            fault for fault in schedule if fault.kind == "runtime_restart"
+        )
+        if len(restart_faults) != 1:
+            raise RuntimeError(
+                "retained V3 collector requires one canonical runtime restart"
+            )
+        restart_fault = restart_faults[0]
+        self._collector.start(
+            site_id=context.configured_site_id,
+            manifest_sha256=manifest.manifest_sha256,
+            gate=context.configured_gate,
+            camera_ids=context.camera_ids,
+            workloads=workloads,
+            sample_interval_seconds=arguments.collector_interval_seconds,
+            launch=request.launch,
+            execution=execution,
+            schedule=schedule,
+        )
+        pending = sorted(
+            command
+            for fault in schedule
+            for command in (
+                (fault.offset_seconds, fault.fault_id, "inject"),
+                (
+                    fault.offset_seconds + fault.duration_seconds,
+                    fault.fault_id,
+                    "recover",
+                ),
+            )
+        )
+        started = self._monotonic()
+        deadline = started + arguments.duration_seconds
+        next_sample = 0.0
+        continuation_completion = None
+        replacement_launched = False
+        while True:
+            now = self._monotonic()
+            elapsed = now - started
+            while pending and pending[0][0] <= elapsed:
+                boundary, fault_id, phase = pending.pop(0)
+                fault = next(
+                    item for item in schedule if item.fault_id == fault_id
+                )
+                if fault is restart_fault and phase == "inject":
+                    runtime = _advance_target_runtime_restart_v3(
+                        continuation=self._continuation,
+                        collector=self._collector,
+                        campaign=campaign,
+                        previous_execution=execution,
+                        fault=fault,
+                        phase=phase,
+                        at_offset=boundary,
+                    )
+                elif fault is restart_fault and phase == "recover":
+                    runtime = _advance_target_runtime_restart_v3(
+                        continuation=self._continuation,
+                        collector=self._collector,
+                        campaign=campaign,
+                        previous_execution=execution,
+                        fault=fault,
+                        phase=phase,
+                        at_offset=boundary,
+                    )
+                    replacement_launched = True
+                else:
+                    self._collector.command_fault(
+                        fault_id=fault_id,
+                        phase=phase,
+                        at_offset=boundary,
+                    )
+            if runtime is not None:
+                runtime.reverify_identity()
+                if runtime.poll() is not None:
+                    raise RuntimeError(
+                        "retained V3 runtime exited before the selected gate"
+                    )
+            if replacement_launched and continuation_completion is None:
+                continuation_completion = (
+                    self._continuation.poll_authorization()
+                )
+            if elapsed >= next_sample and runtime is not None:
+                self._collector.collect(
+                    process_healthy=True,
+                    scheduled_monotonic_offset_seconds=next_sample,
+                )
+                next_sample += arguments.collector_interval_seconds
+            if now >= deadline:
+                break
+            next_boundary = min(
+                arguments.duration_seconds,
+                next_sample,
+                pending[0][0] if pending else arguments.duration_seconds,
+                (
+                    elapsed + 0.25
+                    if replacement_launched
+                    and runtime is not None
+                    and continuation_completion is None
+                    else arguments.duration_seconds
+                ),
+            )
+            self._sleep(max(0.0, next_boundary - elapsed))
+        if (
+            runtime is None
+            or continuation_completion is None
+            or runtime is not continuation_completion.final_runtime
+        ):
+            raise RuntimeError(
+                "retained V3 gate ended before epoch-three authorization"
+            )
+        runtime.reverify_identity()
+        runtime.terminate(timeout_seconds=arguments.stop_grace_seconds)
+        exit_code = runtime.wait(
+            timeout_seconds=float(arguments.stop_grace_seconds)
+        )
+        if exit_code != 0:
+            raise RuntimeError("retained V3 runtime did not stop cleanly")
+        record = self._collector.finish()
+        attestation = self._collector.final_attestation
+        signature = self._collector.final_signature
+        if (
+            record.run_id != campaign.c2_evidence.collector_id
+            or record.environment != "target"
+            or record.site_id != campaign.c2_evidence.site_id
+            or record.gate != campaign.c2_evidence.gate
+            or record.launch != request.launch
+            or record.execution != execution
+            or attestation is None
+            or signature is None
+        ):
+            raise RuntimeError("retained V3 collector final graph differs")
+        envelope = AcceptanceFinalEnvelopeV2(
+            schema_version="acceptance-final-envelope.v2",
+            record=record,
+            attestation=attestation,
+            signature_hex=signature.hex(),
+        )
+        proof_binding = {
+            "collector_id": record.run_id,
+            "site_id": record.site_id,
+            "manifest_sha256": record.manifest_sha256,
+            "gate": record.gate,
+            "launch_attestation_sha256": record.launch.attestation_sha256,
+            "execution_binding_sha256": record.execution.binding_sha256,
+            "fault_schedule_sha256": canonical_fault_schedule_sha256(schedule),
+            "trust_binding": context.binding.model_dump(mode="json"),
+        }
+        with tempfile.TemporaryDirectory(
+            prefix=".kuzet-v3-proof-download-"
+        ) as temporary:
+            proof_source = Path(temporary) / "journal-proof.jsonl"
+            _download_journal_proof(
+                base_url=arguments.control_plane_url,
+                acceptance_controller_token_file=(
+                    arguments.acceptance_controller_token_file
+                ),
+                binding=proof_binding,
+                attestation=attestation,
+                record=record,
+                destination=proof_source,
+            )
+            _write_new_target_artifacts(
+                record_path=arguments.out,
+                attestation_path=arguments.out_attestation,
+                signature_path=arguments.out_signature,
+                proof_path=arguments.out_journal_proof,
+                proof_source=proof_source,
+                record=record,
+                attestation=attestation,
+                signature=signature,
+            )
+        collected = TargetV3CollectedEvidence(
+            final_envelope=envelope,
+            journal_proof_path=arguments.out_journal_proof,
+            continuation_capability=continuation_completion.capability,
+        )
+        return collected
+
+
+def run_target_v3(
+    arguments: argparse.Namespace,
+    *,
+    coordinator: TargetCampaignCoordinatorV3,
+    collector_runner: TargetV3CollectorRunner,
+    trust_context: AcceptanceAuthorityTrustContextV2,
+    signer: AcceptanceRunSigner,
+) -> tuple[
+    SignedTargetAuthorityBindingV3,
+    VerifiedAcceptanceJournalProofV2,
+]:
+    """Run C2 first, collect on its retained epoch, then sign the exact V2 graph."""
+
+    if type(coordinator) is not TargetCampaignCoordinatorV3:
+        raise TypeError("target replay requires the exact V3 campaign coordinator")
+    if type(collector_runner) is not RetainedRuntimeTargetV3Collector:
+        raise TypeError(
+            "target replay requires the exact retained V3 collector runner"
+        )
+    context = _require_authority_trust_context(trust_context)
+    campaign = coordinator.run()
+    if type(campaign) is not TargetCampaignCompletionV3:
+        raise TypeError("target campaign returned an invalid completion")
+    collected = collector_runner(arguments, campaign)
+    if type(collected) is not TargetV3CollectedEvidence:
+        raise TypeError("V3 collector returned an invalid evidence capture")
+    if (
+        collected.final_envelope.record.run_id
+        != campaign.c2_evidence.collector_id
+        or collected.final_envelope.record.site_id
+        != campaign.c2_evidence.site_id
+        or collected.final_envelope.record.gate != campaign.c2_evidence.gate
+        or collected.final_envelope.record.environment != "target"
+    ):
+        raise ValueError("V3 collector evidence differs from the C2 campaign")
+    # The exact retained collector returns only after ordered epoch-two and
+    # epoch-three cleanup.  No caller-owned cleanup seam is accepted here.
+    return bind_target_authority_v3(
+        c2_capability=campaign.c2_capability,
+        continuation_capability=collected.continuation_capability,
+        trust_context=context,
+        signer=signer,
+        final_envelope=collected.final_envelope,
+        journal_proof_path=collected.journal_proof_path,
+    )
+
+
+def _require_private_v3_directory(path: object, *, label: str) -> Path:
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError(f"{label} must be one absolute directory")
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"{label} is unavailable") from exc
+    if (
+        resolved != path
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or os.geteuid() != _TARGET_RUNTIME_UID
+        or os.getegid() != _TARGET_RUNTIME_GID
+        or metadata.st_uid != _TARGET_RUNTIME_UID
+        or metadata.st_gid != _TARGET_RUNTIME_GID
+    ):
+        raise ValueError(
+            f"{label} must be canonical, mode 0700, and owned by "
+            "fixed child UID/GID 10001"
+        )
+    return path
+
+
+def _require_distinct_directory_identities(
+    paths: tuple[Path, ...],
+    *,
+    label: str,
+) -> None:
+    """Reject lexical, symlink, and bind-mount aliases of protected roots."""
+
+    if (
+        type(paths) is not tuple
+        or len(paths) != len(set(paths))
+        or any(not isinstance(path, Path) for path in paths)
+    ):
+        raise ValueError(f"{label} must be distinct")
+    resolved_paths: list[Path] = []
+    identities: list[tuple[int, int]] = []
+    ancestor_identities: list[set[tuple[int, int]]] = []
+    for path in paths:
+        try:
+            resolved = path.resolve(strict=True)
+            metadata = path.stat()
+            ancestors = {
+                (ancestor.stat().st_dev, ancestor.stat().st_ino)
+                for ancestor in resolved.parents
+            }
+        except OSError as exc:
+            raise ValueError(f"{label} is unavailable") from exc
+        identity = (metadata.st_dev, metadata.st_ino)
+        if resolved != path:
+            raise ValueError(
+                f"{label} contains a path or mounted inode alias"
+            )
+        resolved_paths.append(resolved)
+        identities.append(identity)
+        ancestor_identities.append(ancestors)
+    for index, path in enumerate(resolved_paths):
+        for other_index in range(index + 1, len(resolved_paths)):
+            other = resolved_paths[other_index]
+            if (
+                path in other.parents
+                or other in path.parents
+                or identities[index] == identities[other_index]
+                or identities[index] in ancestor_identities[other_index]
+                or identities[other_index] in ancestor_identities[index]
+            ):
+                raise ValueError(
+                    f"{label} contains nested paths or mounted inode aliases"
+                )
+
+
+def _require_unmounted_signer_path(
+    path: object,
+    *,
+    forbidden_roots: tuple[Path, ...],
+) -> Path:
+    """Keep the run signing key outside every child-visible mount tree."""
+
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or type(forbidden_roots) is not tuple
+        or any(not isinstance(root, Path) for root in forbidden_roots)
+    ):
+        raise ValueError("acceptance run signing key path is invalid")
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError("acceptance run signing key is unavailable") from exc
+    if (
+        resolved != path
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError(
+            "acceptance run signing key must remain outside child mounts"
+        )
+    return _require_host_authority_path_outside_child_mounts(
+        path,
+        label="acceptance run signing key",
+        forbidden_roots=forbidden_roots,
+        require_existing=True,
+    )
+
+
+def _require_host_authority_path_outside_child_mounts(
+    path: object,
+    *,
+    label: str,
+    forbidden_roots: tuple[Path, ...],
+    require_existing: bool,
+) -> Path:
+    """Reject containment, symlink, hardlink, and mount aliases."""
+
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or type(forbidden_roots) is not tuple
+        or not forbidden_roots
+        or any(
+            not isinstance(source, Path) or not source.is_absolute()
+            for source in forbidden_roots
+        )
+    ):
+        raise ValueError(f"{label} path is invalid")
+    try:
+        parent = path.parent.resolve(strict=True)
+        if parent != path.parent:
+            raise ValueError(f"{label} parent must be canonical")
+        for ancestor in (path.parent, *path.parent.parents):
+            if stat.S_ISLNK(ancestor.lstat().st_mode):
+                raise ValueError(f"{label} has a symlink ancestor")
+        sources: list[
+            tuple[Path, os.stat_result, tuple[int, int]]
+        ] = []
+        for source in forbidden_roots:
+            resolved_source = source.resolve(strict=True)
+            source_metadata = source.lstat()
+            for ancestor in (source, *source.parents):
+                if stat.S_ISLNK(ancestor.lstat().st_mode):
+                    raise ValueError(
+                        "child-visible mount source is not canonical"
+                    )
+            if (
+                resolved_source != source
+                or not (
+                    stat.S_ISREG(source_metadata.st_mode)
+                    or stat.S_ISDIR(source_metadata.st_mode)
+                )
+            ):
+                raise ValueError(
+                    "child-visible mount source is not canonical"
+                )
+            sources.append(
+                (
+                    resolved_source,
+                    source_metadata,
+                    (source_metadata.st_dev, source_metadata.st_ino),
+                )
+            )
+        authority_ancestor_identities = {
+            (ancestor.stat().st_dev, ancestor.stat().st_ino)
+            for ancestor in (parent, *parent.parents)
+        }
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None:
+            resolved = path.resolve(strict=True)
+        else:
+            if require_existing:
+                raise ValueError(f"{label} is unavailable")
+            resolved = parent / path.name
+    except OSError as exc:
+        raise ValueError(f"{label} is unavailable") from exc
+    authority_identity = (
+        None
+        if metadata is None
+        else (metadata.st_dev, metadata.st_ino)
+    )
+    if (
+        resolved != path
+        or path.name in {"", ".", ".."}
+        or (
+            metadata is not None
+            and (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+            )
+        )
+        or any(
+            source == resolved
+            or source in resolved.parents
+            or resolved in source.parents
+            or (
+                authority_identity is not None
+                and authority_identity == source_identity
+            )
+            or (
+                stat.S_ISDIR(source_metadata.st_mode)
+                and source_identity in authority_ancestor_identities
+            )
+            for source, source_metadata, source_identity in sources
+        )
+    ):
+        raise ValueError(
+            f"{label} must remain outside every child-visible mount"
+        )
+    return path
+
+
+def _required_digest_argument(
+    arguments: argparse.Namespace,
+    name: str,
+) -> str:
+    value = getattr(arguments, name, None)
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be one exact SHA-256 digest")
+    return value
+
+
+def _load_reviewed_v3_model(
+    path: object,
+    model: type[BaseModel],
+    *,
+    label: str,
+) -> BaseModel:
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError(f"{label} path must be absolute")
+    payload = read_regular_bounded(
+        path,
+        max_bytes=64 * 1024 * 1024,
+        label=label,
+    )
+    return load_canonical_json_bytes(
+        payload,
+        model,
+        max_bytes=64 * 1024 * 1024,
+        label=label,
+    )
+
+
+def run_production_target_v3(
+    arguments: argparse.Namespace,
+) -> dict[str, object]:
+    """Hold one host-wide lease for the complete production V3 campaign."""
+
+    collector_state = getattr(arguments, "collector_state", None)
+    if (
+        not isinstance(collector_state, Path)
+        or not collector_state.is_absolute()
+    ):
+        raise ValueError(
+            "production V3 requires an absolute durable collector state path"
+        )
+    lock_path = collector_state.with_name(
+        f"{collector_state.name}.campaign.lock"
+    )
+    with TargetCampaignLock(lock_path):
+        return _run_production_target_v3_locked(arguments)
+
+
+def _run_production_target_v3_locked(
+    arguments: argparse.Namespace,
+) -> dict[str, object]:
+    """Compose C2, retained collection, capture publication, and V3 finalization."""
+
+    from protector.pilot.acceptance import load_conditional_gate_decisions
+    from protector.pilot.acceptance_capture_v3 import (
+        ProtectedAcceptanceCaptureRepositoryV3,
+        ReviewedAcceptanceCaptureProducerV3,
+    )
+    from protector.pilot.acceptance_operational import (
+        AcceptanceLimitsV1,
+        AuthoritativeRepositoryBoundaryV1,
+        OperationalAcceptanceEvidenceV1,
+    )
+    from protector.pilot.api.acceptance_controller import (
+        OpenSSLAcceptanceRunSigner,
+    )
+
+    context = _verify_target_acceptance_context(arguments)
+    manifest = context.trust.manifest
+    reviewed = reviewed_launch_attestation(
+        arguments,
+        manifest=manifest,
+        capacity_authority_public_key=(
+            context.trust.role_public_keys.capacity
+        ),
+    )
+    channel_root = _require_private_v3_directory(
+        getattr(arguments, "acceptance_channel_dir", None),
+        label="acceptance channel root",
+    )
+    source_secrets = _require_private_v3_directory(
+        getattr(arguments, "acceptance_source_secrets_root", None),
+        label="acceptance source secret root",
+    )
+    native_projection_root = _require_private_v3_directory(
+        getattr(arguments, "acceptance_native_projection_dir", None),
+        label="acceptance native projection root",
+    )
+    work_projection_root = _require_private_v3_directory(
+        getattr(arguments, "acceptance_work_projection_dir", None),
+        label="acceptance work projection root",
+    )
+    capture_root = _require_private_v3_directory(
+        getattr(arguments, "acceptance_capture_dir", None),
+        label="acceptance capture root",
+    )
+    snapshot_root = _require_private_v3_directory(
+        getattr(arguments, "acceptance_snapshot_dir", None),
+        label="acceptance snapshot root",
+    )
+    v3_proof_root = _require_private_v3_directory(
+        getattr(arguments, "acceptance_v3_proof_dir", None),
+        label="acceptance V3 proof root",
+    )
+    transition_journal_candidate = getattr(
+        arguments,
+        "acceptance_transition_journal",
+        None,
+    )
+    if (
+        not isinstance(transition_journal_candidate, Path)
+        or not transition_journal_candidate.is_absolute()
+        or transition_journal_candidate.name in {"", ".", ".."}
+    ):
+        raise ValueError(
+            "acceptance transition journal must be one absolute file path"
+        )
+    transition_journal_root = _require_private_v3_directory(
+        transition_journal_candidate.parent,
+        label="acceptance transition journal root",
+    )
+    protected_roots = (
+        channel_root,
+        source_secrets,
+        native_projection_root,
+        work_projection_root,
+        capture_root,
+        snapshot_root,
+        v3_proof_root,
+        transition_journal_root,
+    )
+    _require_distinct_directory_identities(
+        protected_roots,
+        label="acceptance V3 protected roots",
+    )
+    child_visible_roots = (
+        channel_root,
+        source_secrets,
+        native_projection_root,
+        work_projection_root,
+    )
+    _require_host_authority_path_outside_child_mounts(
+        getattr(arguments, "acceptance_controller_token_file", None),
+        label="acceptance controller token",
+        forbidden_roots=child_visible_roots,
+        require_existing=True,
+    )
+    collector_state_candidate = (
+        _require_host_authority_path_outside_child_mounts(
+            getattr(arguments, "collector_state", None),
+            label="acceptance collector state",
+            forbidden_roots=child_visible_roots,
+            require_existing=False,
+        )
+    )
+    transition_journal_path = (
+        _require_host_authority_path_outside_child_mounts(
+            transition_journal_candidate,
+            label="acceptance transition journal",
+            forbidden_roots=child_visible_roots,
+            require_existing=False,
+        )
+    )
+    v3_state_candidate = _require_host_authority_path_outside_child_mounts(
+        getattr(arguments, "acceptance_v3_state", None),
+        label="acceptance V3 state",
+        forbidden_roots=child_visible_roots,
+        require_existing=True,
+    )
+    _require_distinct_authority_files(
+        (
+            ("collector state", collector_state_candidate),
+            ("transition journal", transition_journal_path),
+            ("V3 state", v3_state_candidate),
+        )
+    )
+
+    profile_paths = tuple(
+        getattr(arguments, "acceptance_source_profile_attestations", ()) or ()
+    )
+    signature_paths = tuple(
+        getattr(arguments, "acceptance_source_profile_signatures", ()) or ()
+    )
+    launch_nonces = tuple(
+        getattr(arguments, "acceptance_launch_nonces", ()) or ()
+    )
+    if (
+        len(profile_paths) != 3
+        or len(signature_paths) != 3
+        or len(launch_nonces) != 3
+        or len(set(launch_nonces)) != 3
+        or any(
+            type(nonce) is not str
+            or len(nonce) != 32
+            or any(character not in "0123456789abcdef" for character in nonce)
+            for nonce in launch_nonces
+        )
+    ):
+        raise ValueError(
+            "production V3 requires exactly three fresh launch profiles"
+        )
+    first_epoch = getattr(arguments, "acceptance_first_runtime_epoch", None)
+    if (
+        type(first_epoch) is not int
+        or isinstance(first_epoch, bool)
+        or not 1 <= first_epoch < 2**63 - 2
+    ):
+        raise ValueError("acceptance first runtime epoch is invalid")
+    attestations = tuple(
+        _load_reviewed_v3_model(
+            path,
+            TargetSourceProfileAttestationV2,
+            label=f"acceptance source profile epoch {index + 1}",
+        )
+        for index, path in enumerate(profile_paths)
+    )
+    assert all(
+        type(attestation) is TargetSourceProfileAttestationV2
+        for attestation in attestations
+    )
+    first_attestation = attestations[0]
+    assert isinstance(first_attestation, TargetSourceProfileAttestationV2)
+    if any(
+        attestation.source_identity_commitments
+        != first_attestation.source_identity_commitments
+        or attestation.expectations != first_attestation.expectations
+        for attestation in attestations[1:]
+    ):
+        raise ValueError("three-epoch source profile identities differ")
+    source_bindings = tuple(
+        TargetSourceBindingV2(
+            camera_id=expectation.camera_id,
+            source_index=expectation.source_index,
+            source_identity_commitment=(
+                expectation.source_identity_commitment
+            ),
+        )
+        for expectation in first_attestation.expectations
+    )
+    trust_binding_sha256 = hashlib.sha256(
+        canonical_json_bytes(build_acceptance_trust_binding(context.trust))
+    ).hexdigest()
+    module_gates_sha256 = _required_digest_argument(
+        arguments,
+        "acceptance_module_gates_sha256",
+    )
+    controller_image_id_sha256 = _required_digest_argument(
+        arguments,
+        "controller_image_id_sha256",
+    )
+    controller_image_config_sha256 = _required_digest_argument(
+        arguments,
+        "controller_image_config_sha256",
+    )
+    controller_code_sha256 = _required_digest_argument(
+        arguments,
+        "controller_code_sha256",
+    )
+    requests = tuple(
+        TargetRuntimeLaunchRequestV2(
+            schema_version="target-runtime-launch-request.v2",
+            campaign_id=context.configured_campaign_id,
+            gate=context.configured_gate,
+            launch_nonce=nonce,
+            manifest_sha256=context.binding.manifest_payload_sha256,
+            acceptance_trust_binding_sha256=trust_binding_sha256,
+            module_gate_bindings_sha256=module_gates_sha256,
+            controller_image_id_sha256=controller_image_id_sha256,
+            controller_image_config_sha256=(
+                controller_image_config_sha256
+            ),
+            controller_code_sha256=controller_code_sha256,
+            runtime_epoch=first_epoch + index,
+            runtime_epoch_started_generation=first_epoch + index,
+            launch=reviewed.launch,
+            source_bindings=source_bindings,
+        )
+        for index, nonce in enumerate(launch_nonces)
+    )
+    verified_profiles = tuple(
+        capture_verified_target_source_profile_attestation(
+            context=context,
+            launch_request=request,
+            attestation_path=profile_path,
+            signature_path=signature_path,
+        )
+        for request, profile_path, signature_path in zip(
+            requests,
+            profile_paths,
+            signature_paths,
+            strict=True,
+        )
+    )
+    profile_by_request = {
+        request.request_sha256: profile
+        for request, profile in zip(requests, verified_profiles, strict=True)
+    }
+    graph = DeepStreamGraphSpec.from_site(reviewed.site)
+    collector_id = f"collector-{uuid4()}"
+    fault_executor = ExecutableTargetAcceptanceAdapter(
+        arguments.acceptance_adapter_executable,
+        expected_sha256=reviewed.launch.acceptance_adapter_sha256,
+        policy_path=arguments.acceptance_adapter_policy,
+        policy_sha256=reviewed.launch.acceptance_adapter_policy_sha256,
+        work_root=arguments.acceptance_adapter_work_root,
+    )
+    observer = ExecutableTargetAcceptanceAdapter(
+        arguments.acceptance_observer_executable,
+        expected_sha256=reviewed.launch.acceptance_observer_sha256,
+        policy_path=arguments.acceptance_observer_policy,
+        policy_sha256=reviewed.launch.acceptance_observer_policy_sha256,
+        work_root=arguments.acceptance_observer_work_root,
+    )
+    with (
+        tempfile.TemporaryDirectory(prefix=".kuzet-v3-runtime-stage-")
+        as staging_name,
+        tempfile.TemporaryDirectory(
+            prefix=".epoch-native-",
+            dir=native_projection_root,
+        ) as native_name,
+        tempfile.TemporaryDirectory(
+            prefix=".epoch-work-",
+            dir=work_projection_root,
+        ) as work_name,
+    ):
+        staging_root = Path(staging_name)
+        staging_root.chmod(0o700)
+        native_root = Path(native_name)
+        native_root.chmod(0o700)
+        work_root = Path(work_name)
+        work_root.chmod(0o700)
+        environments: dict[
+            str,
+            tuple[tuple[str, ...], Path, Path, frozenset[Path]],
+        ] = {}
+        reviewed_mount_sources: set[Path] = {
+            channel_root,
+            source_secrets,
+            native_root,
+            work_root,
+        }
+        for request in requests:
+            epoch_stage = staging_root / f"epoch-{request.runtime_epoch}"
+            mount_argv, sources = _stage_reviewed_runtime_mounts(
+                arguments,
+                reviewed=reviewed,
+                work_root=epoch_stage,
+            )
+            reviewed_mount_sources.update(sources)
+            native_path = native_root / f"native-{request.launch_nonce}.json"
+            work_path = work_root / f"work-{request.launch_nonce}.json"
+            environments[request.request_sha256] = (
+                mount_argv,
+                native_path,
+                work_path,
+                sources,
+            )
+
+        child_visible_sources = tuple(
+            sorted(reviewed_mount_sources, key=os.fspath)
+        )
+        controller_token_path = (
+            _require_host_authority_path_outside_child_mounts(
+                getattr(
+                    arguments,
+                    "acceptance_controller_token_file",
+                    None,
+                ),
+                label="acceptance controller token",
+                forbidden_roots=child_visible_sources,
+                require_existing=True,
+            )
+        )
+        collector_state_path = (
+            _require_host_authority_path_outside_child_mounts(
+                collector_state_candidate,
+                label="acceptance collector state",
+                forbidden_roots=child_visible_sources,
+                require_existing=False,
+            )
+        )
+        transition_journal_path = (
+            _require_host_authority_path_outside_child_mounts(
+                transition_journal_path,
+                label="acceptance transition journal",
+                forbidden_roots=child_visible_sources,
+                require_existing=False,
+            )
+        )
+        v3_state_path = _require_host_authority_path_outside_child_mounts(
+            v3_state_candidate,
+            label="acceptance V3 state",
+            forbidden_roots=child_visible_sources,
+            require_existing=True,
+        )
+        _require_distinct_authority_files(
+            (
+                ("collector state", collector_state_path),
+                ("transition journal", transition_journal_path),
+                ("V3 state", v3_state_path),
+            )
+        )
+        signer_path = _require_unmounted_signer_path(
+            getattr(arguments, "acceptance_run_signing_key", None),
+            forbidden_roots=child_visible_sources,
+        )
+        collector = AuthenticatedTargetCollector(
+            base_url=arguments.control_plane_url,
+            acceptance_controller_token_file=controller_token_path,
+            verified_trust=context.trust,
+            configured_site_id=context.configured_site_id,
+            configured_campaign_id=context.configured_campaign_id,
+            configured_gate=context.configured_gate,
+            fault_executor=fault_executor,
+            observer=observer,
+            journal_path=collector_state_path,
+            collector_id=collector_id,
+        )
+        signer = OpenSSLAcceptanceRunSigner(
+            signer_path,
+            expected_public_key_spki_sha256=(
+                context.trust.policy.roles.run_spki_sha256
+            ),
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+        )
+
+        def environment_factory(
+            request: TargetRuntimeLaunchRequestV2,
+            channel_path: Path,
+        ) -> TargetRuntimeControllerEnvironmentV2:
+            mount_argv, native_path, work_path, _sources = environments[
+                request.request_sha256
+            ]
+            child_channel = "/run/acceptance/channel"
+            child_sources = "/run/acceptance/source-secrets"
+            child_native = f"/run/acceptance/native/{native_path.name}"
+            child_work = f"/run/acceptance/work/{work_path.name}"
+            return TargetRuntimeControllerEnvironmentV2(
+                engine_path=arguments.container_engine,
+                nvidia_ctk_path=arguments.nvidia_ctk,
+                command=target_command(
+                    arguments,
+                    launch_nonce=request.launch_nonce,
+                    acceptance_channel=child_channel,
+                    acceptance_source_secrets=child_sources,
+                    acceptance_native_projection=child_native,
+                    acceptance_work_projection=child_work,
+                ),
+                reviewed_mount_argv=(
+                    *mount_argv,
+                    "--mount",
+                    (
+                        f"type=bind,src={channel_path},"
+                        f"dst={child_channel}"
+                    ),
+                    "--mount",
+                    (
+                        f"type=bind,src={source_secrets},"
+                        f"dst={child_sources},readonly"
+                    ),
+                    "--mount",
+                    (
+                        f"type=bind,src={native_root},"
+                        "dst=/run/acceptance/native"
+                    ),
+                    "--mount",
+                    (
+                        f"type=bind,src={work_root},"
+                        "dst=/run/acceptance/work"
+                    ),
+                ),
+            )
+
+        coordinator = TargetCampaignCoordinatorV3(
+            collector_id=collector.campaign_collector_id,
+            trust_context=context,
+            launch_requests=(requests[0], requests[1]),
+            graph=graph,
+            channel_root=channel_root,
+            environment_factory=environment_factory,
+            source_profile_provider=lambda request: profile_by_request[
+                request.request_sha256
+            ],
+            reviewed_mount_sources=tuple(reviewed_mount_sources),
+        )
+        continuation = TargetRuntimeContinuationCoordinatorV3(
+            collector_id=collector.campaign_collector_id,
+            trust_context=context,
+            launch_request=requests[2],
+            graph=graph,
+            channel_root=channel_root,
+            environment_factory=environment_factory,
+            source_profile_provider=lambda request: profile_by_request[
+                request.request_sha256
+            ],
+            transition_journal=(
+                SQLiteTargetExecutionTransitionJournalV3(
+                    transition_journal_path
+                )
+            ),
+            authenticated_collector=collector,
+            reviewed_mount_sources=tuple(reviewed_mount_sources),
+            stop_grace_seconds=arguments.stop_grace_seconds,
+        )
+        collector_runner = RetainedRuntimeTargetV3Collector(
+            collector=collector,
+            trust_context=context,
+            continuation=continuation,
+        )
+        signed_target, _proof = run_target_v3(
+            arguments,
+            coordinator=coordinator,
+            collector_runner=collector_runner,
+            trust_context=context,
+            signer=signer,
+        )
+        collected = collector_runner.collected
+        if collected is None:
+            raise RuntimeError("retained V3 collector produced no durable evidence")
+
+    limits = _load_reviewed_v3_model(
+        getattr(arguments, "acceptance_operational_limits", None),
+        AcceptanceLimitsV1,
+        label="acceptance operational limits",
+    )
+    operational = _load_reviewed_v3_model(
+        getattr(arguments, "acceptance_operational_evidence", None),
+        OperationalAcceptanceEvidenceV1,
+        label="acceptance operational evidence",
+    )
+    boundary = _load_reviewed_v3_model(
+        getattr(arguments, "acceptance_repository_boundary", None),
+        AuthoritativeRepositoryBoundaryV1,
+        label="acceptance repository boundary",
+    )
+    assert type(limits) is AcceptanceLimitsV1
+    assert type(operational) is OperationalAcceptanceEvidenceV1
+    assert type(boundary) is AuthoritativeRepositoryBoundaryV1
+    conditional_paths = tuple(
+        getattr(arguments, "acceptance_conditional_gate_decisions", ()) or ()
+    )
+    decisions = load_conditional_gate_decisions(
+        conditional_paths,
+        trusted_public_key=arguments.acceptance_conditional_role_public_key,
+    )
+    producer = ReviewedAcceptanceCaptureProducerV3(
+        trust_context=context,
+        controller_image_sha256=controller_image_id_sha256,
+        controller_code_sha256=controller_code_sha256,
+        operational_limits=limits,
+        operational_evidence=operational,
+        repository_boundary=boundary,
+        conditional_gate_decisions=decisions,
+    )
+    provider = ProtectedAcceptanceCaptureRepositoryV3(
+        capture_root,
+        trust_context=context,
+    )
+    capture = producer.capture(
+        signed_target_authority=signed_target,
+        final_envelope_v2=collected.final_envelope,
+        journal_proof_v2_path=collected.journal_proof_path,
+    )
+    provider.publish(capture)
+    result_model = collector.finalize_v3(
+        collector.campaign_collector_id
+    )
+    result = result_model.model_dump(mode="json")
+    result_payload = canonical_json_bytes(result)
+    out_v3_result = getattr(arguments, "out_v3_result", None)
+    if not isinstance(out_v3_result, Path) or not out_v3_result.is_absolute():
+        raise ValueError("acceptance V3 result path must be absolute")
+    _publish_exact_bytes(out_v3_result, result_payload)
+    return result
+
+
 def run_target(
     arguments: argparse.Namespace,
     *,
@@ -3751,6 +5278,8 @@ def run_target(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> AcceptanceRunRecordV2:
+    """Collect legacy V2 target evidence; never grant production authority."""
+
     collector_state = getattr(arguments, "collector_state", None)
     if not isinstance(collector_state, Path) or not collector_state.is_absolute():
         raise ValueError("target mode requires an absolute durable collector state path")
@@ -4213,9 +5742,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.mode == "target":
         try:
-            record = run_target(arguments)
-            if not arguments.out.exists():
-                _write_new_run_record(arguments.out, record)
+            run_production_target_v3(arguments)
             return 0
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             print(f"target replay refused: {exc}", file=sys.stderr)

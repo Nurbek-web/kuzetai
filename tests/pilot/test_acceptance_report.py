@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -4407,6 +4408,79 @@ def test_target_collector_durable_post_retries_response_loss_once(
     ) == response_payload
 
 
+def test_target_collector_v3_finalize_uses_exact_packaged_route() -> None:
+    collector = object.__new__(AuthenticatedTargetCollector)
+    collector._operation_lock = threading.RLock()
+    collector._binding = {"collector_id": "collector-route-01"}
+    observed: list[tuple[str, dict[str, object], int]] = []
+    digests = {
+        "snapshot_sha256": "1" * 64,
+        "evaluation_sha256": "2" * 64,
+        "final_decision_sha256": "3" * 64,
+        "proof_sha256": "4" * 64,
+    }
+    pass_payload = {
+        "schema_version": "acceptance-pass-attestation.v3",
+        "collector_id": "collector-route-01",
+        **digests,
+        "accepted": True,
+    }
+    response = {
+        "schema_version": "acceptance-controller-result.v3",
+        "collector_id": "collector-route-01",
+        "state": "ATTESTED",
+        **digests,
+        "accepted": True,
+        "pass_attestation": {
+            "schema_version": "signed-acceptance-pass-attestation.v3",
+            "payload": pass_payload,
+            "signature_hex": "a" * 128,
+        },
+    }
+
+    def post(
+        path: str,
+        payload: dict[str, object],
+        *,
+        limit: int,
+    ) -> dict[str, object]:
+        observed.append((path, payload, limit))
+        return response
+
+    collector._post = post
+    result = collector.finalize_v3("collector-route-01")
+
+    assert result.collector_id == "collector-route-01"
+    assert result.accepted is True
+    assert observed == [
+        (
+            (
+                "/api/internal/acceptance/v3/collectors/"
+                "collector-route-01/finalize"
+            ),
+            {},
+            replay_module._MAX_ACCEPTANCE_CONTROLLER_V3_RESULT_BYTES,
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match="active exact collector"):
+        collector.finalize_v3("collector-route-02")
+    hostile = {
+        **response,
+        "collector_id": "collector-route-02",
+        "pass_attestation": {
+            **response["pass_attestation"],
+            "payload": {
+                **pass_payload,
+                "collector_id": "collector-route-02",
+            },
+        },
+    }
+    collector._post = lambda *_args, **_kwargs: hostile
+    with pytest.raises(RuntimeError, match="invalid result|signed pass"):
+        collector.finalize_v3("collector-route-01")
+
+
 def test_target_fault_resume_observes_before_idempotent_effect_reconciliation(
     tmp_path: Path,
 ) -> None:
@@ -4516,7 +4590,10 @@ def test_target_fault_resume_observes_before_idempotent_effect_reconciliation(
 
     def durable_response(**kwargs: object) -> dict[str, object]:
         if kwargs["path"].endswith("/prepare"):
-            return {
+            response = {
+                "schema_version": (
+                    "acceptance-fault-prepare-response.v2"
+                ),
                 **binding,
                 "fault_id": fault.fault_id,
                 "phase": phase,
@@ -4524,16 +4601,31 @@ def test_target_fault_resume_observes_before_idempotent_effect_reconciliation(
                 "command_id": command_id,
                 "state": "CLAIMED",
             }
-        return {
-            **binding,
-            "fault_id": fault.fault_id,
-            "phase": phase,
-            "commanded_monotonic_offset_seconds": at_offset,
-            "command_id": command_id,
-            "state": fault.expected_degraded,
-            "runtime_boot_id": f"{execution.launch_nonce}.runtime-1",
-            "api_boot_id": "api-1",
-        }
+        else:
+            response = {
+                "schema_version": "acceptance-fault-ack-response.v2",
+                **binding,
+                "fault_id": fault.fault_id,
+                "phase": phase,
+                "commanded_monotonic_offset_seconds": at_offset,
+                "command_id": command_id,
+                "state": fault.expected_degraded,
+                "runtime_boot_id": (
+                    f"{execution.launch_nonce}.runtime-1"
+                ),
+                "api_boot_id": "api-1",
+                "observed_at": START.isoformat(),
+            }
+        operation_key = str(kwargs["operation_key"])
+        request = kwargs["payload"]
+        assert isinstance(request, dict)
+        collector._journal.stage(operation_key, request)
+        collector._journal.complete(
+            operation_key,
+            request=request,
+            response=response,
+        )
+        return response
 
     collector._durable_post = durable_response
     collector.command_fault(

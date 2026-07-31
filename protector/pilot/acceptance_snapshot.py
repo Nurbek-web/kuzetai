@@ -27,6 +27,16 @@ from protector.pilot.acceptance import (
     AcceptanceRunRecordV2,
     ConditionalGateAttestationV2,
 )
+from protector.pilot.acceptance_authority import (
+    AcceptanceAuthorityTrustContextV2,
+    _require_authority_trust_context,
+)
+from protector.pilot.acceptance_c2 import (
+    SignedTargetAuthorityBindingV3,
+    TargetAuthorityBindingV3,
+    require_target_authority_continuation_v3,
+    verify_signed_target_authority_v3,
+)
 from protector.pilot.acceptance_operational import (
     AcceptanceLimitsV1,
     AuthoritativeRepositoryBoundaryV1,
@@ -138,37 +148,6 @@ def expected_evaluator_identities_v3() -> tuple[EvaluatorIdentityV3, EvaluatorId
     )
 
 
-class TargetAuthorityBindingV3(_StrictFrozenModel):
-    """Typed C2 authority result.  No scalar capacity claim is accepted here."""
-
-    schema_version: Literal["target-authority-binding.v3"]
-    authorized: bool
-    runtime_identity_sha256: Digest
-    gpu_inventory_sha256: Digest
-    source_profile_sha256: Digest
-    native_prewarm_sha256: Digest
-    unique_work_sha256: Digest
-    completion_sha256: Digest
-    journal_proof_sha256: Digest
-    authority_receipt_sha256: Digest
-
-    @model_validator(mode="after")
-    def constituents_are_distinct(self) -> TargetAuthorityBindingV3:
-        values = (
-            self.runtime_identity_sha256,
-            self.gpu_inventory_sha256,
-            self.source_profile_sha256,
-            self.native_prewarm_sha256,
-            self.unique_work_sha256,
-            self.completion_sha256,
-            self.journal_proof_sha256,
-            self.authority_receipt_sha256,
-        )
-        if len(set(values)) != len(values):
-            raise ValueError("target authority constituent digests must be distinct")
-        return self
-
-
 def _owned_model[T: BaseModel](value: object, expected: type[T], label: str) -> T:
     if type(value) is not expected:
         raise ValueError(f"{label} must be one exact typed authority value")
@@ -215,6 +194,7 @@ class AcceptanceAuthoritySnapshotV3(_StrictFrozenModel):
     manifest_sha256: Digest
     controller_image_sha256: Digest
     controller_code_sha256: Digest
+    signed_target_authority: SignedTargetAuthorityBindingV3
     target_authority: TargetAuthorityBindingV3
     manifest: AcceptanceManifestV2
     run_record: AcceptanceRunRecordV2
@@ -234,6 +214,7 @@ class AcceptanceAuthoritySnapshotV3(_StrictFrozenModel):
 
     @field_validator(
         "target_authority",
+        "signed_target_authority",
         "manifest",
         "run_record",
         "operational_limits",
@@ -253,6 +234,7 @@ class AcceptanceAuthoritySnapshotV3(_StrictFrozenModel):
         assert field_name is not None
         expected: dict[str, type[BaseModel]] = {
             "target_authority": TargetAuthorityBindingV3,
+            "signed_target_authority": SignedTargetAuthorityBindingV3,
             "manifest": AcceptanceManifestV2,
             "run_record": AcceptanceRunRecordV2,
             "operational_limits": AcceptanceLimitsV1,
@@ -312,6 +294,11 @@ class AcceptanceAuthoritySnapshotV3(_StrictFrozenModel):
             TargetAuthorityBindingV3,
             "target authority",
         )
+        signed_target = _owned_model(
+            self.signed_target_authority,
+            SignedTargetAuthorityBindingV3,
+            "signed target authority",
+        )
         standard = _owned_model(
             self.standard_evaluator,
             EvaluatorIdentityV3,
@@ -338,6 +325,10 @@ class AcceptanceAuthoritySnapshotV3(_StrictFrozenModel):
             or self.gate != run.gate
             or self.gate != limits.gate
             or run.environment != "target"
+            or target.collector_id != self.collector_id
+            or target.site_id != self.site_id
+            or target.campaign_id != self.campaign_id
+            or target.gate != self.gate
             or self.manifest_sha256 != manifest.manifest_sha256
             or self.manifest_sha256 != run.manifest_sha256
             or self.manifest_sha256 != limits.manifest_sha256
@@ -350,6 +341,8 @@ class AcceptanceAuthoritySnapshotV3(_StrictFrozenModel):
             or run.ended_at != evidence.ended_at
             or limits.camera_ids != camera_ids
             or self.run_record_sha256 != hashlib.sha256(canonical_run).hexdigest()
+            or target.v2_run_record_sha256 != self.run_record_sha256
+            or signed_target.binding != target
             or (standard, operational) != expected_evaluator_identities_v3()
             or target != self.target_authority
             or decisions != self.conditional_gate_decisions
@@ -384,7 +377,8 @@ def build_acceptance_authority_snapshot_v3(
     manifest_payload_sha256: str,
     controller_image_sha256: str,
     controller_code_sha256: str,
-    target_authority: TargetAuthorityBindingV3,
+    signed_target_authority: SignedTargetAuthorityBindingV3,
+    trust_context: AcceptanceAuthorityTrustContextV2,
     manifest: AcceptanceManifestV2,
     run_record: AcceptanceRunRecordV2,
     operational_limits: AcceptanceLimitsV1,
@@ -395,6 +389,23 @@ def build_acceptance_authority_snapshot_v3(
     """Build from complete typed inputs; there is intentionally no candidate."""
 
     owned_run = _owned_model(run_record, AcceptanceRunRecordV2, "run record")
+    context = _require_authority_trust_context(trust_context)
+    verified_target = require_target_authority_continuation_v3(
+        verify_signed_target_authority_v3(
+            signed_target_authority,
+            trust_context=context,
+        )
+    )
+    if (
+        collector_id != verified_target.collector_id
+        or campaign_id != context.configured_campaign_id
+        or offline_root_spki_sha256 != context.trust.root_spki_sha256
+        or policy_id != context.trust.policy.policy_id
+        or policy_sha256 != context.trust.policy_sha256
+        or manifest_payload_sha256 != context.trust.manifest_payload_sha256
+        or manifest != context.trust.manifest
+    ):
+        raise ValueError("snapshot inputs differ from pinned acceptance trust")
     standard, operational = expected_evaluator_identities_v3()
     return AcceptanceAuthoritySnapshotV3(
         schema_version="acceptance-authority-snapshot.v3",
@@ -409,8 +420,13 @@ def build_acceptance_authority_snapshot_v3(
         manifest_sha256=owned_run.manifest_sha256,
         controller_image_sha256=controller_image_sha256,
         controller_code_sha256=controller_code_sha256,
+        signed_target_authority=_owned_model(
+            signed_target_authority,
+            SignedTargetAuthorityBindingV3,
+            "signed target authority",
+        ),
         target_authority=_owned_model(
-            target_authority,
+            verified_target,
             TargetAuthorityBindingV3,
             "target authority",
         ),
@@ -682,4 +698,40 @@ class AcceptanceAuthoritySnapshotStoreV3:
             raise RuntimeError("acceptance snapshot is invalid") from None
         if snapshot.canonical_bytes != payload:
             raise RuntimeError("acceptance snapshot is not exact canonical bytes")
+        return snapshot
+
+    def recover_existing(
+        self,
+        collector_id: str,
+    ) -> AcceptanceAuthoritySnapshotV3 | None:
+        """Recover final or pending exact bytes without re-invoking providers."""
+
+        final_name = self._final_name(collector_id)
+        try:
+            payload = self._read_name(final_name)
+        except FileNotFoundError:
+            try:
+                payload = self._read_name(self.pending_name(collector_id))
+            except FileNotFoundError:
+                return None
+        _load_canonical_json_object(
+            payload,
+            max_bytes=MAX_ACCEPTANCE_SNAPSHOT_BYTES,
+            label="recoverable acceptance authority snapshot",
+        )
+        try:
+            snapshot = AcceptanceAuthoritySnapshotV3.model_validate_json(
+                payload,
+                strict=True,
+            )
+        except ValueError:
+            raise RuntimeError("recoverable acceptance snapshot is invalid") from None
+        if (
+            snapshot.collector_id != collector_id
+            or snapshot.canonical_bytes != payload
+        ):
+            raise RuntimeError("recoverable acceptance snapshot binding differs")
+        published = self.publish(snapshot)
+        if published.sha256 != snapshot.snapshot_sha256:
+            raise RuntimeError("recovered acceptance snapshot digest differs")
         return snapshot

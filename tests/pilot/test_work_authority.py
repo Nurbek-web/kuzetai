@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import pickle
+import threading
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,56 @@ def test_runtime_ledger_records_each_planned_post_analytics_completion_once(
             slot_index=last.slot_index,
             detection_count=0,
         )
+
+
+def test_scheduled_frame_slot_claim_is_atomic_under_concurrency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, request, identity, graph = _target_inputs(tmp_path)
+    plan, _authority = derive_target_unique_work_plan(
+        trust_context=context,
+        launch_request=request,
+        runtime_identity=identity,
+        graph=graph,
+    )
+    prewarm = _prewarm(request, identity)
+    clock = [prewarm.ready_at_monotonic_ns + 1_000_000_000]
+    monkeypatch.setattr(work_authority, "_monotonic_ns", lambda: clock[0])
+    ledger = TargetUniqueWorkRuntimeLedger(plan=plan, native_prewarm=prewarm)
+    first = plan.slots[0]
+    clock[0] = ledger.measurement_started_monotonic_ns + first.scheduled_offset_ns
+    barrier = threading.Barrier(3)
+    results: list[object] = []
+    failures: list[BaseException] = []
+
+    def complete() -> None:
+        barrier.wait()
+        try:
+            results.append(
+                ledger.record_scheduled_post_analytics_frame(
+                    camera_id=first.camera_id,
+                    source_index=first.source_index,
+                    module=first.module,
+                    detection_count=0,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = (
+        threading.Thread(target=complete),
+        threading.Thread(target=complete),
+    )
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert failures == []
+    assert len([result for result in results if result is not None]) == 1
+    assert len([result for result in results if result is None]) == 1
 
 
 @pytest.mark.parametrize(

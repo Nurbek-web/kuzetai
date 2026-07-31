@@ -230,7 +230,7 @@ class TargetUniqueWorkRuntimeLedger:
         self.__started_at = started_at
         self.__completions: list[TargetUniqueWorkCompletionV2] = []
         self.__last_completed_at = started_at
-        self.__lock = threading.Lock()
+        self.__lock = threading.RLock()
 
     def __copy__(self):
         raise TypeError("runtime work-ledger capability cannot be copied or serialized")
@@ -312,6 +312,49 @@ class TargetUniqueWorkRuntimeLedger:
             self.__completions.append(completion)
             self.__last_completed_at = now
             return completion
+
+    def record_scheduled_post_analytics_frame(
+        self,
+        *,
+        camera_id: str,
+        source_index: int,
+        module: str,
+        detection_count: int,
+    ) -> TargetUniqueWorkCompletionV2 | None:
+        """Claim the next due slot from a real frame; early/unrelated frames are ignored."""
+
+        if (
+            type(camera_id) is not str
+            or type(source_index) is not int
+            or type(module) is not str
+            or type(detection_count) is not int
+        ):
+            raise TypeError("scheduled runtime frame fields must use exact scalar types")
+        now = _checked_now()
+        with self.__lock:
+            next_index = len(self.__completions)
+            if next_index >= len(self.__plan.slots):
+                return None
+            slot = self.__plan.slots[next_index]
+            if (
+                now < self.__started_at + slot.scheduled_offset_ns
+                or camera_id != slot.camera_id
+                or source_index != slot.source_index
+                or module != slot.module
+            ):
+                return None
+            return self.record_post_shared_analytics_completion(
+                work_id=slot.work_id,
+                runtime_epoch=self.__plan.runtime_epoch,
+                runtime_epoch_started_generation=(
+                    self.__plan.runtime_epoch_started_generation
+                ),
+                camera_id=camera_id,
+                source_index=source_index,
+                module=module,
+                slot_index=slot.slot_index,
+                detection_count=detection_count,
+            )
 
     def publish_projection(
         self,

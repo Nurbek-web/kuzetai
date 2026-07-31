@@ -1042,6 +1042,10 @@ def test_every_data_plane_start_uses_a_fresh_injectable_runtime_session_seed(
 
         class StateChangeReturn:
             FAILURE = "FAILURE"
+            ASYNC = "ASYNC"
+            SUCCESS = "SUCCESS"
+
+        SECOND = 1_000_000_000
 
     class Glib:
         @staticmethod
@@ -1570,6 +1574,13 @@ def test_runtime_stop_clears_writer_generation_and_allows_clean_restart(
         class State:
             NULL = "null"
 
+        class StateChangeReturn:
+            FAILURE = "failure"
+            ASYNC = "async"
+            SUCCESS = "success"
+
+        SECOND = 1_000_000_000
+
         class ElementFactory:
             @staticmethod
             def make(_: str, __: str) -> Element:
@@ -1579,8 +1590,9 @@ def test_runtime_stop_clears_writer_generation_and_allows_clean_restart(
         def __init__(self) -> None:
             self.states: list[object] = []
 
-        def set_state(self, state: object) -> None:
+        def set_state(self, state: object) -> str:
             self.states.append(state)
+            return Gst.StateChangeReturn.SUCCESS
 
     class Structure:
         def get_name(self) -> str:
@@ -1982,6 +1994,9 @@ def test_nvtracker_configuration_applies_documented_gstreamer_properties(tmp_pat
 def test_deployment_artifacts_pin_the_target_and_shared_person_tracker_contract() -> None:
     root = Path(__file__).parents[2]
     dockerfile = (root / "deploy/pilot/Dockerfile.runtime").read_text(encoding="utf-8")
+    requirements_lock = (
+        root / "deploy/pilot/api-requirements.lock"
+    ).read_text(encoding="utf-8")
     person_config = (root / "deploy/pilot/deepstream/person_primary.txt").read_text(
         encoding="utf-8"
     )
@@ -1990,9 +2005,19 @@ def test_deployment_artifacts_pin_the_target_and_shared_person_tracker_contract(
     )
 
     assert f"FROM --platform=linux/amd64 {DEEPSTREAM_IMAGE}" in dockerfile
-    assert "pydantic==2.13.4" in dockerfile
-    assert "pyyaml==6.0.3" in dockerfile
-    assert 'ENTRYPOINT ["python3", "-m", "protector.pilot.runtime.deepstream"]' in dockerfile
+    assert (
+        "COPY deploy/pilot/api-requirements.lock "
+        "/tmp/runtime-requirements.lock"
+        in dockerfile
+    )
+    assert "--require-hashes" in dockerfile
+    assert "pydantic==2.13.4" in requirements_lock
+    assert "pyyaml==6.0.3" in requirements_lock
+    assert (
+        'ENTRYPOINT ["python3", "-m", '
+        '"protector.pilot.runtime.production_main"]'
+        in dockerfile
+    )
     assert "batch-size=20" in person_config
     assert "network-mode=2" in person_config
     assert "onnx-file=/models/approved/person_primary.onnx" in person_config
@@ -2077,6 +2102,11 @@ def test_frame_metadata_anchors_splitmux_running_time_to_camera_rtcp_utc() -> No
         stream_epoch=epoch,
         running_time_ns=8_000_000_000,
     ) == clocks.wall() + timedelta(seconds=1)
+    event_batch = runtime.drain_event_batch(max_items=1)
+    assert event_batch.observations == ()
+    assert [cursor.camera_id for cursor in event_batch.cursors] == [
+        camera_id
+    ]
 
 
 def test_missing_camera_ntp_never_marks_online_publishes_or_anchors() -> None:
@@ -2347,14 +2377,28 @@ def test_stop_uses_gst_null_and_partial_start_cleanup_does_not_leave_a_pipeline(
     class State:
         NULL = object()
 
-    Gst = type("Gst", (), {"State": State})
+    class StateChangeReturn:
+        FAILURE = object()
+        ASYNC = object()
+        SUCCESS = object()
+
+    Gst = type(
+        "Gst",
+        (),
+        {
+            "State": State,
+            "StateChangeReturn": StateChangeReturn,
+            "SECOND": 1_000_000_000,
+        },
+    )
 
     class Pipeline:
         def __init__(self) -> None:
             self.states: list[object] = []
 
-        def set_state(self, state: object) -> None:
+        def set_state(self, state: object) -> object:
             self.states.append(state)
+            return StateChangeReturn.SUCCESS
 
     pipeline = Pipeline()
     stop_pipeline(pipeline, Gst)
@@ -2362,18 +2406,159 @@ def test_stop_uses_gst_null_and_partial_start_cleanup_does_not_leave_a_pipeline(
     assert pipeline.states == [State.NULL]
 
 
+@pytest.mark.parametrize("initial_result", ("FAILURE", "ASYNC"))
+def test_stop_rejects_failed_or_incomplete_async_null_transition(
+    initial_result: str,
+) -> None:
+    class State:
+        NULL = "NULL"
+        PLAYING = "PLAYING"
+
+    class StateChangeReturn:
+        FAILURE = "FAILURE"
+        ASYNC = "ASYNC"
+        SUCCESS = "SUCCESS"
+
+    Gst = type(
+        "Gst",
+        (),
+        {
+            "State": State,
+            "StateChangeReturn": StateChangeReturn,
+            "SECOND": 1_000_000_000,
+        },
+    )
+
+    class Pipeline:
+        def set_state(self, state: object) -> str:
+            assert state == State.NULL
+            return initial_result
+
+        def get_state(self, timeout: int) -> tuple[str, str, str]:
+            assert timeout == 10 * Gst.SECOND
+            return StateChangeReturn.ASYNC, State.PLAYING, State.NULL
+
+    with pytest.raises(RuntimeError, match="NULL"):
+        stop_pipeline(Pipeline(), Gst)
+
+
+def test_stop_accepts_only_a_completed_async_null_transition() -> None:
+    class State:
+        NULL = "NULL"
+
+    class StateChangeReturn:
+        FAILURE = "FAILURE"
+        ASYNC = "ASYNC"
+        SUCCESS = "SUCCESS"
+
+    Gst = type(
+        "Gst",
+        (),
+        {
+            "State": State,
+            "StateChangeReturn": StateChangeReturn,
+            "SECOND": 1_000_000_000,
+        },
+    )
+
+    class Pipeline:
+        def set_state(self, _: object) -> str:
+            return StateChangeReturn.ASYNC
+
+        def get_state(self, timeout: int) -> tuple[str, str, None]:
+            assert timeout == 10 * Gst.SECOND
+            return StateChangeReturn.SUCCESS, State.NULL, None
+
+    stop_pipeline(Pipeline(), Gst)
+
+
+@pytest.mark.parametrize("initial_result", ("FAILURE", "ASYNC"))
+def test_runtime_retains_graph_and_dependencies_until_null_is_verified(
+    initial_result: str,
+) -> None:
+    class State:
+        NULL = "NULL"
+        PLAYING = "PLAYING"
+
+    class StateChangeReturn:
+        FAILURE = "FAILURE"
+        ASYNC = "ASYNC"
+        SUCCESS = "SUCCESS"
+
+    Gst = type(
+        "Gst",
+        (),
+        {
+            "State": State,
+            "StateChangeReturn": StateChangeReturn,
+            "SECOND": 1_000_000_000,
+        },
+    )
+
+    class Pipeline:
+        def set_state(self, _: object) -> str:
+            return initial_result
+
+        def get_state(self, _: int) -> tuple[str, str, str]:
+            return StateChangeReturn.ASYNC, State.PLAYING, State.NULL
+
+    class Telemetry:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    pipeline = Pipeline()
+    bindings = deepstream_module._NvidiaBindings(
+        gst=Gst,
+        glib=object(),
+        pyds=object(),
+    )
+    telemetry = Telemetry()
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+    )
+    runtime._pipeline = pipeline
+    runtime._bindings = bindings
+    runtime._telemetry_publisher = telemetry  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="NULL"):
+        runtime.stop()
+
+    assert runtime._pipeline is pipeline
+    assert runtime._bindings is bindings
+    assert runtime._telemetry_publisher is telemetry
+    assert telemetry.closed is False
+
+
 def test_stop_cleans_gpu_pipeline_even_when_telemetry_close_fails() -> None:
     class State:
         NULL = object()
 
-    gst = type("Gst", (), {"State": State})
+    class StateChangeReturn:
+        FAILURE = object()
+        ASYNC = object()
+        SUCCESS = object()
+
+    gst = type(
+        "Gst",
+        (),
+        {
+            "State": State,
+            "StateChangeReturn": StateChangeReturn,
+            "SECOND": 1_000_000_000,
+        },
+    )
 
     class Pipeline:
         def __init__(self) -> None:
             self.states: list[object] = []
 
-        def set_state(self, state: object) -> None:
+        def set_state(self, state: object) -> object:
             self.states.append(state)
+            return StateChangeReturn.SUCCESS
 
     class Telemetry:
         def close(self) -> None:
@@ -2483,6 +2668,15 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
     capacity_source = tmp_path / "capacity.yaml"
     capacity_signature_source = tmp_path / "capacity.sig"
     capacity_public_key_source = tmp_path / "capacity-authority.pem"
+    database_url_source = tmp_path / "runtime_database_url"
+    object_store_access_key_source = (
+        tmp_path / "runtime_object_store_access_key"
+    )
+    object_store_secret_key_source = (
+        tmp_path / "runtime_object_store_secret_key"
+    )
+    runtime_journal_source = tmp_path / "runtime-journal"
+    runtime_preview_source = tmp_path / "runtime-preview"
     token_source = tmp_path / "machine_token"
     evidence_source = tmp_path / "evidence-spool"
     site_source.write_text(yaml.safe_dump(site.model_dump(mode="json")))
@@ -2490,8 +2684,22 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
     capacity_source.write_text("schema_version: measured-capacity-report.v1\n")
     capacity_signature_source.write_bytes(b"bounded-signature")
     capacity_public_key_source.write_bytes(b"bounded-public-key")
+    database_url_source.write_text("postgresql+psycopg://runtime@example/pilot")
+    object_store_access_key_source.write_text("runtime-object-store-access")
+    object_store_secret_key_source.write_text("runtime-object-store-secret")
     token_source.write_text("machine-token-fixture")
     evidence_source.mkdir(mode=0o700)
+    runtime_journal_source.mkdir(mode=0o700)
+    runtime_preview_source.mkdir(mode=0o700)
+    runtime_uid = os.geteuid() or 10_001
+    runtime_gid = os.getegid() or 10_001
+    if os.geteuid() == 0:
+        for directory in (
+            evidence_source,
+            runtime_journal_source,
+            runtime_preview_source,
+        ):
+            os.chown(directory, runtime_uid, runtime_gid)
     mounts = [
         RuntimeBindMountV1(
             source=site_source,
@@ -2581,13 +2789,103 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
         measured_capacity_source=capacity_source,
         measured_capacity_signature_source=capacity_signature_source,
         capacity_authority_public_key_source=capacity_public_key_source,
-        runtime_uid=os.geteuid(),
-        runtime_gid=os.getegid(),
+        runtime_uid=runtime_uid,
+        runtime_gid=runtime_gid,
     )
 
     assert len(contract.mounts) == 30
     assert len(argv) == 60
     assert all("rtsp://" not in argument for argument in argv)
+    production_mounts = (
+        *(
+            mount.model_copy(
+                update={
+                    "storage_encryption_attested": True,
+                    "storage_quota_bytes": 4 * 1024 * 1024 * 1024,
+                }
+            )
+            if mount.target == Path("/srv/kuzet/evidence-spool")
+            else mount
+            for mount in contract.mounts
+        ),
+        RuntimeBindMountV1(
+            source=database_url_source,
+            target=Path("/run/secrets/runtime_database_url"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=object_store_access_key_source,
+            target=Path("/run/secrets/runtime_object_store_access_key"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=object_store_secret_key_source,
+            target=Path("/run/secrets/runtime_object_store_secret_key"),
+            kind="file",
+            read_only=True,
+        ),
+        RuntimeBindMountV1(
+            source=runtime_journal_source,
+            target=Path("/var/lib/kuzet/journal"),
+            kind="directory",
+            read_only=False,
+            storage_encryption_attested=True,
+            storage_quota_bytes=512 * 1024 * 1024,
+        ),
+        RuntimeBindMountV1(
+            source=runtime_preview_source,
+            target=Path("/var/lib/kuzet/previews"),
+            kind="directory",
+            read_only=False,
+            storage_encryption_attested=True,
+            storage_quota_bytes=2 * 1024 * 1024 * 1024,
+        ),
+    )
+    production_contract = contract.model_copy(
+        update={"mounts": production_mounts}
+    )
+    production_arguments = {
+        "database_url_secret_source": database_url_source,
+        "object_store_access_key_secret_source": (
+            object_store_access_key_source
+        ),
+        "object_store_secret_key_secret_source": object_store_secret_key_source,
+        "runtime_journal_source": runtime_journal_source,
+        "runtime_preview_source": runtime_preview_source,
+    }
+
+    production_argv = validate_runtime_mount_contract(
+        site_config=site,
+        runtime_manifest=manifest,
+        contract=production_contract,
+        expected_image_id=contract.image_id,
+        site_config_source=site_source,
+        runtime_manifest_source=runtime_source,
+        measured_capacity_source=capacity_source,
+        measured_capacity_signature_source=capacity_signature_source,
+        capacity_authority_public_key_source=capacity_public_key_source,
+        runtime_uid=runtime_uid,
+        runtime_gid=runtime_gid,
+        **production_arguments,
+    )
+
+    assert len(production_contract.mounts) == 35
+    assert len(production_argv) == 70
+    with pytest.raises(ValueError, match="secret mount sources must be supplied together"):
+        validate_runtime_mount_contract(
+            site_config=site,
+            runtime_manifest=manifest,
+            contract=contract,
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
+            database_url_secret_source=database_url_source,
+        )
     duplicate_secret_site = site.model_copy(
         update={
             "ready_to_start": site.ready_to_start.model_copy(
@@ -2670,6 +2968,126 @@ def test_target_mount_contract_covers_exact_secrets_artifacts_and_reviewed_input
             measured_capacity_source=capacity_source,
             measured_capacity_signature_source=capacity_signature_source,
             capacity_authority_public_key_source=capacity_public_key_source,
+        )
+    database_source_collision_contract = contract.model_copy(
+        update={
+            "mounts": tuple(
+                mount.model_copy(update={"source": site_source})
+                if mount.target == Path("/run/secrets/runtime_database_url")
+                else mount
+                for mount in production_contract.mounts
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="mount sources must be unique"):
+        validate_runtime_mount_contract(
+            site_config=site,
+            runtime_manifest=manifest,
+            contract=database_source_collision_contract,
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
+            **production_arguments,
+        )
+    nested_preview_source = runtime_journal_source / "nested-preview"
+    nested_preview_source.mkdir(mode=0o700)
+    if os.geteuid() == 0:
+        os.chown(nested_preview_source, runtime_uid, runtime_gid)
+    nested_storage_contract = production_contract.model_copy(
+        update={
+            "mounts": tuple(
+                mount.model_copy(update={"source": nested_preview_source})
+                if mount.target == Path("/var/lib/kuzet/previews")
+                else mount
+                for mount in production_contract.mounts
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="unique and disjoint"):
+        validate_runtime_mount_contract(
+            site_config=site,
+            runtime_manifest=manifest,
+            contract=nested_storage_contract,
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
+            **(
+                production_arguments
+                | {"runtime_preview_source": nested_preview_source}
+            ),
+        )
+    unattested_spool_contract = production_contract.model_copy(
+        update={
+            "mounts": tuple(
+                mount.model_copy(
+                    update={
+                        "storage_encryption_attested": False,
+                        "storage_quota_bytes": None,
+                    }
+                )
+                if mount.target == Path("/srv/kuzet/evidence-spool")
+                else mount
+                for mount in production_contract.mounts
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="encryption and quota attestation"):
+        validate_runtime_mount_contract(
+            site_config=site,
+            runtime_manifest=manifest,
+            contract=unattested_spool_contract,
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
+            **production_arguments,
+        )
+    unsafe_preview_source = tmp_path / "unsafe-runtime-preview"
+    unsafe_preview_source.mkdir(mode=0o755)
+    unsafe_preview_source.chmod(0o755)
+    if os.geteuid() == 0:
+        os.chown(unsafe_preview_source, runtime_uid, runtime_gid)
+    unsafe_storage_contract = production_contract.model_copy(
+        update={
+            "mounts": tuple(
+                mount.model_copy(update={"source": unsafe_preview_source})
+                if mount.target == Path("/var/lib/kuzet/previews")
+                else mount
+                for mount in production_contract.mounts
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="private and owned"):
+        validate_runtime_mount_contract(
+            site_config=site,
+            runtime_manifest=manifest,
+            contract=unsafe_storage_contract,
+            expected_image_id=contract.image_id,
+            site_config_source=site_source,
+            runtime_manifest_source=runtime_source,
+            measured_capacity_source=capacity_source,
+            measured_capacity_signature_source=capacity_signature_source,
+            capacity_authority_public_key_source=capacity_public_key_source,
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
+            **(
+                production_arguments
+                | {"runtime_preview_source": unsafe_preview_source}
+            ),
         )
     with pytest.raises(ValueError, match="exact required target set"):
         validate_runtime_mount_contract(
@@ -2847,14 +3265,68 @@ def test_deepstream_adapter_exposes_the_same_bounded_observation_drain_as_replay
         wall_clock=clocks.wall,
     )
     supervisor.accept_sample(camera_id="camera-01", source_time=clocks.wall(), monotonic_seq=0)
+    supervisor.accept_sample(camera_id="camera-01", source_time=clocks.wall(), monotonic_seq=1)
     runtime = DeepStreamDataPlane(
         runtime_manifest=_manifest(),
         runtime_info=lambda: ("8.9", "10.16.0.72"),
     )
     runtime._supervisor = supervisor
 
-    assert [item.camera_id for item in runtime.drain_observations()] == ["camera-01"]
+    assert [item.monotonic_seq for item in runtime.drain_observations(max_items=1)] == [0]
+    assert len(runtime.event_cursors()) == 1
+    assert [item.monotonic_seq for item in runtime.drain_observations()] == [1]
     assert runtime.drain_observations() == []
+
+
+def test_deepstream_adapter_preserves_finite_observations_until_worker_drain() -> None:
+    clocks = Clocks()
+    supervisor = CameraSupervisor(
+        camera_ids=("camera-01",),
+        observation_queue_size=2,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+    supervisor.accept_sample(
+        camera_id="camera-01",
+        source_time=clocks.wall(),
+        monotonic_seq=0,
+    )
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+    )
+    runtime._supervisor = supervisor
+
+    runtime.stop(preserve_observations=True)
+
+    assert runtime._supervisor is None
+    assert runtime._draining_supervisor is supervisor
+    assert runtime.event_cursors() == ()
+    assert [item.monotonic_seq for item in runtime.drain_observations(max_items=1)] == [0]
+    assert len(runtime.event_cursors()) == 1
+    runtime.finish_observation_drain()
+    assert runtime.event_cursors() == ()
+    assert runtime.drain_observations() == []
+    runtime.finish_observation_drain()
+
+
+def test_deepstream_adapter_rejects_restart_before_observation_drain_finishes() -> None:
+    clocks = Clocks()
+    runtime = DeepStreamDataPlane(
+        runtime_manifest=_manifest(),
+        runtime_info=lambda: ("8.9", "10.16.0.72"),
+    )
+    runtime._draining_supervisor = CameraSupervisor(
+        camera_ids=("camera-01",),
+        observation_queue_size=1,
+        monotonic_clock=clocks.monotonic,
+        wall_clock=clocks.wall,
+    )
+
+    with pytest.raises(RuntimeError, match="already running"):
+        runtime.start(_site())
+
+    runtime.finish_observation_drain()
 
 
 def test_sigterm_quits_main_loop_drains_runtime_and_exits_cleanly() -> None:

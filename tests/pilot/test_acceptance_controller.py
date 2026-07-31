@@ -205,8 +205,13 @@ def test_acceptance_controller_streams_only_authenticated_sealed_proof(
 
 
 def test_compose_keeps_acceptance_authority_out_of_restartable_api() -> None:
-    compose = yaml.safe_load(Path("deploy/pilot/docker-compose.yml").read_text(encoding="utf-8"))
-    api = compose["services"]["api"]
+    compose = yaml.safe_load(
+        Path("deploy/pilot/docker-compose.acceptance.yml").read_text(encoding="utf-8")
+    )
+    base = yaml.safe_load(
+        Path("deploy/pilot/docker-compose.yml").read_text(encoding="utf-8")
+    )
+    api = base["services"]["api"]
     controller = compose["services"]["acceptance-controller"]
     assert "PILOT_ACCEPTANCE_JOURNAL_PATH" not in api["environment"]
     assert "acceptance_controller_token" not in api["secrets"]
@@ -217,12 +222,12 @@ def test_compose_keeps_acceptance_authority_out_of_restartable_api() -> None:
     assert controller["environment"]["PILOT_ACCEPTANCE_JOURNAL_PATH"].endswith("authority.sqlite3")
     assert (
         controller["environment"]["PILOT_ACCEPTANCE_PROOF_DIR"]
-        == "/var/lib/kuzet/acceptance-proofs"
+        == "/var/lib/kuzet/acceptance-proof"
     )
     proof_mount = next(
         volume
         for volume in controller["volumes"]
-        if volume.get("target") == "/var/lib/kuzet/acceptance-proofs"
+        if volume.get("target") == "/var/lib/kuzet/acceptance-proof"
     )
     assert "PILOT_ACCEPTANCE_PROOF_PATH" in proof_mount["source"]
     assert proof_mount["read_only"] is False

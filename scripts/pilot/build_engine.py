@@ -13,8 +13,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import yaml
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from protector.pilot.model_registry import (  # noqa: E402
@@ -23,6 +21,11 @@ from protector.pilot.model_registry import (  # noqa: E402
     build_engine,
     load_model_entry,
 )
+from protector.pilot.trusted_yaml import StrictYAMLError, load_strict_yaml  # noqa: E402
+
+_MAX_ENGINE_BUILD_SPEC_YAML_BYTES = 256 * 1024
+_MAX_ENGINE_BUILD_SPEC_YAML_NODES = 4_000
+_MAX_ENGINE_BUILD_SPEC_YAML_DEPTH = 32
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -55,9 +58,18 @@ def _parser() -> argparse.ArgumentParser:
 def _load_build_spec(path: Path | None) -> EngineBuildSpecV1:
     if path is None:
         return EngineBuildSpecV1()
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("build spec must be a YAML mapping")
+    with path.open("rb") as build_spec_file:
+        encoded = build_spec_file.read(_MAX_ENGINE_BUILD_SPEC_YAML_BYTES + 1)
+    try:
+        payload = load_strict_yaml(
+            encoded,
+            max_bytes=_MAX_ENGINE_BUILD_SPEC_YAML_BYTES,
+            max_nodes=_MAX_ENGINE_BUILD_SPEC_YAML_NODES,
+            max_depth=_MAX_ENGINE_BUILD_SPEC_YAML_DEPTH,
+            require_mapping=True,
+        )
+    except StrictYAMLError as exc:
+        raise ValueError("build spec YAML is invalid") from exc
     return EngineBuildSpecV1.model_validate(payload)
 
 

@@ -40,9 +40,24 @@ from protector.pilot.acceptance_authority import (
     build_authority_trust_context,
     read_host_boot_id,
 )
+from protector.pilot.acceptance_authority_v3 import (
+    AcceptanceAuthorityStateStoreV3,
+    AcceptanceAuthorityV3,
+)
+from protector.pilot.acceptance_capture_v3 import (
+    ProtectedAcceptanceCaptureRepositoryV3,
+)
+from protector.pilot.acceptance_controller_v3 import (
+    AcceptanceControllerResultV3,
+    CollectorBoundAcceptanceControllerV3,
+)
 from protector.pilot.acceptance_proof import (
     AcceptanceFinalEnvelopeV2,
     AcceptanceProofStore,
+)
+from protector.pilot.acceptance_proof_v3 import AcceptanceProofStoreV3
+from protector.pilot.acceptance_snapshot import (
+    AcceptanceAuthoritySnapshotStoreV3,
 )
 from protector.pilot.acceptance_trust import (
     AcceptanceRolePublicKeyPathsV2,
@@ -262,6 +277,9 @@ def build_production_acceptance_authority() -> AcceptanceAuthority:
         "PILOT_ACCEPTANCE_JOURNAL_PATH",
         "PILOT_ACCEPTANCE_OFFLINE_ROOT_SPKI_SHA256",
         "PILOT_ACCEPTANCE_PROOF_DIR",
+        "PILOT_ACCEPTANCE_SNAPSHOT_DIR",
+        "PILOT_ACCEPTANCE_CHANNEL_DIR",
+        "PILOT_ACCEPTANCE_CAPTURE_DIR",
     }
     forbidden = tuple(
         name
@@ -359,13 +377,33 @@ def _read_controller_token(path: Path = _TOKEN_PATH) -> str:
 def create_acceptance_controller_app(
     *,
     authority: Any,
+    v3_authority: Any | None = None,
     controller_token: str,
     runtime_lock_path: str | Path = "/tmp/kuzet-acceptance-controller.lock",
     max_request_body_bytes: int = MAX_REQUEST_BODY_BYTES,
     max_final_request_body_bytes: int = _MAX_FINAL_REQUEST_BODY_BYTES,
+    v3_authorization_guard: Callable[[], None] | None = None,
 ) -> FastAPI:
     """Create the small authenticated controller surface."""
-    if authority is None or len(controller_token) < 16:
+    if (
+        authority is None
+        or (
+            v3_authority is not None
+            and (
+                not callable(
+                    getattr(v3_authority, "finalize_collector", None)
+                )
+                or not callable(
+                    getattr(v3_authority, "readiness_probe", None)
+                )
+            )
+        )
+        or (
+            v3_authorization_guard is not None
+            and not callable(v3_authorization_guard)
+        )
+        or len(controller_token) < 16
+    ):
         raise ValueError("acceptance controller requires authority and token")
     singleton = ProcessSingletonLock(runtime_lock_path)
 
@@ -481,6 +519,52 @@ def create_acceptance_controller_app(
     def finalize(payload: AcceptanceFinalizeRequestV2) -> dict[str, object]:
         return call("finalize", payload.model_dump(mode="json"))
 
+    if v3_authority is not None:
+
+        @app.post(
+            "/api/internal/acceptance/v3/collectors/{collector_id}/finalize",
+            dependencies=[Depends(require_controller)],
+            response_model=AcceptanceControllerResultV3,
+        )
+        def finalize_collector(collector_id: str) -> dict[str, object]:
+            if (
+                re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}",
+                    collector_id,
+                )
+                is None
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="collector identity is invalid",
+                )
+            try:
+                if v3_authorization_guard is not None:
+                    v3_authorization_guard()
+                result = v3_authority.finalize_collector(collector_id)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail={
+                        "code": "invalid_acceptance_evidence",
+                        "message": "acceptance evidence is invalid",
+                    },
+                ) from exc
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "acceptance_state_conflict",
+                        "message": "acceptance state conflict",
+                    },
+                ) from exc
+            if not isinstance(result, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="acceptance authority unavailable",
+                )
+            return result
+
     @app.post(
         "/api/internal/acceptance/proof",
         dependencies=[Depends(require_controller)],
@@ -529,6 +613,132 @@ def create_acceptance_controller_app(
     )
     def ready() -> dict[str, str]:
         try:
+            if (
+                v3_authority is not None
+                and v3_authorization_guard is not None
+            ):
+                v3_authorization_guard()
+            authority.readiness_probe()
+            if v3_authority is not None:
+                v3_authority.readiness_probe()
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="acceptance controller is not ready",
+            ) from exc
+        return {"status": "ready"}
+
+    return app
+
+
+def create_v3_acceptance_controller_app(
+    *,
+    authority: Any,
+    controller_token: str,
+    runtime_lock_path: str | Path = "/tmp/kuzet-acceptance-controller-v3.lock",
+    max_request_body_bytes: int = MAX_REQUEST_BODY_BYTES,
+    authorization_guard: Callable[[], None] | None = None,
+) -> FastAPI:
+    """Expose only collector-bound finalization; all evidence stays provider owned."""
+
+    if (
+        authority is None
+        or not callable(getattr(authority, "finalize_collector", None))
+        or not callable(getattr(authority, "readiness_probe", None))
+        or (
+            authorization_guard is not None
+            and not callable(authorization_guard)
+        )
+        or len(controller_token) < 16
+    ):
+        raise ValueError("V3 acceptance controller requires authority and token")
+    singleton = ProcessSingletonLock(runtime_lock_path)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> Any:
+        singleton.acquire()
+        try:
+            yield
+        finally:
+            singleton.release()
+
+    app = FastAPI(
+        title="Kuzet AI Acceptance Controller V3",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_body_bytes=max_request_body_bytes,
+    )
+
+    def require_controller(
+        authorization: Annotated[
+            str | None,
+            Header(alias="Authorization"),
+        ] = None,
+    ) -> None:
+        scheme, separator, credential = (authorization or "").partition(" ")
+        if (
+            separator != " "
+            or scheme.casefold() != "bearer"
+            or not credential
+            or not hmac.compare_digest(credential, controller_token)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="acceptance controller authentication required",
+            )
+
+    @app.post(
+        "/api/internal/acceptance/v3/collectors/{collector_id}/finalize",
+        dependencies=[Depends(require_controller)],
+        response_model=AcceptanceControllerResultV3,
+    )
+    def finalize_collector(collector_id: str) -> dict[str, object]:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}", collector_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="collector identity is invalid",
+            )
+        try:
+            if authorization_guard is not None:
+                authorization_guard()
+            result = authority.finalize_collector(collector_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "code": "invalid_acceptance_evidence",
+                    "message": "acceptance evidence is invalid",
+                },
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "acceptance_state_conflict",
+                    "message": "acceptance state conflict",
+                },
+            ) from exc
+        if not isinstance(result, dict):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="acceptance authority unavailable",
+            )
+        return result
+
+    @app.get("/live", dependencies=[Depends(require_controller)])
+    def live() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/ready", dependencies=[Depends(require_controller)])
+    def ready() -> dict[str, str]:
+        try:
+            if authorization_guard is not None:
+                authorization_guard()
             authority.readiness_probe()
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(
@@ -547,4 +757,84 @@ def create_production_acceptance_controller_app() -> FastAPI:
     return create_acceptance_controller_app(
         authority=authority,
         controller_token=_read_controller_token(),
+    )
+
+
+def _require_distinct_v3_protected_roots(
+    roots: tuple[tuple[str, Path], ...],
+) -> None:
+    identities: dict[tuple[int, int], str] = {}
+    for label, path in roots:
+        try:
+            resolved = path.resolve(strict=True)
+            metadata = path.stat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"acceptance V3 {label} root is unavailable"
+            ) from exc
+        identity = (metadata.st_dev, metadata.st_ino)
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or resolved != path
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise RuntimeError(
+                f"acceptance V3 {label} root must be one exact directory"
+            )
+        previous = identities.get(identity)
+        if previous is not None:
+            raise RuntimeError(
+                "acceptance V3 protected roots contain an inode alias: "
+                f"{previous} and {label}"
+            )
+        identities[identity] = label
+
+
+def create_production_acceptance_controller_v3_app() -> FastAPI:
+    """Build the target-only V3 surface from protected provider-owned stores."""
+
+    legacy_authority = build_production_acceptance_authority()
+    if legacy_authority.signer is None or legacy_authority.trust_context is None:
+        raise RuntimeError("acceptance V3 signing and trust authority are required")
+    journal_path = Path(_required_environment("PILOT_ACCEPTANCE_JOURNAL_PATH"))
+    snapshot_root = Path(_required_environment("PILOT_ACCEPTANCE_SNAPSHOT_DIR"))
+    proof_root = Path(_required_environment("PILOT_ACCEPTANCE_PROOF_DIR"))
+    channel_root = Path(_required_environment("PILOT_ACCEPTANCE_CHANNEL_DIR"))
+    capture_root = Path(_required_environment("PILOT_ACCEPTANCE_CAPTURE_DIR"))
+    _require_distinct_v3_protected_roots(
+        (
+            ("capture", capture_root),
+            ("channel", channel_root),
+            ("snapshot", snapshot_root),
+            ("proof", proof_root),
+        )
+    )
+    try:
+        provider = ProtectedAcceptanceCaptureRepositoryV3(
+            capture_root,
+            trust_context=legacy_authority.trust_context,
+        )
+        snapshot_store = AcceptanceAuthoritySnapshotStoreV3(snapshot_root)
+        proof_store = AcceptanceProofStoreV3(proof_root)
+        state_store = AcceptanceAuthorityStateStoreV3(journal_path)
+        authority = AcceptanceAuthorityV3(
+            state_store=state_store,
+            run_evidence_signer=legacy_authority.signer,
+            acceptance_pass_signer=legacy_authority.signer,
+        )
+        controller = CollectorBoundAcceptanceControllerV3(
+            provider=provider,
+            snapshot_store=snapshot_store,
+            authority=authority,
+            proof_store=proof_store,
+            trust_context=legacy_authority.trust_context,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("acceptance V3 protected stores are unavailable") from exc
+    return create_acceptance_controller_app(
+        authority=legacy_authority,
+        v3_authority=controller,
+        controller_token=_read_controller_token(),
+        runtime_lock_path="/tmp/kuzet-acceptance-controller-v3.lock",
     )

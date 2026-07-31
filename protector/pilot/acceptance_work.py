@@ -13,6 +13,7 @@ import hmac
 import os
 import secrets
 import stat
+import threading
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -33,6 +34,9 @@ from protector.pilot.acceptance_target import (
 from protector.pilot.acceptance_trust import (
     canonical_json_bytes,
     load_canonical_json_bytes,
+)
+from protector.pilot.acceptance_transaction import (
+    C2_CAPABILITY_TRANSACTION_LOCK,
 )
 from protector.pilot.config import FrozenModel
 from protector.pilot.runtime.deepstream import DeepStreamGraphSpec
@@ -504,7 +508,13 @@ def _make_verified_work_tools():
     key = secrets.token_bytes(32)
 
     class _VerifiedTargetWorkCapability:
-        __slots__ = ("__plan_sha256", "__projection_sha256", "__receipt")
+        __slots__ = (
+            "__consumed",
+            "__lock",
+            "__plan_bytes",
+            "__projection_bytes",
+            "__receipt",
+        )
 
         def __init__(
             self,
@@ -515,13 +525,15 @@ def _make_verified_work_tools():
         ) -> None:
             if issuer is not token:
                 raise TypeError("verified target work requires the controller verifier")
-            self.__plan_sha256 = plan.plan_sha256
-            self.__projection_sha256 = projection.projection_sha256
+            self.__plan_bytes = plan.canonical_bytes
+            self.__projection_bytes = projection.canonical_bytes
             self.__receipt = hmac.digest(
                 key,
-                (self.__plan_sha256 + self.__projection_sha256).encode("ascii"),
+                self.__plan_bytes + self.__projection_bytes,
                 "sha256",
             )
+            self.__consumed = False
+            self.__lock = threading.Lock()
 
         def __copy__(self):
             raise TypeError("verified target-work capability cannot be copied or serialized")
@@ -542,10 +554,78 @@ def _make_verified_work_tools():
             projection=projection,
         )
 
-    return issue
+    def _inspect_locked(
+        candidate: object,
+        *,
+        consume: bool,
+    ) -> tuple[TargetUniqueWorkPlanV2, TargetUniqueWorkProjectionV2]:
+        if type(candidate) is not _VerifiedTargetWorkCapability:
+            raise TypeError("verified target-work capability is required")
+        with candidate._VerifiedTargetWorkCapability__lock:
+            if candidate._VerifiedTargetWorkCapability__consumed:
+                raise RuntimeError("verified target-work capability was already consumed")
+            plan_bytes = candidate._VerifiedTargetWorkCapability__plan_bytes
+            projection_bytes = candidate._VerifiedTargetWorkCapability__projection_bytes
+            receipt = candidate._VerifiedTargetWorkCapability__receipt
+            expected = hmac.digest(
+                key,
+                plan_bytes + projection_bytes,
+                "sha256",
+            )
+            if (
+                type(plan_bytes) is not bytes
+                or type(projection_bytes) is not bytes
+                or type(receipt) is not bytes
+                or not hmac.compare_digest(receipt, expected)
+            ):
+                raise ValueError("verified target-work capability provenance is invalid")
+            plan = load_canonical_json_bytes(
+                plan_bytes,
+                TargetUniqueWorkPlanV2,
+                max_bytes=MAX_TARGET_UNIQUE_WORK_PROJECTION_BYTES,
+                label="verified unique-work plan",
+            )
+            projection = load_canonical_json_bytes(
+                projection_bytes,
+                TargetUniqueWorkProjectionV2,
+                max_bytes=MAX_TARGET_UNIQUE_WORK_PROJECTION_BYTES,
+                label="verified unique-work projection",
+            )
+            if (
+                plan.plan_sha256 != projection.plan_sha256
+                or projection.completed_unique_work_units != plan.offered_work_units
+            ):
+                raise ValueError("verified target-work capability binding is invalid")
+            if consume:
+                candidate._VerifiedTargetWorkCapability__consumed = True
+            return plan, projection
+
+    def inspect(
+        candidate: object,
+        *,
+        consume: bool,
+    ) -> tuple[TargetUniqueWorkPlanV2, TargetUniqueWorkProjectionV2]:
+        with C2_CAPABILITY_TRANSACTION_LOCK:
+            return _inspect_locked(candidate, consume=consume)
+
+    def peek(
+        candidate: object,
+    ) -> tuple[TargetUniqueWorkPlanV2, TargetUniqueWorkProjectionV2]:
+        return inspect(candidate, consume=False)
+
+    def consume(
+        candidate: object,
+    ) -> tuple[TargetUniqueWorkPlanV2, TargetUniqueWorkProjectionV2]:
+        return inspect(candidate, consume=True)
+
+    return issue, peek, consume
 
 
-_issue_verified_work = _make_verified_work_tools()
+(
+    _issue_verified_work,
+    _peek_verified_target_work,
+    _require_verified_target_work,
+) = _make_verified_work_tools()
 
 
 def derive_target_unique_work_plan(
@@ -817,14 +897,12 @@ def _read_projection_once(path: Path) -> bytes:
     return payload
 
 
-def verify_target_unique_work_projection(
-    path: Path,
+def _verify_target_unique_work_projection_value(
+    projection: TargetUniqueWorkProjectionV2,
     *,
     plan_authority: object,
     native_prewarm: TargetNativePrewarmProjectionV2,
 ) -> tuple[TargetUniqueWorkProjectionV2, object]:
-    """Single-capture, reparse, and independently recompute runtime work."""
-
     context, plan = _require_plan_authority(plan_authority)
     prewarm = _strict_exact(
         native_prewarm,
@@ -842,30 +920,34 @@ def verify_target_unique_work_projection(
         or context.trust.manifest.manifest_sha256 != plan.manifest_sha256
     ):
         raise ValueError("native prewarm differs from the verified unique-work plan")
-    payload = _read_projection_once(path)
-    projection = load_canonical_json_bytes(
-        payload,
+    checked_projection = _strict_exact(
+        projection,
         TargetUniqueWorkProjectionV2,
-        max_bytes=MAX_TARGET_UNIQUE_WORK_PROJECTION_BYTES,
-        label="target unique-work projection",
+        "target unique-work projection",
     )
     if (
-        projection.plan_sha256 != plan.plan_sha256
-        or projection.launch_request_sha256 != plan.launch_request_sha256
-        or projection.runtime_identity_sha256 != plan.runtime_identity_sha256
-        or projection.native_prewarm_projection_sha256 != prewarm.projection_sha256
-        or projection.measurement_started_monotonic_ns < prewarm.ready_at_monotonic_ns
-        or projection.measurement_completed_monotonic_ns
-        - projection.measurement_started_monotonic_ns
+        checked_projection.plan_sha256 != plan.plan_sha256
+        or checked_projection.launch_request_sha256 != plan.launch_request_sha256
+        or checked_projection.runtime_identity_sha256 != plan.runtime_identity_sha256
+        or checked_projection.native_prewarm_projection_sha256
+        != prewarm.projection_sha256
+        or checked_projection.measurement_started_monotonic_ns
+        < prewarm.ready_at_monotonic_ns
+        or checked_projection.measurement_completed_monotonic_ns
+        - checked_projection.measurement_started_monotonic_ns
         != plan.measurement_duration_ns
-        or projection.offered_work_units != plan.offered_work_units
-        or projection.completed_unique_work_units != plan.offered_work_units
-        or projection.required_work_numerator != plan.required_work_numerator
-        or projection.required_work_denominator != plan.required_work_denominator
-        or len(projection.completions) != len(plan.slots)
+        or checked_projection.offered_work_units != plan.offered_work_units
+        or checked_projection.completed_unique_work_units != plan.offered_work_units
+        or checked_projection.required_work_numerator != plan.required_work_numerator
+        or checked_projection.required_work_denominator != plan.required_work_denominator
+        or len(checked_projection.completions) != len(plan.slots)
     ):
         raise ValueError("runtime unique-work projection is incomplete or differs from plan")
-    for slot, completion in zip(plan.slots, projection.completions, strict=True):
+    for slot, completion in zip(
+        plan.slots,
+        checked_projection.completions,
+        strict=True,
+    ):
         if (
             completion.work_id != slot.work_id
             or completion.slot_index != slot.slot_index
@@ -873,29 +955,80 @@ def verify_target_unique_work_projection(
             or completion.source_index != slot.source_index
             or completion.module != slot.module
             or completion.completed_at_monotonic_ns
-            < (projection.measurement_started_monotonic_ns + slot.scheduled_offset_ns)
-            or completion.completed_at_monotonic_ns > projection.measurement_completed_monotonic_ns
+            < (
+                checked_projection.measurement_started_monotonic_ns
+                + slot.scheduled_offset_ns
+            )
+            or completion.completed_at_monotonic_ns
+            > checked_projection.measurement_completed_monotonic_ns
         ):
             raise ValueError("runtime completion differs from its planned unique-work slot")
     effective_rate = Fraction(
-        projection.completed_unique_work_units * 1_000_000_000,
+        checked_projection.completed_unique_work_units * 1_000_000_000,
         plan.measurement_duration_ns,
     )
     required_work = Fraction(
         plan.required_work_numerator,
         plan.required_work_denominator,
     )
-    headroom = Fraction(projection.completed_unique_work_units, 1) / required_work - 1
+    headroom = (
+        Fraction(checked_projection.completed_unique_work_units, 1)
+        / required_work
+        - 1
+    )
     if (
-        (projection.effective_rate_numerator, projection.effective_rate_denominator)
+        (
+            checked_projection.effective_rate_numerator,
+            checked_projection.effective_rate_denominator,
+        )
         != (effective_rate.numerator, effective_rate.denominator)
-        or (projection.headroom_numerator, projection.headroom_denominator)
+        or (
+            checked_projection.headroom_numerator,
+            checked_projection.headroom_denominator,
+        )
         != (headroom.numerator, headroom.denominator)
         or headroom < Fraction(1, 4)
     ):
         raise ValueError("runtime effective rate or 25 percent headroom differs")
-    capability = _issue_verified_work(plan, projection)
-    return projection, capability
+    capability = _issue_verified_work(plan, checked_projection)
+    return checked_projection, capability
+
+
+def verify_target_unique_work_projection_value(
+    projection: TargetUniqueWorkProjectionV2,
+    *,
+    plan_authority: object,
+    native_prewarm: TargetNativePrewarmProjectionV2,
+) -> tuple[TargetUniqueWorkProjectionV2, object]:
+    """Verify one authenticated child projection without caller-owned file paths."""
+
+    return _verify_target_unique_work_projection_value(
+        projection,
+        plan_authority=plan_authority,
+        native_prewarm=native_prewarm,
+    )
+
+
+def verify_target_unique_work_projection(
+    path: Path,
+    *,
+    plan_authority: object,
+    native_prewarm: TargetNativePrewarmProjectionV2,
+) -> tuple[TargetUniqueWorkProjectionV2, object]:
+    """Single-capture, reparse, and independently recompute runtime work."""
+
+    payload = _read_projection_once(path)
+    projection = load_canonical_json_bytes(
+        payload,
+        TargetUniqueWorkProjectionV2,
+        max_bytes=MAX_TARGET_UNIQUE_WORK_PROJECTION_BYTES,
+        label="target unique-work projection",
+    )
+    return _verify_target_unique_work_projection_value(
+        projection,
+        plan_authority=plan_authority,
+        native_prewarm=native_prewarm,
+    )
 
 
 __all__ = (
@@ -909,4 +1042,5 @@ __all__ = (
     "completed_work_ledger_sha256",
     "derive_target_unique_work_plan",
     "verify_target_unique_work_projection",
+    "verify_target_unique_work_projection_value",
 )

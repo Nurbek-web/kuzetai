@@ -1016,7 +1016,10 @@ def test_production_controller_rejects_legacy_acceptance_overrides(
 
 
 def test_deployment_wires_durable_reviewed_acceptance_authority() -> None:
-    compose = yaml.safe_load((REPO_ROOT / "deploy/pilot/docker-compose.yml").read_text())
+    compose = yaml.safe_load(
+        (REPO_ROOT / "deploy/pilot/docker-compose.acceptance.yml").read_text()
+    )
+    base = yaml.safe_load((REPO_ROOT / "deploy/pilot/docker-compose.yml").read_text())
     controller = compose["services"]["acceptance-controller"]
     environment = controller["environment"]
     assert environment["PILOT_ACCEPTANCE_JOURNAL_PATH"] == (
@@ -1036,7 +1039,7 @@ def test_deployment_wires_durable_reviewed_acceptance_authority() -> None:
     }
     assert all(volume["bind"]["create_host_path"] is False for volume in controller["volumes"])
     assert "docker.sock" not in str(controller["volumes"])
-    assert "ports" not in compose["services"]["api"]
+    assert "ports" not in base["services"]["api"]
     dockerfile = (REPO_ROOT / "deploy/pilot/Dockerfile.api").read_text()
     assert "install -d -o root -g root -m 0755 /var/lib/kuzet/acceptance" in dockerfile
     ready = (REPO_ROOT / "docs/pilot/ready_to_start.md").read_text()

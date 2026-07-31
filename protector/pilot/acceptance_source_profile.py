@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import secrets
@@ -145,15 +146,78 @@ class TargetSourceProfileAttestationV2(_StrictFrozenModel):
         return hashlib.sha256(canonical_json_bytes(self)).hexdigest()
 
 
+class TransmittedTargetSourceProfileV2(_StrictFrozenModel):
+    """Exact signed bytes and manifest key independently verified by the child."""
+
+    schema_version: Literal["transmitted-target-source-profile.v2"]
+    attestation: TargetSourceProfileAttestationV2
+    signature_hex: Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
+    manifest_public_key_pem_base64: Annotated[
+        str,
+        Field(min_length=1, max_length=2048),
+    ]
+    attestation_payload_sha256: _Digest
+    signature_sha256: _Digest
+    manifest_role_spki_sha256: _Digest
+    verified_binding_sha256: _Digest
+
+    @model_validator(mode="after")
+    def exact_signed_graph(self) -> TransmittedTargetSourceProfileV2:
+        payload = canonical_json_bytes(self.attestation)
+        try:
+            signature = bytes.fromhex(self.signature_hex)
+            public_key = base64.b64decode(
+                self.manifest_public_key_pem_base64,
+                validate=True,
+            )
+        except ValueError:
+            raise ValueError("transmitted source profile encoding is invalid") from None
+        manifest_spki = ed25519_public_key_spki_sha256(public_key)
+        expected_binding = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "schema_version": "verified-target-source-profile-binding.v2",
+                    "attestation_payload_sha256": hashlib.sha256(payload).hexdigest(),
+                    "signature_sha256": hashlib.sha256(signature).hexdigest(),
+                    "manifest_role_spki_sha256": manifest_spki,
+                    "launch_request_sha256": self.attestation.launch_request_sha256,
+                }
+            )
+        ).hexdigest()
+        if (
+            len(signature) != 64
+            or not 1 <= len(public_key) <= 1024
+            or self.attestation_payload_sha256
+            != hashlib.sha256(payload).hexdigest()
+            or self.signature_sha256 != hashlib.sha256(signature).hexdigest()
+            or self.manifest_role_spki_sha256 != manifest_spki
+            or self.attestation.manifest_role_spki_sha256 != manifest_spki
+            or self.verified_binding_sha256 != expected_binding
+        ):
+            raise ValueError("transmitted source profile digest graph differs")
+        verified_spki = verify_ed25519_payload(
+            payload=payload,
+            signature=signature,
+            trusted_public_key=public_key,
+            label="transmitted target source profile",
+        )
+        if verified_spki != manifest_spki:
+            raise ValueError("transmitted source profile used the wrong manifest role")
+        return self
+
+
 class VerifiedTargetSourceProfileAttestationV2:
     """Process-local proof that exact captured bytes passed the manifest-role check."""
 
     __slots__ = (
         "_attestation",
         "_attestation_payload_sha256",
+        "_manifest_public_key",
         "_manifest_role_spki_sha256",
         "_provenance",
+        "_signature",
         "_signature_sha256",
+        "_verified_binding_sha256",
     )
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -189,6 +253,10 @@ class VerifiedTargetSourceProfileAttestationV2:
     def signature_sha256(self) -> str:
         return self._signature_sha256
 
+    @property
+    def verified_binding_sha256(self) -> str:
+        return self._verified_binding_sha256
+
 
 def _provenance(
     *,
@@ -217,6 +285,8 @@ def _mint_verified(
     attestation_payload_sha256: str,
     signature_sha256: str,
     manifest_role_spki_sha256: str,
+    signature: bytes,
+    manifest_public_key: bytes,
 ) -> VerifiedTargetSourceProfileAttestationV2:
     verified = object.__new__(VerifiedTargetSourceProfileAttestationV2)
     object.__setattr__(verified, "_attestation", attestation)
@@ -226,6 +296,12 @@ def _mint_verified(
         attestation_payload_sha256,
     )
     object.__setattr__(verified, "_signature_sha256", signature_sha256)
+    object.__setattr__(verified, "_signature", bytes(signature))
+    object.__setattr__(
+        verified,
+        "_manifest_public_key",
+        bytes(manifest_public_key),
+    )
     object.__setattr__(
         verified,
         "_manifest_role_spki_sha256",
@@ -240,6 +316,21 @@ def _mint_verified(
             signature_sha256=signature_sha256,
             manifest_role_spki_sha256=manifest_role_spki_sha256,
         ),
+    )
+    object.__setattr__(
+        verified,
+        "_verified_binding_sha256",
+        hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "schema_version": "verified-target-source-profile-binding.v2",
+                    "attestation_payload_sha256": attestation_payload_sha256,
+                    "signature_sha256": signature_sha256,
+                    "manifest_role_spki_sha256": manifest_role_spki_sha256,
+                    "launch_request_sha256": attestation.launch_request_sha256,
+                }
+            )
+        ).hexdigest(),
     )
     return verified
 
@@ -257,16 +348,113 @@ def _require_verified_target_source_profile_attestation(
             manifest_role_spki_sha256=(verified._manifest_role_spki_sha256),
         )
         actual = verified._provenance
+        actual_binding = verified._verified_binding_sha256
+        expected_binding = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "schema_version": (
+                        "verified-target-source-profile-binding.v2"
+                    ),
+                    "attestation_payload_sha256": (
+                        verified._attestation_payload_sha256
+                    ),
+                    "signature_sha256": verified._signature_sha256,
+                    "manifest_role_spki_sha256": (
+                        verified._manifest_role_spki_sha256
+                    ),
+                    "launch_request_sha256": (
+                        verified._attestation.launch_request_sha256
+                    ),
+                }
+            )
+        ).hexdigest()
     except (AttributeError, TypeError, ValueError):
         raise ValueError("source profile attestation provenance is invalid") from None
     if (
         type(actual) is not bytes
         or len(actual) != hashlib.sha256().digest_size
         or not hmac.compare_digest(actual, expected)
+        or type(actual_binding) is not str
+        or not hmac.compare_digest(
+            actual_binding,
+            expected_binding,
+        )
+        or type(verified._signature) is not bytes
+        or len(verified._signature) != 64
+        or type(verified._manifest_public_key) is not bytes
+        or ed25519_public_key_spki_sha256(verified._manifest_public_key)
+        != verified._manifest_role_spki_sha256
+        or hashlib.sha256(verified._signature).hexdigest()
+        != verified._signature_sha256
     ):
         raise ValueError("source profile attestation provenance is invalid")
     return TargetSourceProfileAttestationV2.model_validate(
         verified._attestation.model_dump(mode="python")
+    )
+
+
+def export_verified_target_source_profile(
+    verified: VerifiedTargetSourceProfileAttestationV2,
+) -> TransmittedTargetSourceProfileV2:
+    """Export only the signed public profile material, never a local capability."""
+
+    attestation = _require_verified_target_source_profile_attestation(verified)
+    return TransmittedTargetSourceProfileV2(
+        schema_version="transmitted-target-source-profile.v2",
+        attestation=attestation,
+        signature_hex=verified._signature.hex(),
+        manifest_public_key_pem_base64=base64.b64encode(
+            verified._manifest_public_key
+        ).decode("ascii"),
+        attestation_payload_sha256=verified.attestation_payload_sha256,
+        signature_sha256=verified.signature_sha256,
+        manifest_role_spki_sha256=verified._manifest_role_spki_sha256,
+        verified_binding_sha256=verified.verified_binding_sha256,
+    )
+
+
+def verify_transmitted_target_source_profile(
+    transmitted: TransmittedTargetSourceProfileV2,
+    *,
+    launch_request: TargetRuntimeLaunchRequestV2,
+) -> VerifiedTargetSourceProfileAttestationV2:
+    """Independently verify the signed wire profile inside the child process."""
+
+    if type(transmitted) is not TransmittedTargetSourceProfileV2:
+        raise TypeError("exact transmitted source profile is required")
+    if type(launch_request) is not TargetRuntimeLaunchRequestV2:
+        raise TypeError("exact target launch request is required")
+    checked = TransmittedTargetSourceProfileV2.model_validate(
+        transmitted.model_dump(mode="python")
+    )
+    request = TargetRuntimeLaunchRequestV2.model_validate(
+        launch_request.model_dump(mode="python")
+    )
+    attestation = checked.attestation
+    if (
+        attestation.launch_request_sha256 != request.request_sha256
+        or attestation.site_id != request.launch.site_id
+        or attestation.campaign_id != request.campaign_id
+        or attestation.gate != request.gate
+        or attestation.source_identity_commitments
+        != tuple(
+            binding.source_identity_commitment
+            for binding in request.source_bindings
+        )
+    ):
+        raise ValueError("transmitted source profile differs from the exact launch")
+    signature = bytes.fromhex(checked.signature_hex)
+    public_key = base64.b64decode(
+        checked.manifest_public_key_pem_base64,
+        validate=True,
+    )
+    return _mint_verified(
+        attestation=attestation,
+        attestation_payload_sha256=checked.attestation_payload_sha256,
+        signature_sha256=checked.signature_sha256,
+        manifest_role_spki_sha256=checked.manifest_role_spki_sha256,
+        signature=signature,
+        manifest_public_key=public_key,
     )
 
 
@@ -389,6 +577,8 @@ def capture_verified_target_source_profile_attestation(
         attestation_payload_sha256=hashlib.sha256(captured_attestation.payload).hexdigest(),
         signature_sha256=hashlib.sha256(captured_signature.payload).hexdigest(),
         manifest_role_spki_sha256=manifest_spki,
+        signature=captured_signature.payload,
+        manifest_public_key=manifest_public_key,
     )
 
 
@@ -397,6 +587,9 @@ __all__ = (
     "MAX_TARGET_SOURCE_PROFILE_ATTESTATION_BYTES",
     "MAX_TARGET_SOURCE_PROFILE_SIGNATURE_BYTES",
     "TargetSourceProfileAttestationV2",
+    "TransmittedTargetSourceProfileV2",
     "VerifiedTargetSourceProfileAttestationV2",
     "capture_verified_target_source_profile_attestation",
+    "export_verified_target_source_profile",
+    "verify_transmitted_target_source_profile",
 )

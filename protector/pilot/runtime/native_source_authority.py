@@ -387,7 +387,6 @@ class NativeExact20SourceAuthorityV2:
             self._require_open()
             if self._projected:
                 raise RuntimeError("native source prewarm projection was already attempted")
-            self._projected = True
             if tuple(self._leases) != tuple(range(_CAMERA_COUNT)):
                 raise ValueError("native source prewarm requires current exact ordered 20 leases")
             leases = tuple(self._leases[index] for index in range(_CAMERA_COUNT))
@@ -409,11 +408,13 @@ class NativeExact20SourceAuthorityV2:
                 expected_epoch_started_generation=(self._request.runtime_epoch_started_generation),
             )
             projector = NativePrewarmProjectorV2(self._projection_path)
-            return projector.project(
+            projection = projector.project(
                 receipt=receipt,
                 launch_request=self._request,
                 runtime_identity=self._identity,
             )
+            self._projected = True
+            return projection
 
     def close(self) -> None:
         with self._lock:

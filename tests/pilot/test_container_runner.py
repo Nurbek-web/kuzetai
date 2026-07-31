@@ -344,7 +344,7 @@ def _runner_fixture(
         "Entrypoint": [
             "python3",
             "-m",
-            "protector.pilot.runtime.deepstream",
+            "protector.pilot.runtime.production_main",
         ],
         "Cmd": None,
         "User": "10001:10001",
@@ -354,12 +354,12 @@ def _runner_fixture(
     }
     image_payload = {"Id": image_id, "Config": image_config}
     container_config = {
-        "Cmd": list(command),
-        "Entrypoint": [
-            "python3",
+        "Cmd": [
             "-m",
             "protector.pilot.runtime.deepstream",
+            *command,
         ],
+        "Entrypoint": ["python3"],
         "User": "10001:10001",
         "Labels": {
             "ai.kuzet.launch-nonce": NONCE,
@@ -414,6 +414,7 @@ def _runner_fixture(
     inventory_observations = 0
     state: dict[str, object] = {
         "cleanup_calls": 0,
+        "invocations": [],
         "removed": False,
         "restart_calls": 0,
     }
@@ -423,6 +424,9 @@ def _runner_fixture(
         **_kwargs: object,
     ) -> SimpleNamespace:
         nonlocal inventory_observations
+        invocations = state["invocations"]
+        assert isinstance(invocations, list)
+        invocations.append(invocation)
         if invocation[0] == "/usr/bin/nvidia-ctk":
             version = "1.17.8"
             if (
@@ -643,6 +647,67 @@ def test_launch_retains_and_reverifies_complete_immutable_inventory(
     )
     with pytest.raises(ValidationError):
         initial.devices[0].product_name = "mutated"
+
+
+def test_create_explicitly_overrides_acceptance_runtime_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments, _run, state = _runner_fixture()
+    monkeypatch.setattr(
+        container_runner,
+        "_trusted_engine",
+        lambda path: str(path),
+    )
+
+    launch_docker_runtime(**arguments)
+
+    invocations = state["invocations"]
+    assert isinstance(invocations, list)
+    create = next(
+        invocation
+        for invocation in invocations
+        if invocation[1:2] == ("create",)
+    )
+    assert create.count("--entrypoint") == 1
+    entrypoint = create.index("--entrypoint")
+    assert entrypoint < create.index(arguments["image_id"])
+    assert create[entrypoint + 1] == "python3"
+    image = create.index(arguments["image_id"])
+    assert create[image + 1 :] == (
+        "-m",
+        "protector.pilot.runtime.deepstream",
+        *arguments["command"],
+    )
+
+
+def test_create_preserves_literal_quotes_in_gpu_capabilities_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments, _run, state = _runner_fixture()
+    monkeypatch.setattr(
+        container_runner,
+        "_trusted_engine",
+        lambda path: str(path),
+    )
+
+    launch_docker_runtime(**arguments)
+
+    invocations = state["invocations"]
+    assert isinstance(invocations, list)
+    create = next(
+        invocation
+        for invocation in invocations
+        if invocation[1:2] == ("create",)
+    )
+    assert create.count("--gpus") == 1
+    gpus = create.index("--gpus")
+    assert create[gpus : gpus + 2] == (
+        "--gpus",
+        (
+            "device=GPU-11111111-2222-3333-4444-555555555555,"
+            '"capabilities=compute,utility,video"'
+        ),
+    )
 
 
 @pytest.mark.parametrize(

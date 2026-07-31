@@ -775,7 +775,7 @@ def launch_docker_runtime(
         "--gpus",
         (
             f"device={expected_gpu_device_ids[0]},"
-            "capabilities=compute,utility,video"
+            '"capabilities=compute,utility,video"'
         ),
         "--user",
         "10001:10001",
@@ -802,8 +802,12 @@ def launch_docker_runtime(
         "max-size=10m",
         "--log-opt",
         "max-file=3",
+        "--entrypoint",
+        "python3",
         *mount_argv,
         image_id,
+        "-m",
+        "protector.pilot.runtime.deepstream",
         *command,
     )
     try:
@@ -849,9 +853,13 @@ def launch_docker_runtime(
             or inspected.get("Image") != image_id
             or inspected["Name"] != f"/{name}"
             or inspected["State"]["Status"] != "created"
-            or tuple(inspected["Config"]["Cmd"]) != command
-            or inspected["Config"]["Entrypoint"]
-            != ["python3", "-m", "protector.pilot.runtime.deepstream"]
+            or tuple(inspected["Config"]["Cmd"])
+            != (
+                "-m",
+                "protector.pilot.runtime.deepstream",
+                *command,
+            )
+            or inspected["Config"]["Entrypoint"] != ["python3"]
             or inspected["Config"]["User"] != "10001:10001"
             or host["ReadonlyRootfs"] is not True
             or "ALL" not in host["CapDrop"]

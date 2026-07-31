@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -15,6 +18,10 @@ from protector.pilot.acceptance_target import (
     TargetRuntimeIdentityV2,
     TargetRuntimeLaunchRequestV2,
     TargetRuntimeObservationV2,
+)
+from protector.pilot.acceptance_trust import canonical_json_bytes
+from protector.pilot.acceptance_transaction import (
+    C2_CAPABILITY_TRANSACTION_LOCK,
 )
 from protector.pilot.config import FrozenModel
 from protector.pilot.runtime.container_runner import (
@@ -139,6 +146,7 @@ class _ControllerOwnedDockerRuntime:
     __slots__ = (
         "__cleanup_failure",
         "__cleanup_started",
+        "__c2_consumed",
         "__identity",
         "__lock",
         "__process",
@@ -149,11 +157,22 @@ class _ControllerOwnedDockerRuntime:
     def __init__(
         self,
         *,
+        _issuer: object | None = None,
         process: DockerRuntimeProcess,
         request: TargetRuntimeLaunchRequestV2,
         identity: TargetRuntimeIdentityV2,
         started_monotonic_ns: int,
     ) -> None:
+        if (
+            not _is_controller_runtime_owner_issuer(_issuer)
+            or type(process) is not DockerRuntimeProcess
+            or type(request) is not TargetRuntimeLaunchRequestV2
+            or type(identity) is not TargetRuntimeIdentityV2
+            or type(started_monotonic_ns) is not int
+        ):
+            raise TypeError(
+                "controller runtime owner requires exact private Docker provenance"
+            )
         self.__process = process
         self.__request = request
         self.__identity = identity
@@ -161,6 +180,7 @@ class _ControllerOwnedDockerRuntime:
         self.__lock = threading.Lock()
         self.__cleanup_started = False
         self.__cleanup_failure: BaseException | None = None
+        self.__c2_consumed = False
 
     def __copy__(self) -> _ControllerOwnedDockerRuntime:
         raise TypeError("controller-owned runtime capability cannot be copied or serialized")
@@ -229,8 +249,9 @@ class _ControllerOwnedDockerRuntime:
             except BaseException as primary:
                 self._cleanup_after_failure(primary)
                 raise
-            self.__identity = identity
-            return TargetRuntimeIdentityV2.model_validate(identity.model_dump(mode="python"))
+            return TargetRuntimeIdentityV2.model_validate(
+                self.__identity.model_dump(mode="python")
+            )
 
     def poll(self) -> int | None:
         return self._delegate(self.__process.poll)
@@ -267,6 +288,189 @@ class _ControllerOwnedDockerRuntime:
             except BaseException as cleanup:
                 self.__cleanup_failure = cleanup
                 raise
+
+    def _mark_c2_consumed(self) -> None:
+        with self.__lock:
+            self._require_live()
+            if self.__c2_consumed:
+                raise RuntimeError(
+                    "controller-owned runtime capability was already consumed"
+                )
+            self.__c2_consumed = True
+
+
+def _make_controller_runtime_owner_issuer() -> tuple[
+    Callable[[object], bool],
+    Callable[
+        ...,
+        tuple[_ControllerOwnedDockerRuntime, TargetRuntimeIdentityV2],
+    ],
+]:
+    token = object()
+
+    def is_issuer(candidate: object) -> bool:
+        return candidate is token
+
+    def issue(
+        *,
+        process: DockerRuntimeProcess,
+        request: TargetRuntimeLaunchRequestV2,
+        epoch_started_monotonic_ns: int,
+        identity_observed_monotonic_ns: int,
+    ) -> tuple[_ControllerOwnedDockerRuntime, TargetRuntimeIdentityV2]:
+        if (
+            type(process) is not DockerRuntimeProcess
+            or type(request) is not TargetRuntimeLaunchRequestV2
+            or type(epoch_started_monotonic_ns) is not int
+            or type(identity_observed_monotonic_ns) is not int
+            or epoch_started_monotonic_ns < 0
+            or identity_observed_monotonic_ns < epoch_started_monotonic_ns
+        ):
+            raise TypeError(
+                "controller runtime owner requires exact Docker launch values"
+            )
+        identity = _build_identity(
+            request=request,
+            process=process,
+            inventory=process.verify_identity(),
+            epoch_started_monotonic_ns=epoch_started_monotonic_ns,
+            observed_monotonic_ns=identity_observed_monotonic_ns,
+        )
+        runtime = _ControllerOwnedDockerRuntime(
+            _issuer=token,
+            process=process,
+            request=request,
+            identity=identity,
+            started_monotonic_ns=epoch_started_monotonic_ns,
+        )
+        return runtime, identity
+
+    return is_issuer, issue
+
+
+(
+    _is_controller_runtime_owner_issuer,
+    _issue_controller_owned_docker_runtime,
+) = _make_controller_runtime_owner_issuer()
+
+
+def _make_controller_runtime_authority_tools():
+    issuer = object()
+    key = secrets.token_bytes(32)
+
+    class _VerifiedControllerRuntime:
+        __slots__ = (
+            "__consumed",
+            "__identity_bytes",
+            "__lock",
+            "__receipt",
+            "__runtime",
+        )
+
+        def __init__(
+            self,
+            *,
+            token: object,
+            runtime: _ControllerOwnedDockerRuntime,
+            identity: TargetRuntimeIdentityV2,
+        ) -> None:
+            if token is not issuer:
+                raise TypeError("controller runtime authority requires its private issuer")
+            self.__runtime = runtime
+            self.__identity_bytes = canonical_json_bytes(identity)
+            self.__receipt = hmac.digest(key, self.__identity_bytes, "sha256")
+            self.__consumed = False
+            self.__lock = threading.Lock()
+
+        def __copy__(self) -> None:
+            raise TypeError("verified runtime capability cannot be copied or serialized")
+
+        def __deepcopy__(self, _memo: object) -> None:
+            raise TypeError("verified runtime capability cannot be copied or serialized")
+
+        def __reduce_ex__(self, _protocol: int) -> None:
+            raise TypeError("verified runtime capability cannot be copied or serialized")
+
+    def issue(
+        runtime: _ControllerOwnedDockerRuntime,
+    ) -> object:
+        if type(runtime) is not _ControllerOwnedDockerRuntime:
+            raise TypeError("exact controller-owned runtime capability is required")
+        identity = runtime.reverify_identity()
+        runtime._mark_c2_consumed()  # noqa: SLF001
+        return _VerifiedControllerRuntime(
+            token=issuer,
+            runtime=runtime,
+            identity=identity,
+        )
+
+    def _inspect_locked(
+        capability: object,
+        *,
+        consume: bool,
+    ) -> tuple[_ControllerOwnedDockerRuntime, TargetRuntimeIdentityV2]:
+        if type(capability) is not _VerifiedControllerRuntime:
+            raise TypeError("verified controller runtime capability is required")
+        with capability._VerifiedControllerRuntime__lock:
+            if capability._VerifiedControllerRuntime__consumed:
+                raise RuntimeError(
+                    "verified controller runtime capability was already consumed"
+                )
+            identity_bytes = capability._VerifiedControllerRuntime__identity_bytes
+            receipt = capability._VerifiedControllerRuntime__receipt
+            if (
+                type(identity_bytes) is not bytes
+                or type(receipt) is not bytes
+                or not hmac.compare_digest(
+                    receipt,
+                    hmac.digest(key, identity_bytes, "sha256"),
+                )
+            ):
+                raise ValueError("verified controller runtime provenance is invalid")
+            try:
+                identity = TargetRuntimeIdentityV2.model_validate_json(
+                    identity_bytes,
+                    strict=True,
+                )
+            except ValueError:
+                raise ValueError("verified controller runtime identity is invalid") from None
+            if hashlib.sha256(canonical_json_bytes(identity)).hexdigest() != (
+                identity.identity_sha256
+            ):
+                raise ValueError("verified controller runtime identity digest differs")
+            runtime = capability._VerifiedControllerRuntime__runtime
+            if type(runtime) is not _ControllerOwnedDockerRuntime:
+                raise ValueError("verified controller runtime owner changed")
+            if consume:
+                capability._VerifiedControllerRuntime__consumed = True
+            return runtime, identity
+
+    def inspect(
+        capability: object,
+        *,
+        consume: bool,
+    ) -> tuple[_ControllerOwnedDockerRuntime, TargetRuntimeIdentityV2]:
+        with C2_CAPABILITY_TRANSACTION_LOCK:
+            return _inspect_locked(capability, consume=consume)
+
+    def peek(
+        capability: object,
+    ) -> tuple[_ControllerOwnedDockerRuntime, TargetRuntimeIdentityV2]:
+        return inspect(capability, consume=False)
+
+    def consume(
+        capability: object,
+    ) -> tuple[_ControllerOwnedDockerRuntime, TargetRuntimeIdentityV2]:
+        return inspect(capability, consume=True)
+
+    return issue, peek, consume
+
+
+(
+    _consume_controller_owned_runtime_for_c2,
+    _peek_controller_runtime_authority,
+    _require_controller_runtime_authority,
+) = _make_controller_runtime_authority_tools()
 
 
 def launch_and_observe_controller_owned_target_runtime(
@@ -319,14 +523,14 @@ def launch_and_observe_controller_owned_target_runtime(
         if type(process) is not DockerRuntimeProcess:
             raise TypeError("launcher did not return the exact Docker runtime process")
         checked_process = cast(DockerRuntimeProcess, process)
-        inventory = checked_process.verify_identity()
         observed_monotonic_ns = time.monotonic_ns()
-        identity = _build_identity(
-            request=checked_request,
+        capability, identity = _issue_controller_owned_docker_runtime(
             process=checked_process,
-            inventory=inventory,
-            epoch_started_monotonic_ns=epoch_started_monotonic_ns,
-            observed_monotonic_ns=observed_monotonic_ns,
+            request=checked_request,
+            epoch_started_monotonic_ns=(
+                epoch_started_monotonic_ns
+            ),
+            identity_observed_monotonic_ns=observed_monotonic_ns,
         )
         observation = TargetRuntimeObservationV2.model_validate(
             {
@@ -334,12 +538,6 @@ def launch_and_observe_controller_owned_target_runtime(
                 "identity": identity.model_dump(mode="python"),
                 "authorizing": False,
             }
-        )
-        capability = _ControllerOwnedDockerRuntime(
-            process=checked_process,
-            request=checked_request,
-            identity=identity,
-            started_monotonic_ns=epoch_started_monotonic_ns,
         )
     except BaseException as primary:
         _remove_after_failure(process, primary)

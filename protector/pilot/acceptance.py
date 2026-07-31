@@ -18,7 +18,6 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
 
-import yaml
 from pydantic import ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from protector.pilot.acceptance_legacy_v1 import verify_signed_report_v1
@@ -29,9 +28,13 @@ from protector.pilot.trusted_artifacts import (
     capture_regular_bounded,
     ed25519_public_key_spki_sha256,
 )
+from protector.pilot.trusted_yaml import StrictYAMLError, load_strict_yaml
 
 MAX_ACCEPTANCE_RECORD_BYTES = 32 * 1024 * 1024
 MAX_ACCEPTANCE_ENVELOPE_BYTES = MAX_ACCEPTANCE_RECORD_BYTES + 1024 * 1024
+_MAX_ACCEPTANCE_MANIFEST_YAML_BYTES = 2 * 1024 * 1024
+_MAX_ACCEPTANCE_MANIFEST_YAML_NODES = 100_000
+_MAX_ACCEPTANCE_MANIFEST_YAML_DEPTH = 96
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 ModuleMode = Literal["pass/operator", "shadow", "disabled"]
@@ -823,8 +826,21 @@ def _sha256_regular_bounded(path: Path, *, limit: int) -> str:
 def load_acceptance_manifest(path: Path) -> AcceptanceManifestV2:
     if path.is_symlink():
         raise ValueError("acceptance manifest symlink is forbidden")
-    payload = _read_regular_bounded(path.resolve(strict=True), limit=2 * 1024 * 1024)
-    manifest = AcceptanceManifestV2.model_validate(yaml.safe_load(payload))
+    payload = _read_regular_bounded(
+        path.resolve(strict=True),
+        limit=_MAX_ACCEPTANCE_MANIFEST_YAML_BYTES,
+    )
+    try:
+        parsed = load_strict_yaml(
+            payload,
+            max_bytes=_MAX_ACCEPTANCE_MANIFEST_YAML_BYTES,
+            max_nodes=_MAX_ACCEPTANCE_MANIFEST_YAML_NODES,
+            max_depth=_MAX_ACCEPTANCE_MANIFEST_YAML_DEPTH,
+            require_mapping=True,
+        )
+    except StrictYAMLError as exc:
+        raise ValueError("acceptance manifest YAML is invalid") from exc
+    manifest = AcceptanceManifestV2.model_validate(parsed)
     for item in manifest.sources:
         if not isinstance(item.source, LocalFixtureSourceV2):
             continue

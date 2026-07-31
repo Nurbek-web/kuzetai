@@ -1049,7 +1049,9 @@ def test_invalid_production_trust_and_legacy_fingerprint_never_open_journal(
 
 
 def test_compose_mounts_complete_fixed_trust_chain_and_private_key_as_binds() -> None:
-    compose = yaml.safe_load(Path("deploy/pilot/docker-compose.yml").read_text(encoding="utf-8"))
+    compose = yaml.safe_load(
+        Path("deploy/pilot/docker-compose.acceptance.yml").read_text(encoding="utf-8")
+    )
     controller = compose["services"]["acceptance-controller"]
     environment = controller["environment"]
     assert set(environment) == {
@@ -1058,6 +1060,8 @@ def test_compose_mounts_complete_fixed_trust_chain_and_private_key_as_binds() ->
         "PILOT_ACCEPTANCE_GATE",
         "PILOT_ACCEPTANCE_JOURNAL_PATH",
         "PILOT_ACCEPTANCE_PROOF_DIR",
+        "PILOT_ACCEPTANCE_SNAPSHOT_DIR",
+        "PILOT_ACCEPTANCE_CHANNEL_DIR",
         "PILOT_ACCEPTANCE_OFFLINE_ROOT_SPKI_SHA256",
     }
     assert "PILOT_ACCEPTANCE_RUN_PUBLIC_KEY_SHA256" not in str(controller)
@@ -1080,7 +1084,9 @@ def test_compose_mounts_complete_fixed_trust_chain_and_private_key_as_binds() ->
         "/var/lib/kuzet/acceptance/authority.sqlite3",
         "/var/lib/kuzet/acceptance/authority.sqlite3-wal",
         "/var/lib/kuzet/acceptance/authority.sqlite3-shm",
-        "/var/lib/kuzet/acceptance-proofs",
+        "/var/lib/kuzet/acceptance-proof",
+        "/var/lib/kuzet/acceptance-snapshot",
+        "/var/lib/kuzet/acceptance-channel",
     }
     assert set(targets) == readonly_targets | writable_targets
     assert all(targets[target]["read_only"] for target in readonly_targets)

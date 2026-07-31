@@ -988,8 +988,9 @@ class SourceBin:
     def sync_state_with_parent(self) -> bool:
         return self.sync_results.pop(0) if self.sync_results else True
 
-    def set_state(self, state: object) -> None:
+    def set_state(self, state: object) -> str:
         self.states.append(state)
+        return GstRebuild.StateChangeReturn.SUCCESS
 
 
 class Mux:
@@ -1043,6 +1044,13 @@ class Pipeline:
 class GstRebuild:
     class State:
         NULL = "null"
+
+    class StateChangeReturn:
+        FAILURE = "failure"
+        ASYNC = "async"
+        SUCCESS = "success"
+
+    SECOND = 1_000_000_000
 
     class PadLinkReturn:
         OK = 0
