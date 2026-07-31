@@ -3,12 +3,10 @@
 ## Controller state
 
 - Branch: `codex/kuzet-20-camera-pilot`
-- Worktree: `/Users/nurbek/.codex/worktrees/8477/kuzetai`
-- Starting commit: `39173bc`
-- Existing untracked user files preserved and excluded from task commits:
-  `.superpowers/brainstorm/62185-1785235040/`, `deliverables/`,
-  `docs/superpowers/plans/2026-07-22-kuzet-20-camera-pilot.md`,
-  `docs/superpowers/specs/2026-07-22-kuzet-20-camera-pilot-design.md`.
+- Replacement worktree: `/workspace/scratch/d6f924c72a2b/kuzetai`
+- Original controller starting commit: `39173bc`
+- Replacement-controller checkpoint:
+  `ae18d636c2df333591bc747a855b4e4730ff3267`
 
 ## Pre-flight review
 
@@ -48,12 +46,14 @@
 - Task 12: complete locally and independently approved; live PostgreSQL,
   Docker/Linux bind-mount, storage, and NVIDIA observability gates pending —
   Add observability, backup/restore, and deployment hardening
-- Task 13: in progress; initial implementation committed and bounded
-  trust/source-profile/operational-evidence review loops active — Automate
+- Task 13: complete for the safely implementable cloud scope; exact-20,
+  NVIDIA, 8-hour, and 72-hour target acceptance remains pending — Automate
   replay, failure injection, and acceptance reporting
-- Task 14: pending — Handover, operator training, and regression protection
+- Task 14: complete for documentation, packaging, and regression protection;
+  named training, live integration, and customer sign-off remain pending —
+  Handover, operator training, and regression protection
 
-## Resumption point
+## Historical resumption point
 
 Baseline verification at `39173bc`:
 
@@ -4129,3 +4129,191 @@ reservation integration.
   integrated Task 13 review/fix/commit; then implement the event/evidence
   composition and packaging batches, commit Task 14, run whole-branch
   verification, and finish the branch without push/merge/deploy.
+- Replacement-controller resume proof: the connected GitHub app resolved
+  `codex/kuzet-20-camera-pilot` to
+  `ae18d636c2df333591bc747a855b4e4730ff3267`, exactly the required
+  `ae18d63` checkpoint. Repository metadata and the committed `AGENTS.md`,
+  design, plan, and this ledger were read in that order before any local
+  implementation work. No write was made to `main`, no PR was opened, and no
+  deployment was attempted.
+- Administrator lifecycle is offline GREEN after a fresh independent source
+  review of the complete checkpointed candidate. The review found no contract
+  defect across NFKC-plus-casefold identity, positive `auth_generation`,
+  zero-user/sole-site bootstrap, last-admin locking, atomic redacted audit,
+  and immediate durable session invalidation. Scoped production, lifecycle,
+  and legacy auth/security sources compile; `git diff --check` is clean; Ruff
+  WASM 0.16.1 reports no E/F/W finding and only ten pre-existing whole-file
+  `I001` import-order findings caused by formatter-version drift. The pinned
+  environment could not be installed because this cloud denies PyPI package
+  downloads, so pytest collection did not begin and no test pass is claimed.
+  Exact deferred commands are:
+  `uv run pytest tests/pilot/test_auth_api.py
+  tests/pilot/test_api_security.py
+  tests/pilot/test_api_security_migration.py -q`;
+  `uv run pytest tests/pilot/test_auth_lifecycle_migration.py
+  tests/pilot/test_auth_lifecycle_repository.py
+  tests/pilot/test_auth_lifecycle_api.py tests/pilot/test_bootstrap_admin.py
+  -q`; and `uv run ruff check migrations/versions/0005_auth_lifecycle.py
+  protector/pilot/api/auth.py protector/pilot/api/dependencies.py
+  protector/pilot/api/routes_auth.py protector/pilot/api/app.py
+  protector/pilot/storage/models.py protector/pilot/storage/repositories.py
+  scripts/pilot/bootstrap_admin.py tests/pilot/test_auth_lifecycle_*.py
+  tests/pilot/test_bootstrap_admin.py`. PostgreSQL 16+ online migration plus
+  concurrent first-admin and last-active-admin locking remain an explicit
+  external gate because `psql`, `pg_isready`, `initdb`, `postgres`, Docker,
+  and Podman are absent. The current resumption point is production V3/C2
+  acceptance-controller integration, followed by its broad Task-13 review.
+
+## Replacement cloud implementation closeout — 2026-07-31
+
+- Before implementation, the connected GitHub app read the repository and
+  resolved `codex/kuzet-20-camera-pilot` to the exact full SHA
+  `ae18d636c2df333591bc747a855b4e4730ff3267`. It then read the committed
+  `AGENTS.md`, design, plan, and this ledger in the required order. The
+  checkpoint matched the required `ae18d63` start. No work targeted `main`;
+  no PR, merge, or deployment was performed.
+- The remaining cloud-safe production scope is implemented: one shared
+  multistream runtime; bounded/leaky observation and event queues; supervised
+  per-camera source recovery, epochs, timestamps, and state; a hardware-decode
+  adapter; cross-camera batching; shared models; immutable configuration and
+  rule provenance; writer-bound PostgreSQL persistence; bounded event,
+  evidence, preview, and operational-metadata retention; strict database-role
+  and machine-auth boundaries; migrations `0006_event_provenance` through
+  `0008_runtime_persistence`; and fail-closed runtime composition.
+- Continuous video remains in the customer NVR. Only bounded event evidence
+  and metadata enter pilot storage. Every alert remains a human-confirmed
+  candidate. No police, fire-system, door, or other automatic action was
+  added. Face recognition and watchlist collection remain excluded. Heavy
+  X-CLIP/ViT and whole-frame OWLv2 remain shadowed or disabled pending lawful
+  site-specific validation.
+- Task 13 now includes controller-owned acceptance V3 authority, exact signed
+  source/profile/work bindings, protected capture/snapshot/proof state,
+  restart continuation through a fresh third runtime epoch, authenticated
+  external executor and observer acknowledgements, durable transition
+  journals, strict signed reports, and append-only recovery/publication
+  behavior. Portable fake/replay evidence remains explicitly
+  non-authorizing.
+- The target runner finalizes only through the packaged authenticated
+  loopback route
+  `/api/internal/acceptance/v3/collectors/{collector_id}/finalize`. It uses
+  bounded, no-redirect, no-retry transport, strictly validates the bounded V3
+  result, and requires the exact collector and accepted bound verdict. The
+  controller, Compose, runner, and handover commands use the same exact
+  STATE, PROOF, SNAPSHOT, CHANNEL, and CAPTURE roots.
+- Packaging adds digest-pinned runtime, API, acceptance-controller, admin,
+  backup, restore, retention, and optional Telegram compositions; non-root,
+  read-only, no-new-privilege service boundaries; explicit secrets and
+  networks; render-only runtime command validation; strict bind-mount
+  contracts; and hash-locked dependencies. Docker and Podman were unavailable,
+  so the files were rendered and statically validated only.
+- Task 14 provides the Ready-to-Start checklist, deployment, operator, and
+  incident runbooks, model register, known limits, support and training
+  records, handover manifest, credential rotation, migrations, backup,
+  restore, rollback, and exact external acceptance instructions. The investor
+  reel, clip manifest, Gradio application, and demo audit/scenario modules are
+  byte-unchanged from the replacement checkpoint.
+
+### Replacement TDD and review record
+
+- The integrated review first found that the target runner constructed and
+  finalized a separate local V3 controller. The frozen RED required the exact
+  packaged route; the fix removed local V3 authority construction and made
+  that route the sole finalization path.
+- The next hostile pass found that a latest-frame cursor could overtake a
+  same-camera backlog, and that DeepStream published a frame heartbeat before
+  all selected detections. RED evidence included a 128-observation/64-item
+  batch and a premature periodic cursor. The fix uses an atomic
+  sequence-bearing drain, post-publication completed-frame watermarks,
+  per-camera monotonic frontiers, epoch-scoped drop fencing, and serialized
+  epoch recovery. Zero-detection frames still complete without inventing an
+  observation.
+- The same pass found that the worker discarded degraded
+  `SiteEventStatus`, allowing candidate-journal exhaustion to remain silent.
+  REDs covered startup, observation, periodic, malformed, secret-bearing, and
+  unbounded status results. The worker now retains only bounded/redacted
+  health and fails closed on `candidate_journal_full` or
+  `candidate_journal_write_failed` before counting the observation complete.
+- A final hostile pass found one stale first status snapshot when the pending
+  evidence-depth probe failed. Its RED returned
+  `degraded=False, reasons=()`. The service now snapshots reasons after all
+  journal probes; the first returned status reports
+  `pending_evidence_depth_failed`. That reason is visible but is not confused
+  with the two terminal candidate-loss reasons.
+- Two deterministic test defects were corrected without weakening production
+  contracts: the restart-before-drain test now injects the supervisor clocks,
+  and the DeepStream packaging test verifies dependency pins in the
+  hash-locked requirements file copied by the Dockerfile.
+- Final fresh independent whole-branch verdict on the exact frozen
+  implementation bytes: **C0 / I0 / M0**. No replacement-review minors are
+  parked. Hardware, provider, and customer-acceptance gates below are explicit
+  external blockers, not local review findings.
+
+### Available cloud verification
+
+- Independent focused and contract verification: **190 passed, 2
+  dependency-guarded skips**. This includes event worker 11/11; supervisor
+  17/17; parametrized worker/supervisor/GStreamer limits 13/13; DeepStream
+  no-argument contracts 33/33; packaged V3 route behavior 1/1; first status
+  snapshot 1/1; isolated production worker-failure loop 1/1; continuation
+  contract and behavior 11/11; operational retention, JSONB compatibility,
+  mount modes, target launch, and strict validator 27/27; trusted YAML 18/18;
+  packaging 34/34; handover docs 21/21; and authority YAML 2 passed plus 2
+  dependency-guarded skips.
+- PGlite accepted the operational-retention SQL and the regenerated migration
+  sequence through `0008`, including runtime claim, configuration, epoch,
+  event, evidence, storage, and downgrade checks. `libpg-query` parsed 105/105
+  PostgreSQL statements; nine SQLite trigger bodies were intentionally
+  outside that parser.
+- `compileall`, `py_compile`, `git diff --check`, and conflict-marker checks
+  are clean. Ruff WASM 0.16.1 reports zero E/F/W findings across 195 Python
+  files under the repository's Python 3.12 configuration. All 13 production
+  YAML files parse; 29/29 Markdown shell fences and 2/2 shell files pass
+  `bash -n`; all 21 relative Markdown links resolve. Offline lock validation
+  resolves 127 packages.
+- The strict configuration contains exactly 20 unique camera identities and
+  source indices. Its canonical site hash is
+  `027ed8d3984c6a77c9390b20fc920daef85fadc7497161e59d3cdac799799825`.
+- Full pytest is not claimed in this cloud. `pytest`, SQLAlchemy, FastAPI,
+  Alembic, psycopg, Boto3, Prometheus client, and the pinned `av` wheel were
+  unavailable offline. Docker, Podman, PostgreSQL executables, and
+  `nvidia-smi` were absent. No CUDA, DeepStream, TensorRT, live PostgreSQL,
+  Kazakhstan object-storage, live RTSP, exact-20, 8-hour, or 72-hour result
+  was fabricated.
+
+### External gates and exact next execution
+
+- `docs/pilot/ready_to_start.md` freezes the exact pending V3 8-hour and
+  72-hour target commands. They invoke `scripts/pilot/replay_20.py --mode
+  target` for exactly 28,800 and 259,200 seconds, followed by
+  `acceptance_report.py generate` and `verify`.
+- Required target fixtures are the lawful signed 20-source manifest, source
+  hashes and rights, three signed source profiles and nonces, site/runtime/
+  capacity/mount artifacts, pinned image/model/engine/code/network/adapter/
+  observer digests, independent adapter and observer roots, role keys,
+  controller and machine tokens, and fresh private state/output roots.
+- An authorized Kazakhstan target operator must still execute NVIDIA
+  driver/toolkit, DeepStream, TensorRT engine-build and digest checks; lawful
+  exact-20 RTSP or frozen-corpus execution; live PostgreSQL 16 migration,
+  role, and concurrency checks; Kazakhstan-resident object-store lifecycle,
+  versioning, encryption, and restore checks; browser, TLS, and notification
+  checks; named operator training; and signed customer exceptions.
+- Acceptance requires measured effective throughput with at least 25%
+  headroom; GPU at most 75%; VRAM at most 80%; availability at least 99.5%;
+  drops below 1%; queue age p95 below 1 second and p99 below 2 seconds; RTSP
+  recovery within 30 seconds; candidate-to-event p95 at most 1 second; first
+  preview p95 at most 2 seconds; and no crash, OOM, unbounded growth,
+  cross-camera leakage, unaudited review, or notification before
+  confirmation. No universal cameras-per-GPU coefficient is asserted.
+
+## Final resumption point
+
+Tasks 13 and 14 are complete for the safely implementable cloud scope. Human
+review starts at
+`ae18d636c2df333591bc747a855b4e4730ff3267..codex/kuzet-20-camera-pilot`.
+The exact review head is the dedicated-branch commit containing this closeout
+entry; publication is recorded by that branch ref because a commit cannot
+self-reference its own SHA. There is no remaining cloud acceptance claim to
+manufacture. After approval, resume only with the exact PostgreSQL/storage,
+NVIDIA, exact-20, 8-hour, restore-drill, and 72-hour commands in the committed
+runbooks, archive the signed artifacts and exceptions, and keep every
+conditional analytic shadowed or disabled unless its lawful site gate passes.
