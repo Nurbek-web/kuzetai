@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import and_, case, exists, or_, select, text
@@ -28,10 +28,49 @@ from protector.pilot.storage.models import (
 )
 
 _SAFE_SITE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_MAX_DATABASE_CLOCK_SKEW = timedelta(minutes=5)
+
+
+def _aware_utc_now(value: datetime, *, label: str) -> datetime:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError(f"{label} must return UTC-aware time")
+    return value.astimezone(UTC)
+
+
+def _database_bounded_now(
+    session: Any,
+    *,
+    host_now: datetime,
+    label: str,
+) -> datetime:
+    """Use PostgreSQL server time and reject a materially skewed worker clock."""
+
+    host_now = _aware_utc_now(host_now, label=label)
+    bind = session.get_bind()
+    if getattr(getattr(bind, "dialect", None), "name", None) != "postgresql":
+        # Deterministic SQLite replay/unit tests intentionally use an injected
+        # clock. Production retention is PostgreSQL-only and takes the branch
+        # below before selecting or mutating any retention row.
+        return host_now
+    observed = session.scalar(text("SELECT CURRENT_TIMESTAMP"))
+    if (
+        not isinstance(observed, datetime)
+        or observed.tzinfo is None
+        or observed.utcoffset() is None
+    ):
+        raise RuntimeError("database retention clock is unavailable")
+    database_now = observed.astimezone(UTC)
+    if abs(database_now - host_now) > _MAX_DATABASE_CLOCK_SKEW:
+        raise RuntimeError("retention host clock differs from database clock")
+    return database_now
 
 
 class EvidenceDeleteStore(Protocol):
-    def delete(self, key: str) -> None: ...
+    def delete_exact(self, key: str, *, sha256: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,11 +112,17 @@ class EvidenceRetentionCoordinator:
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def run_once(self) -> RetentionResult:
-        now = self._clock()
-        if now.tzinfo is None or now.utcoffset() is None or now.utcoffset() != timedelta(0):
-            raise ValueError("retention clock must return UTC-aware time")
-        cutoff = now.astimezone(UTC) - timedelta(days=self.retention_days)
+        host_now = _aware_utc_now(
+            self._clock(),
+            label="retention clock",
+        )
         with self._session_factory.begin() as session:
+            now = _database_bounded_now(
+                session,
+                host_now=host_now,
+                label="retention clock",
+            )
+            cutoff = now - timedelta(days=self.retention_days)
             rows = list(
                 session.scalars(
                     select(EvidenceModel)
@@ -121,7 +166,10 @@ class EvidenceRetentionCoordinator:
         failure_reasons: set[str] = set()
         for row in rows:
             try:
-                self._object_store.delete(row.object_key)
+                self._object_store.delete_exact(
+                    row.object_key,
+                    sha256=row.sha256,
+                )
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
@@ -361,16 +409,27 @@ class AuditArchiveCoordinator:
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def run_once(self) -> AuditArchiveResult:
-        now = self._clock()
-        if now.tzinfo is None or now.utcoffset() != timedelta(0):
-            raise ValueError("audit archive clock must return UTC-aware time")
-        now = now.astimezone(UTC)
+        host_now = _aware_utc_now(
+            self._clock(),
+            label="audit archive clock",
+        )
+        with self._session_factory() as clock_session:
+            _database_bounded_now(
+                clock_session,
+                host_now=host_now,
+                label="audit archive clock",
+            )
         pending = self._pending_receipt()
         if pending is not None:
             receipt_id, audit_ids = pending
             return self._prune(receipt_id, audit_ids, scanned=0, archived=0)
-        cutoff = now - timedelta(days=self.retention_days)
         with self._session_factory() as session:
+            now = _database_bounded_now(
+                session,
+                host_now=host_now,
+                label="audit archive clock",
+            )
+            cutoff = now - timedelta(days=self.retention_days)
             site_ids = tuple(
                 session.scalars(select(SiteModel.site_id).order_by(SiteModel.site_id))
             )

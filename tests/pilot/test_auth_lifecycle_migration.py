@@ -12,6 +12,8 @@ from sqlalchemy.exc import IntegrityError
 
 from protector.pilot.storage.db import create_engine
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 def _config(database: Path) -> Config:
     config = Config("alembic.ini")
@@ -57,7 +59,7 @@ def test_migration_0005_backfills_canonical_identity_and_positive_generation(
     command.upgrade(config, "0004_operational_retention")
     _insert_site_and_user(database, user_id="admin-1", username="  Ｓｔｒａßｅ  ")
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0005_auth_lifecycle")
 
     engine = create_engine(f"sqlite+pysqlite:///{database}")
     user_columns = {column["name"] for column in inspect(engine).get_columns("users")}
@@ -136,3 +138,16 @@ def test_offline_migration_fails_closed_before_canonical_backfill_is_skipped() -
 
     rendered = output.getvalue()
     assert "migration 0005 requires an online canonical username backfill" in rendered
+
+
+def test_auth_lifecycle_uses_fixed_transaction_lock_without_site_update_acl() -> None:
+    repository_source = (
+        ROOT / "protector/pilot/storage/repositories.py"
+    ).read_text()
+    grant_source = (
+        ROOT / "scripts/pilot/bootstrap_roles.py"
+    ).read_text()
+
+    assert "pg_advisory_xact_lock" in repository_source
+    assert "hashtextextended('kuzet-auth-lifecycle', 31)" in repository_source
+    assert "GRANT UPDATE ON TABLE sites" not in grant_source

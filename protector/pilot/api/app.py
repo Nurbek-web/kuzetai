@@ -24,7 +24,7 @@ from protector.pilot.api.auth import (
 from protector.pilot.api.dependencies import (
     ApiContext,
     get_context,
-    require_machine_auth,
+    require_monitoring_machine_auth,
     utc_now,
 )
 from protector.pilot.api.routes_auth import router as auth_router
@@ -236,7 +236,10 @@ def create_app(
     repository: PilotRepository,
     session_secret: str,
     totp_encryption_key: str,
-    machine_token: str,
+    machine_token: str | None = None,
+    runtime_machine_token: str | None = None,
+    notification_machine_token: str | None = None,
+    monitoring_machine_token: str | None = None,
     throttle: LoginThrottle | None = None,
     worker_count: int | None = None,
     max_request_body_bytes: int = MAX_REQUEST_BODY_BYTES,
@@ -250,10 +253,34 @@ def create_app(
     telemetry: PilotTelemetryState | None = None,
     health: PilotHealthService | None = None,
 ) -> FastAPI:
-    """Construct an explicitly configured app; secrets have no committed defaults."""
+    """Construct an explicitly configured app; secrets have no committed defaults.
 
-    if len(machine_token) < 16:
-        raise ValueError("machine token must contain at least 16 characters")
+    ``machine_token`` exists only for legacy test/demo construction. Production
+    callers provide the scoped token arguments instead.
+    """
+
+    scoped_tokens = (
+        runtime_machine_token,
+        notification_machine_token,
+        monitoring_machine_token,
+    )
+    if machine_token is not None:
+        if any(token is not None for token in scoped_tokens):
+            raise ValueError("legacy and scoped machine tokens cannot be mixed")
+        runtime_machine_token = machine_token
+        notification_machine_token = machine_token
+        monitoring_machine_token = machine_token
+    elif runtime_machine_token is None or monitoring_machine_token is None:
+        raise ValueError("runtime and monitoring machine tokens are required")
+    assert runtime_machine_token is not None
+    assert monitoring_machine_token is not None
+    configured_tokens = (runtime_machine_token, monitoring_machine_token)
+    if notification_machine_token is not None:
+        configured_tokens += (notification_machine_token,)
+    if any(len(token) < 16 for token in configured_tokens):
+        raise ValueError("machine tokens must contain at least 16 characters")
+    if machine_token is None and len(set(configured_tokens)) != len(configured_tokens):
+        raise ValueError("scoped machine tokens must be distinct")
     if session_secret == totp_encryption_key:
         raise ValueError("TOTP encryption key must be separate from the session signing key")
     if _configured_worker_count(worker_count) != 1:
@@ -295,7 +322,9 @@ def create_app(
         passwords=PasswordService(),
         totp=TotpService(encryption_key=totp_encryption_key),
         throttle=throttle or LoginThrottle(),
-        machine_token=machine_token,
+        runtime_machine_token=runtime_machine_token,
+        notification_machine_token=notification_machine_token,
+        monitoring_machine_token=monitoring_machine_token,
         evidence_preview_provider=evidence_preview_provider,
         pilot_site_id=pilot_site_id,
         evidence_link_signer=evidence_link_signer,
@@ -335,7 +364,7 @@ def create_app(
     @app.get(
         "/internal/metrics",
         include_in_schema=False,
-        dependencies=[Depends(require_machine_auth)],
+        dependencies=[Depends(require_monitoring_machine_auth)],
     )
     def internal_metrics(context: ApiContext = Depends(get_context)) -> Response:
         if context.metrics is None:
@@ -361,7 +390,7 @@ def create_app(
     @app.get(
         "/internal/health/live",
         include_in_schema=False,
-        dependencies=[Depends(require_machine_auth)],
+        dependencies=[Depends(require_monitoring_machine_auth)],
     )
     def internal_liveness(
         response: Response,
@@ -378,7 +407,7 @@ def create_app(
     @app.get(
         "/internal/health/ready",
         include_in_schema=False,
-        dependencies=[Depends(require_machine_auth)],
+        dependencies=[Depends(require_monitoring_machine_auth)],
     )
     def internal_readiness(
         response: Response,
@@ -397,7 +426,7 @@ def create_app(
     @app.get(
         "/internal/health",
         include_in_schema=False,
-        dependencies=[Depends(require_machine_auth)],
+        dependencies=[Depends(require_monitoring_machine_auth)],
     )
     def internal_health(context: ApiContext = Depends(get_context)) -> dict[str, object]:
         if context.health is None:

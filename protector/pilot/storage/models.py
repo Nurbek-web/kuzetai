@@ -14,6 +14,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -54,6 +55,7 @@ class CameraModel(Base):
             name="ck_cameras_state",
         ),
         UniqueConstraint("site_id", "name", name="uq_cameras_site_name"),
+        UniqueConstraint("site_id", "camera_id", name="uq_cameras_site_camera"),
         Index("ix_cameras_site_state", "site_id", "state"),
     )
 
@@ -81,6 +83,11 @@ class CameraHealthSampleModel(Base):
         CheckConstraint("reconnect_count >= 0", name="ck_camera_health_reconnect_count"),
         CheckConstraint("dropped_samples >= 0", name="ck_camera_health_dropped_samples"),
         Index("ix_camera_health_camera_observed", "camera_id", "observed_at"),
+        Index(
+            "uq_camera_health_latest_per_camera",
+            "camera_id",
+            unique=True,
+        ).ddl_if(dialect="postgresql"),
     )
 
     health_sample_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -306,6 +313,925 @@ class CandidateEventModel(Base):
     )
 
 
+class SiteConfigRevisionModel(Base):
+    __tablename__ = "site_config_revisions"
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_site_config_revision_positive"),
+        CheckConstraint("length(config_sha256) = 64", name="ck_site_config_sha256"),
+        CheckConstraint("length(artifact_sha256) = 64", name="ck_site_config_artifact_sha256"),
+        CheckConstraint("length(signature_sha256) = 64", name="ck_site_config_signature_sha256"),
+        CheckConstraint(
+            "length(signing_key_spki_sha256) = 64",
+            name="ck_site_config_signing_key_sha256",
+        ),
+        UniqueConstraint("site_id", "revision", name="uq_site_config_revision"),
+        UniqueConstraint("site_id", "config_sha256", name="uq_site_config_digest"),
+        UniqueConstraint(
+            "site_id",
+            "config_revision_id",
+            name="uq_site_config_site_revision_id",
+        ),
+    )
+
+    config_revision_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), nullable=False
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    signature_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    signing_key_spki_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    reviewed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    review_reference: Mapped[str] = mapped_column(String(2048), nullable=False)
+    canonical_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class CameraRulesetRevisionModel(Base):
+    __tablename__ = "camera_ruleset_revisions"
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_camera_ruleset_revision_positive"),
+        CheckConstraint("length(site_config_sha256) = 64", name="ck_ruleset_site_config_sha256"),
+        CheckConstraint(
+            "length(frozen_workload_sha256) = 64",
+            name="ck_ruleset_frozen_workload_sha256",
+        ),
+        CheckConstraint(
+            "length(engine_sha256) = 64",
+            name="ck_ruleset_engine_sha256",
+        ),
+        CheckConstraint(
+            "length(runtime_manifest_sha256) = 64",
+            name="ck_ruleset_runtime_manifest_sha256",
+        ),
+        CheckConstraint("length(ruleset_sha256) = 64", name="ck_ruleset_sha256"),
+        CheckConstraint("length(artifact_sha256) = 64", name="ck_ruleset_artifact_sha256"),
+        CheckConstraint("length(signature_sha256) = 64", name="ck_ruleset_signature_sha256"),
+        CheckConstraint(
+            "length(signing_key_spki_sha256) = 64",
+            name="ck_ruleset_signing_key_sha256",
+        ),
+        UniqueConstraint("site_id", "ruleset_id", "revision", name="uq_ruleset_revision"),
+        UniqueConstraint("site_id", "ruleset_sha256", name="uq_ruleset_digest"),
+        UniqueConstraint(
+            "site_id",
+            "ruleset_revision_id",
+            name="uq_ruleset_site_revision_id",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "config_revision_id",
+            "ruleset_revision_id",
+            name="uq_ruleset_site_config_revision",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "config_revision_id"],
+            [
+                "site_config_revisions.site_id",
+                "site_config_revisions.config_revision_id",
+            ],
+            ondelete="RESTRICT",
+        ),
+    )
+
+    ruleset_revision_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    ruleset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), nullable=False
+    )
+    config_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    site_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    frozen_workload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    engine_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    runtime_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    ruleset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    signature_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    signing_key_spki_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    reviewed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    review_reference: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class CameraRuleRevisionModel(Base):
+    __tablename__ = "camera_rule_revisions"
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_camera_rule_revision_positive"),
+        CheckConstraint(
+            "gate_mode IN ('disabled', 'shadow', 'operator')",
+            name="ck_camera_rule_gate_mode",
+        ),
+        CheckConstraint(
+            "minimum_confidence >= 0 AND minimum_confidence <= 1",
+            name="ck_camera_rule_confidence",
+        ),
+        CheckConstraint(
+            "minimum_votes >= 1 AND minimum_votes <= 64",
+            name="ck_camera_rule_votes",
+        ),
+        CheckConstraint(
+            "sample_count >= minimum_votes AND sample_count <= 64",
+            name="ck_camera_rule_samples",
+        ),
+        CheckConstraint(
+            "window_seconds > 0 AND window_seconds <= 60",
+            name="ck_camera_rule_window",
+        ),
+        CheckConstraint(
+            "evidence_seconds >= 4 AND evidence_seconds <= 10",
+            name="ck_camera_rule_evidence",
+        ),
+        CheckConstraint(
+            "length(model_decision_sha256) = 64",
+            name="ck_camera_rule_decision_sha256",
+        ),
+        CheckConstraint(
+            "length(rule_revision_sha256) = 64",
+            name="ck_camera_rule_revision_sha256",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "ruleset_revision_id"],
+            [
+                "camera_ruleset_revisions.site_id",
+                "camera_ruleset_revisions.ruleset_revision_id",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "camera_id"],
+            ["cameras.site_id", "cameras.camera_id"],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "rule_id",
+            "revision",
+            name="uq_camera_rule_identity_revision",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "ruleset_revision_id",
+            "rule_id",
+            name="uq_camera_rule_site_ruleset_rule",
+        ),
+        UniqueConstraint(
+            "ruleset_revision_id",
+            "camera_id",
+            "module",
+            name="uq_ruleset_camera_module",
+        ),
+    )
+
+    ruleset_revision_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    rule_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), nullable=False
+    )
+    camera_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    module: Mapped[str] = mapped_column(String(128), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    model_artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("model_artifacts.artifact_id", ondelete="RESTRICT"), nullable=False
+    )
+    model_decision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    gate_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    minimum_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    minimum_votes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    window_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    evidence_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    rule_spec: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    rule_revision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ConfigurationActivationModel(Base):
+    """Append-only activation receipts; the active table is only a pointer."""
+
+    __tablename__ = "configuration_activations"
+    __table_args__ = (
+        CheckConstraint("activation_generation > 0", name="ck_activation_generation"),
+        CheckConstraint(
+            "expected_activation_generation >= 0",
+            name="ck_activation_expected_generation",
+        ),
+        CheckConstraint(
+            "runtime_writer_generation > 0",
+            name="ck_activation_writer_generation",
+        ),
+        CheckConstraint(
+            "length(site_config_sha256) = 64",
+            name="ck_activation_site_config_sha256",
+        ),
+        CheckConstraint(
+            "length(ruleset_sha256) = 64",
+            name="ck_activation_ruleset_sha256",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "config_revision_id"],
+            [
+                "site_config_revisions.site_id",
+                "site_config_revisions.config_revision_id",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "config_revision_id", "ruleset_revision_id"],
+            [
+                "camera_ruleset_revisions.site_id",
+                "camera_ruleset_revisions.config_revision_id",
+                "camera_ruleset_revisions.ruleset_revision_id",
+            ],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_activation_idempotency"),
+        UniqueConstraint(
+            "site_id",
+            "activation_generation",
+            "config_revision_id",
+            "ruleset_revision_id",
+            name="uq_activation_exact_pointer",
+        ),
+    )
+
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), primary_key=True
+    )
+    expected_activation_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    activation_generation: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    runtime_writer_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    config_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    site_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    ruleset_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    ruleset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    activated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    force_new_generation: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+
+class ActivePilotConfigurationModel(Base):
+    __tablename__ = "active_pilot_configurations"
+    __table_args__ = (
+        CheckConstraint(
+            "activation_generation > 0",
+            name="ck_active_configuration_generation",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "activation_generation",
+            name="uq_active_site_generation",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "config_revision_id"],
+            [
+                "site_config_revisions.site_id",
+                "site_config_revisions.config_revision_id",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "config_revision_id", "ruleset_revision_id"],
+            [
+                "camera_ruleset_revisions.site_id",
+                "camera_ruleset_revisions.config_revision_id",
+                "camera_ruleset_revisions.ruleset_revision_id",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "site_id",
+                "activation_generation",
+                "config_revision_id",
+                "ruleset_revision_id",
+            ],
+            [
+                "configuration_activations.site_id",
+                "configuration_activations.activation_generation",
+                "configuration_activations.config_revision_id",
+                "configuration_activations.ruleset_revision_id",
+            ],
+            ondelete="RESTRICT",
+        ),
+    )
+
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), primary_key=True
+    )
+    activation_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    config_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    ruleset_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    activated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RuntimeWriterAuthorityModel(Base):
+    __tablename__ = "runtime_writer_authorities"
+    __table_args__ = (
+        CheckConstraint("writer_generation > 0", name="ck_runtime_writer_generation"),
+        CheckConstraint(
+            "configuration_activation_generation > 0",
+            name="ck_runtime_writer_activation_generation",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "configuration_activation_generation"],
+            [
+                "configuration_activations.site_id",
+                "configuration_activations.activation_generation",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "configuration_activation_generation"],
+            [
+                "active_pilot_configurations.site_id",
+                "active_pilot_configurations.activation_generation",
+            ],
+            deferrable=True,
+            initially="DEFERRED",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), primary_key=True
+    )
+    runtime_session_id: Mapped[str | None] = mapped_column(String(128))
+    writer_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_activation_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RuntimeWriterSessionModel(Base):
+    """Append-only writer issuance history; session IDs can never be resurrected."""
+
+    __tablename__ = "runtime_writer_sessions"
+    __table_args__ = (
+        CheckConstraint("writer_generation > 0", name="ck_writer_session_generation"),
+        CheckConstraint(
+            "configuration_activation_generation > 0",
+            name="ck_writer_session_activation_generation",
+        ),
+        CheckConstraint("length(receipt_sha256) = 64", name="ck_writer_receipt_sha256"),
+        UniqueConstraint(
+            "site_id",
+            "writer_generation",
+            name="uq_writer_session_site_generation",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "runtime_session_id",
+            "writer_generation",
+            "configuration_activation_generation",
+            name="uq_writer_session_exact_authority",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "configuration_activation_generation"],
+            [
+                "configuration_activations.site_id",
+                "configuration_activations.activation_generation",
+            ],
+            ondelete="RESTRICT",
+        ),
+    )
+
+    runtime_session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), nullable=False
+    )
+    writer_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_activation_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    receipt_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class CameraEpochAuthorityModel(Base):
+    """Current per-camera source epoch bound to one exact writer session."""
+
+    __tablename__ = "camera_epoch_authorities"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["site_id", "camera_id"],
+            ["cameras.site_id", "cameras.camera_id"],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "site_id",
+                "runtime_session_id",
+                "writer_generation",
+                "configuration_activation_generation",
+            ],
+            [
+                "runtime_writer_sessions.site_id",
+                "runtime_writer_sessions.runtime_session_id",
+                "runtime_writer_sessions.writer_generation",
+                "runtime_writer_sessions.configuration_activation_generation",
+            ],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "camera_id",
+            "source_epoch",
+            name="uq_camera_epoch_active_identity",
+        ),
+    )
+
+    camera_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    site_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_epoch: Mapped[str] = mapped_column(String(36), nullable=False)
+    runtime_session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    writer_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_activation_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CameraEpochHistoryModel(Base):
+    """Append-only epoch history prevents retired source epochs from returning."""
+
+    __tablename__ = "camera_epoch_history"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["site_id", "camera_id"],
+            ["cameras.site_id", "cameras.camera_id"],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "site_id",
+                "runtime_session_id",
+                "writer_generation",
+                "configuration_activation_generation",
+            ],
+            [
+                "runtime_writer_sessions.site_id",
+                "runtime_writer_sessions.runtime_session_id",
+                "runtime_writer_sessions.writer_generation",
+                "runtime_writer_sessions.configuration_activation_generation",
+            ],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "camera_id",
+            "source_epoch",
+            name="uq_camera_epoch_history_site_identity",
+        ),
+    )
+
+    camera_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source_epoch: Mapped[str] = mapped_column(String(36), primary_key=True)
+    previous_source_epoch: Mapped[str | None] = mapped_column(String(36))
+    site_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    runtime_session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    writer_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_activation_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class LegacyCandidateImportModel(Base):
+    """One explicit marker for a candidate imported at the 0006 cutover."""
+
+    __tablename__ = "legacy_candidate_imports"
+    __table_args__ = (
+        CheckConstraint(
+            "migration_revision = '0006_event_provenance'",
+            name="ck_legacy_candidate_migration",
+        ),
+        CheckConstraint(
+            "schema_version = 'legacy-candidate-import.v1'",
+            name="ck_legacy_candidate_schema",
+        ),
+        CheckConstraint(
+            "legacy_cutoff_at <= imported_at",
+            name="ck_legacy_candidate_cutoff",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_events.event_id", ondelete="RESTRICT"), primary_key=True
+    )
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    legacy_cutoff_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    migration_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class CandidateEventProvenanceModel(Base):
+    __tablename__ = "candidate_event_provenance"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version = 'candidate-event-provenance.v1'",
+            name="ck_candidate_provenance_schema",
+        ),
+        CheckConstraint(
+            "runtime_writer_generation > 0",
+            name="ck_candidate_provenance_writer_generation",
+        ),
+        CheckConstraint(
+            "configuration_activation_generation > 0",
+            name="ck_candidate_provenance_activation_generation",
+        ),
+        CheckConstraint("rule_revision > 0", name="ck_candidate_provenance_rule_revision"),
+        CheckConstraint(
+            "gate_mode IN ('shadow', 'operator')",
+            name="ck_candidate_provenance_gate_mode",
+        ),
+        CheckConstraint(
+            "length(rule_revision_sha256) = 64",
+            name="ck_candidate_provenance_rule_sha256",
+        ),
+        CheckConstraint(
+            "length(ruleset_sha256) = 64",
+            name="ck_candidate_provenance_ruleset_sha256",
+        ),
+        CheckConstraint(
+            "length(site_config_sha256) = 64",
+            name="ck_candidate_provenance_config_sha256",
+        ),
+        CheckConstraint(
+            "length(model_gate_decision_sha256) = 64",
+            name="ck_candidate_provenance_decision_sha256",
+        ),
+        CheckConstraint(
+            "length(body_sha256) = 64",
+            name="ck_candidate_provenance_body_sha256",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "ruleset_revision_id", "rule_id"],
+            [
+                "camera_rule_revisions.site_id",
+                "camera_rule_revisions.ruleset_revision_id",
+                "camera_rule_revisions.rule_id",
+            ],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "event_id",
+            "site_id",
+            "runtime_session_id",
+            "runtime_writer_generation",
+            "configuration_activation_generation",
+            "source_epoch",
+            "rule_revision_sha256",
+            "site_config_sha256",
+            "body_sha256",
+            name="uq_candidate_provenance_preview_authority",
+        ),
+        Index(
+            "ix_candidate_provenance_runtime",
+            "site_id",
+            "runtime_writer_generation",
+            "runtime_session_id",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey("candidate_events.event_id", ondelete="CASCADE"), primary_key=True
+    )
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"), nullable=False
+    )
+    runtime_session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    runtime_writer_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_activation_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    source_epoch: Mapped[str] = mapped_column(String(36), nullable=False)
+    ruleset_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    rule_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    rule_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    rule_revision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    ruleset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    site_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_gate_decision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    gate_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    body_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+@event.listens_for(SiteConfigRevisionModel, "before_update")
+@event.listens_for(SiteConfigRevisionModel, "before_delete")
+@event.listens_for(CameraRulesetRevisionModel, "before_update")
+@event.listens_for(CameraRulesetRevisionModel, "before_delete")
+@event.listens_for(CameraRuleRevisionModel, "before_update")
+@event.listens_for(CameraRuleRevisionModel, "before_delete")
+@event.listens_for(ConfigurationActivationModel, "before_update")
+@event.listens_for(ConfigurationActivationModel, "before_delete")
+@event.listens_for(RuntimeWriterSessionModel, "before_update")
+@event.listens_for(RuntimeWriterSessionModel, "before_delete")
+@event.listens_for(CameraEpochHistoryModel, "before_update")
+@event.listens_for(CameraEpochHistoryModel, "before_delete")
+@event.listens_for(LegacyCandidateImportModel, "before_update")
+@event.listens_for(LegacyCandidateImportModel, "before_delete")
+@event.listens_for(CandidateEventProvenanceModel, "before_update")
+@event.listens_for(CandidateEventProvenanceModel, "before_delete")
+def reject_reviewed_revision_mutation(*_: object) -> None:
+    raise ValueError("reviewed revisions and candidate provenance are immutable")
+
+
+event.listen(
+    SiteConfigRevisionModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION pilot_reject_reviewed_revision_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, public
+        AS $$
+        BEGIN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                MESSAGE = 'reviewed revisions and candidate provenance are immutable';
+        END;
+        $$
+        """
+    ).execute_if(dialect="postgresql"),
+)
+for immutable_table in (
+    SiteConfigRevisionModel.__table__,
+    CameraRulesetRevisionModel.__table__,
+    CameraRuleRevisionModel.__table__,
+    ConfigurationActivationModel.__table__,
+    RuntimeWriterSessionModel.__table__,
+    CameraEpochHistoryModel.__table__,
+    LegacyCandidateImportModel.__table__,
+    CandidateEventProvenanceModel.__table__,
+):
+    for immutable_operation in ("UPDATE", "DELETE"):
+        event.listen(
+            immutable_table,
+            "after_create",
+            DDL(
+                f"""
+                CREATE TRIGGER trg_{immutable_table.name}_{immutable_operation.lower()}_immutable
+                BEFORE {immutable_operation} ON {immutable_table.name}
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'reviewed revisions and candidate provenance are immutable'
+                    );
+                END
+                """
+            ).execute_if(dialect="sqlite"),
+        )
+    event.listen(
+        immutable_table,
+        "after_create",
+        DDL(
+            f"""
+            CREATE TRIGGER trg_{immutable_table.name}_immutable
+            BEFORE UPDATE OR DELETE ON {immutable_table.name}
+            FOR EACH ROW
+            EXECUTE FUNCTION pilot_reject_reviewed_revision_mutation()
+            """
+        ).execute_if(dialect="postgresql"),
+    )
+
+event.listen(
+    SiteConfigRevisionModel.__table__,
+    "after_drop",
+    DDL(
+        "DROP FUNCTION IF EXISTS pilot_reject_reviewed_revision_mutation()"
+    ).execute_if(dialect="postgresql"),
+)
+
+event.listen(
+    CandidateEventProvenanceModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_legacy_candidate_import_fence
+        BEFORE INSERT ON legacy_candidate_imports
+        FOR EACH ROW
+        BEGIN
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM candidate_event_provenance
+                 WHERE event_id = NEW.event_id
+            ) THEN RAISE(ABORT, 'provenanced event cannot become legacy') END;
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM candidate_events
+                 WHERE event_id = NEW.event_id
+                   AND opened_at <= NEW.legacy_cutoff_at
+            ) THEN RAISE(ABORT, 'legacy marker does not match pre-cutoff event') END;
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+
+
+event.listen(
+    CandidateEventProvenanceModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_candidate_provenance_fence
+        BEFORE INSERT ON candidate_event_provenance
+        FOR EACH ROW
+        BEGIN
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM legacy_candidate_imports
+                 WHERE event_id = NEW.event_id
+            ) THEN RAISE(ABORT, 'legacy event cannot gain runtime provenance') END;
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1
+                  FROM active_pilot_configurations AS active
+                  JOIN site_config_revisions AS config
+                    ON config.config_revision_id = active.config_revision_id
+                  JOIN camera_ruleset_revisions AS ruleset
+                    ON ruleset.ruleset_revision_id = active.ruleset_revision_id
+                  JOIN runtime_writer_authorities AS writer
+                    ON writer.site_id = active.site_id
+                  JOIN candidate_events AS candidate
+                    ON candidate.event_id = NEW.event_id
+                  JOIN camera_epoch_authorities AS epoch
+                    ON epoch.camera_id = candidate.camera_id
+                 WHERE active.site_id = NEW.site_id
+                   AND active.activation_generation =
+                       NEW.configuration_activation_generation
+                   AND config.config_sha256 = NEW.site_config_sha256
+                   AND ruleset.ruleset_revision_id = NEW.ruleset_revision_id
+                   AND ruleset.ruleset_sha256 = NEW.ruleset_sha256
+                   AND writer.runtime_session_id = NEW.runtime_session_id
+                   AND writer.writer_generation = NEW.runtime_writer_generation
+                   AND writer.configuration_activation_generation =
+                       NEW.configuration_activation_generation
+                   AND epoch.site_id = NEW.site_id
+                   AND epoch.source_epoch = NEW.source_epoch
+                   AND epoch.runtime_session_id = NEW.runtime_session_id
+                   AND epoch.writer_generation = NEW.runtime_writer_generation
+                   AND epoch.configuration_activation_generation =
+                       NEW.configuration_activation_generation
+            ) THEN RAISE(ABORT, 'retired runtime writer cannot persist candidate') END;
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1
+                  FROM camera_rule_revisions AS rule
+                  JOIN candidate_events AS candidate
+                    ON candidate.event_id = NEW.event_id
+                  JOIN cameras AS camera
+                    ON camera.camera_id = candidate.camera_id
+                 WHERE rule.ruleset_revision_id = NEW.ruleset_revision_id
+                   AND rule.rule_id = NEW.rule_id
+                   AND rule.revision = NEW.rule_revision
+                   AND rule.rule_revision_sha256 = NEW.rule_revision_sha256
+                   AND rule.model_decision_sha256 =
+                       NEW.model_gate_decision_sha256
+                   AND rule.gate_mode = NEW.gate_mode
+                   AND rule.enabled = 1
+                   AND rule.camera_id = candidate.camera_id
+                   AND rule.module = candidate.module
+                   AND rule.model_artifact_id = candidate.model_artifact_id
+                   AND candidate.gate_mode = NEW.gate_mode
+                   AND candidate.evidence_status = 'pending'
+                   AND candidate.review_status = 'candidate'
+                   AND candidate.transition_history = 'observation>candidate'
+                   AND camera.site_id = NEW.site_id
+            ) THEN RAISE(ABORT, 'candidate provenance does not match active camera rule') END;
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+
+
+event.listen(
+    CandidateEventProvenanceModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION pilot_validate_candidate_provenance()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, public
+        AS $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM public.legacy_candidate_imports
+                 WHERE event_id = NEW.event_id
+            ) THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'legacy event cannot gain runtime provenance';
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1
+                  FROM public.active_pilot_configurations AS active
+                  JOIN public.site_config_revisions AS config
+                    ON config.config_revision_id = active.config_revision_id
+                  JOIN public.camera_ruleset_revisions AS ruleset
+                    ON ruleset.ruleset_revision_id = active.ruleset_revision_id
+                  JOIN public.runtime_writer_authorities AS writer
+                    ON writer.site_id = active.site_id
+                  JOIN public.candidate_events AS candidate
+                    ON candidate.event_id = NEW.event_id
+                  JOIN public.camera_epoch_authorities AS epoch
+                    ON epoch.camera_id = candidate.camera_id
+                 WHERE active.site_id = NEW.site_id
+                   AND active.activation_generation =
+                       NEW.configuration_activation_generation
+                   AND config.config_sha256 = NEW.site_config_sha256
+                   AND ruleset.ruleset_revision_id = NEW.ruleset_revision_id
+                   AND ruleset.ruleset_sha256 = NEW.ruleset_sha256
+                   AND writer.runtime_session_id = NEW.runtime_session_id
+                   AND writer.writer_generation = NEW.runtime_writer_generation
+                   AND writer.configuration_activation_generation =
+                       NEW.configuration_activation_generation
+                   AND epoch.site_id = NEW.site_id
+                   AND epoch.source_epoch = NEW.source_epoch
+                   AND epoch.runtime_session_id = NEW.runtime_session_id
+                   AND epoch.writer_generation = NEW.runtime_writer_generation
+                   AND epoch.configuration_activation_generation =
+                       NEW.configuration_activation_generation
+            ) THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'retired runtime writer cannot persist candidate';
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1
+                  FROM public.camera_rule_revisions AS rule
+                  JOIN public.candidate_events AS candidate
+                    ON candidate.event_id = NEW.event_id
+                  JOIN public.cameras AS camera
+                    ON camera.camera_id = candidate.camera_id
+                 WHERE rule.ruleset_revision_id = NEW.ruleset_revision_id
+                   AND rule.rule_id = NEW.rule_id
+                   AND rule.revision = NEW.rule_revision
+                   AND rule.rule_revision_sha256 = NEW.rule_revision_sha256
+                   AND rule.model_decision_sha256 =
+                       NEW.model_gate_decision_sha256
+                   AND rule.gate_mode = NEW.gate_mode
+                   AND rule.enabled
+                   AND rule.camera_id = candidate.camera_id
+                   AND rule.module = candidate.module
+                   AND rule.model_artifact_id = candidate.model_artifact_id
+                   AND candidate.gate_mode = NEW.gate_mode
+                   AND candidate.evidence_status = 'pending'
+                   AND candidate.review_status = 'candidate'
+                   AND candidate.transition_history = 'observation>candidate'
+                   AND camera.site_id = NEW.site_id
+            ) THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'candidate provenance does not match active camera rule';
+            END IF;
+            RETURN NEW;
+        END;
+        $$;
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    CandidateEventProvenanceModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_candidate_provenance_fence
+        BEFORE INSERT ON candidate_event_provenance
+        FOR EACH ROW EXECUTE FUNCTION pilot_validate_candidate_provenance()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    CandidateEventProvenanceModel.__table__,
+    "after_drop",
+    DDL(
+        "DROP FUNCTION IF EXISTS pilot_validate_candidate_provenance()"
+    ).execute_if(dialect="postgresql"),
+)
+
+
 class EvidenceModel(Base):
     __tablename__ = "evidence"
     __table_args__ = (
@@ -488,6 +1414,750 @@ class AuditEntryModel(Base):
 @event.listens_for(AuditEntryModel, "before_delete")
 def reject_audit_mutation(*_: object) -> None:
     raise ValueError("audit entries are append-only")
+
+
+class PreviewPublicationModel(Base):
+    """One terminal, immutable-material preview publication per candidate."""
+
+    __tablename__ = "preview_publications"
+    __table_args__ = (
+        CheckConstraint(
+            "intent_schema_version = 'preview-publication-intent.v1'",
+            name="ck_preview_intent_schema",
+        ),
+        CheckConstraint(
+            "publication_state IN ('reserved', 'ready', 'retiring', 'retired')",
+            name="ck_preview_publication_state",
+        ),
+        CheckConstraint(
+            "length(sha256) = 64",
+            name="ck_preview_publication_sha256",
+        ),
+        CheckConstraint(
+            "length(configuration_sha256) = 64",
+            name="ck_preview_configuration_sha256",
+        ),
+        CheckConstraint(
+            "runtime_writer_generation > 0",
+            name="ck_preview_writer_generation",
+        ),
+        CheckConstraint(
+            "configuration_activation_generation > 0",
+            name="ck_preview_activation_generation",
+        ),
+        CheckConstraint(
+            "length(rule_revision_sha256) = 64",
+            name="ck_preview_rule_sha256",
+        ),
+        CheckConstraint(
+            "length(candidate_body_sha256) = 64",
+            name="ck_preview_candidate_body_sha256",
+        ),
+        CheckConstraint(
+            "intent_expires_at > intent_created_at",
+            name="ck_preview_intent_time_range",
+        ),
+        CheckConstraint(
+            "receipt_schema_version IS NULL OR "
+            "receipt_schema_version = 'preview-object-receipt.v1'",
+            name="ck_preview_receipt_schema",
+        ),
+        CheckConstraint(
+            "size_bytes IS NULL OR "
+            "(size_bytes > 0 AND size_bytes <= 16777216)",
+            name="ck_preview_size_bound",
+        ),
+        CheckConstraint(
+            "media_type IS NULL OR media_type = 'video/mp4'",
+            name="ck_preview_media_type",
+        ),
+        CheckConstraint(
+            "server_side_encryption IS NULL OR "
+            "server_side_encryption IN ('AES256', 'aws:kms')",
+            name="ck_preview_encryption",
+        ),
+        CheckConstraint(
+            "(server_side_encryption IS NULL AND kms_key_id IS NULL) OR "
+            "(server_side_encryption = 'AES256' AND kms_key_id IS NULL) OR "
+            "(server_side_encryption = 'aws:kms' AND kms_key_id IS NOT NULL)",
+            name="ck_preview_kms_identity",
+        ),
+        CheckConstraint(
+            "receipt_sha256 IS NULL OR length(receipt_sha256) = 64",
+            name="ck_preview_receipt_sha256",
+        ),
+        ForeignKeyConstraint(
+            [
+                "event_id",
+                "site_id",
+                "runtime_session_id",
+                "runtime_writer_generation",
+                "configuration_activation_generation",
+                "source_epoch",
+                "rule_revision_sha256",
+                "configuration_sha256",
+                "candidate_body_sha256",
+            ],
+            [
+                "candidate_event_provenance.event_id",
+                "candidate_event_provenance.site_id",
+                "candidate_event_provenance.runtime_session_id",
+                "candidate_event_provenance.runtime_writer_generation",
+                "candidate_event_provenance.configuration_activation_generation",
+                "candidate_event_provenance.source_epoch",
+                "candidate_event_provenance.rule_revision_sha256",
+                "candidate_event_provenance.site_config_sha256",
+                "candidate_event_provenance.body_sha256",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "site_id",
+                "runtime_session_id",
+                "runtime_writer_generation",
+                "configuration_activation_generation",
+            ],
+            [
+                "runtime_writer_sessions.site_id",
+                "runtime_writer_sessions.runtime_session_id",
+                "runtime_writer_sessions.writer_generation",
+                "runtime_writer_sessions.configuration_activation_generation",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "camera_id", "source_epoch"],
+            [
+                "camera_epoch_history.site_id",
+                "camera_epoch_history.camera_id",
+                "camera_epoch_history.source_epoch",
+            ],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "event_id",
+            name="uq_preview_site_event",
+        ),
+        UniqueConstraint(
+            "evidence_id",
+            name="uq_preview_evidence_identity",
+        ),
+        UniqueConstraint(
+            "object_key",
+            name="uq_preview_object_identity",
+        ),
+        UniqueConstraint(
+            "receipt_sha256",
+            name="uq_preview_receipt_identity",
+        ),
+        UniqueConstraint(
+            "site_id",
+            "event_id",
+            "receipt_sha256",
+            name="uq_preview_access_authority",
+        ),
+        Index(
+            "ix_preview_retention_claim",
+            "site_id",
+            "publication_state",
+            "receipt_created_at",
+            "event_id",
+        ),
+        Index(
+            "ix_preview_intent_expiry",
+            "site_id",
+            "publication_state",
+            "intent_expires_at",
+            "event_id",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    site_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    camera_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    evidence_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    intent_schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    publication_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    runtime_session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    runtime_writer_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_activation_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    source_epoch: Mapped[str] = mapped_column(String(36), nullable=False)
+    rule_revision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_body_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    intent_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    intent_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    receipt_schema_version: Mapped[str | None] = mapped_column(String(64))
+    checksum_sha256: Mapped[str | None] = mapped_column(String(44))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    media_type: Mapped[str | None] = mapped_column(String(32))
+    etag: Mapped[str | None] = mapped_column(String(512))
+    version_id: Mapped[str | None] = mapped_column(String(1024))
+    server_side_encryption: Mapped[str | None] = mapped_column(String(16))
+    kms_key_id: Mapped[str | None] = mapped_column(String(2048))
+    receipt_sha256: Mapped[str | None] = mapped_column(String(64))
+    receipt_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    retiring_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PreviewAccessReceiptModel(Base):
+    """Redacted, append-only proof that an exact ready preview was accessed."""
+
+    __tablename__ = "preview_access_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version = 'preview-access-receipt.v1'",
+            name="ck_preview_access_schema",
+        ),
+        CheckConstraint(
+            "length(receipt_sha256) = 64",
+            name="ck_preview_access_receipt_sha256",
+        ),
+        ForeignKeyConstraint(
+            ["site_id", "event_id", "receipt_sha256"],
+            [
+                "preview_publications.site_id",
+                "preview_publications.event_id",
+                "preview_publications.receipt_sha256",
+            ],
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ix_preview_access_site_occurred",
+            "site_id",
+            "occurred_at",
+            "access_id",
+        ),
+    )
+
+    access_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    site_id: Mapped[str] = mapped_column(
+        ForeignKey("sites.site_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    event_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    actor_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    receipt_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_preview_publication_insert_guard
+        BEFORE INSERT ON preview_publications
+        FOR EACH ROW
+        WHEN
+          NEW.publication_state <> 'reserved'
+          OR NEW.receipt_schema_version IS NOT NULL
+          OR NEW.checksum_sha256 IS NOT NULL
+          OR NEW.size_bytes IS NOT NULL
+          OR NEW.media_type IS NOT NULL
+          OR NEW.etag IS NOT NULL
+          OR NEW.version_id IS NOT NULL
+          OR NEW.server_side_encryption IS NOT NULL
+          OR NEW.kms_key_id IS NOT NULL
+          OR NEW.receipt_sha256 IS NOT NULL
+          OR NEW.receipt_created_at IS NOT NULL
+          OR NEW.retiring_at IS NOT NULL
+          OR NEW.retired_at IS NOT NULL
+          OR NEW.intent_expires_at > datetime(NEW.intent_created_at, '+1 hour')
+          OR NEW.object_key <> (
+            NEW.site_id || '/' || NEW.event_id || '/' || NEW.evidence_id ||
+            '/' || NEW.sha256 || '.mp4'
+          )
+          OR NOT EXISTS (
+            SELECT 1
+              FROM candidate_events AS candidate
+              JOIN cameras AS camera
+                ON camera.camera_id = candidate.camera_id
+              JOIN candidate_event_provenance AS provenance
+                ON provenance.event_id = candidate.event_id
+              JOIN active_pilot_configurations AS active
+                ON active.site_id = provenance.site_id
+              JOIN site_config_revisions AS config
+                ON config.site_id = active.site_id
+               AND config.config_revision_id = active.config_revision_id
+              JOIN runtime_writer_authorities AS writer
+                ON writer.site_id = active.site_id
+              JOIN camera_epoch_authorities AS epoch
+                ON epoch.camera_id = candidate.camera_id
+             WHERE candidate.event_id = NEW.event_id
+               AND candidate.camera_id = NEW.camera_id
+               AND candidate.evidence_status = 'pending'
+               AND candidate.review_status = 'candidate'
+               AND candidate.transition_history = 'observation>candidate'
+               AND camera.site_id = NEW.site_id
+               AND provenance.site_id = NEW.site_id
+               AND provenance.runtime_session_id = NEW.runtime_session_id
+               AND provenance.runtime_writer_generation =
+                   NEW.runtime_writer_generation
+               AND provenance.configuration_activation_generation =
+                   NEW.configuration_activation_generation
+               AND provenance.source_epoch = NEW.source_epoch
+               AND provenance.rule_revision_sha256 =
+                   NEW.rule_revision_sha256
+               AND provenance.site_config_sha256 =
+                   NEW.configuration_sha256
+               AND provenance.body_sha256 = NEW.candidate_body_sha256
+               AND active.activation_generation =
+                   NEW.configuration_activation_generation
+               AND active.ruleset_revision_id =
+                   provenance.ruleset_revision_id
+               AND config.config_sha256 = NEW.configuration_sha256
+               AND writer.runtime_session_id = NEW.runtime_session_id
+               AND writer.writer_generation = NEW.runtime_writer_generation
+               AND writer.configuration_activation_generation =
+                   NEW.configuration_activation_generation
+               AND epoch.site_id = NEW.site_id
+               AND epoch.source_epoch = NEW.source_epoch
+               AND epoch.runtime_session_id = NEW.runtime_session_id
+               AND epoch.writer_generation = NEW.runtime_writer_generation
+               AND epoch.configuration_activation_generation =
+                   NEW.configuration_activation_generation
+          )
+        BEGIN
+          SELECT RAISE(
+            ABORT,
+            'preview reservation lacks exact current candidate authority'
+          );
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_preview_publication_update_guard
+        BEFORE UPDATE ON preview_publications
+        FOR EACH ROW
+        WHEN
+          OLD.event_id IS NOT NEW.event_id
+          OR OLD.site_id IS NOT NEW.site_id
+          OR OLD.camera_id IS NOT NEW.camera_id
+          OR OLD.evidence_id IS NOT NEW.evidence_id
+          OR OLD.intent_schema_version IS NOT NEW.intent_schema_version
+          OR OLD.object_key IS NOT NEW.object_key
+          OR OLD.sha256 IS NOT NEW.sha256
+          OR OLD.configuration_sha256 IS NOT NEW.configuration_sha256
+          OR OLD.runtime_session_id IS NOT NEW.runtime_session_id
+          OR OLD.runtime_writer_generation IS NOT NEW.runtime_writer_generation
+          OR OLD.configuration_activation_generation
+             IS NOT NEW.configuration_activation_generation
+          OR OLD.source_epoch IS NOT NEW.source_epoch
+          OR OLD.rule_revision_sha256 IS NOT NEW.rule_revision_sha256
+          OR OLD.candidate_body_sha256 IS NOT NEW.candidate_body_sha256
+          OR OLD.intent_created_at IS NOT NEW.intent_created_at
+          OR OLD.intent_expires_at IS NOT NEW.intent_expires_at
+          OR (
+            OLD.publication_state <> 'reserved'
+            AND (
+              OLD.receipt_schema_version IS NOT NEW.receipt_schema_version
+              OR OLD.checksum_sha256 IS NOT NEW.checksum_sha256
+              OR OLD.size_bytes IS NOT NEW.size_bytes
+              OR OLD.media_type IS NOT NEW.media_type
+              OR OLD.etag IS NOT NEW.etag
+              OR OLD.version_id IS NOT NEW.version_id
+              OR OLD.server_side_encryption IS NOT NEW.server_side_encryption
+              OR OLD.kms_key_id IS NOT NEW.kms_key_id
+              OR OLD.receipt_sha256 IS NOT NEW.receipt_sha256
+              OR OLD.receipt_created_at IS NOT NEW.receipt_created_at
+            )
+          )
+          OR NOT (
+            (
+              OLD.publication_state = 'reserved'
+              AND NEW.publication_state = 'ready'
+              AND NEW.receipt_schema_version = 'preview-object-receipt.v1'
+              AND NEW.checksum_sha256 IS NOT NULL
+              AND NEW.size_bytes BETWEEN 1 AND 16777216
+              AND NEW.media_type = 'video/mp4'
+              AND NEW.etag IS NOT NULL
+              AND NEW.version_id IS NOT NULL
+              AND NEW.server_side_encryption IS NOT NULL
+              AND NEW.receipt_sha256 IS NOT NULL
+              AND NEW.receipt_created_at IS OLD.intent_created_at
+              AND NEW.retiring_at IS NULL
+              AND NEW.retired_at IS NULL
+            )
+            OR (
+              OLD.publication_state = 'reserved'
+              AND NEW.publication_state = 'retired'
+              AND NEW.receipt_schema_version IS NULL
+              AND NEW.checksum_sha256 IS NULL
+              AND NEW.size_bytes IS NULL
+              AND NEW.media_type IS NULL
+              AND NEW.etag IS NULL
+              AND NEW.version_id IS NULL
+              AND NEW.server_side_encryption IS NULL
+              AND NEW.kms_key_id IS NULL
+              AND NEW.receipt_sha256 IS NULL
+              AND NEW.receipt_created_at IS NULL
+              AND NEW.retiring_at IS NULL
+              AND NEW.retired_at >= OLD.intent_expires_at
+            )
+            OR (
+              OLD.publication_state = 'ready'
+              AND NEW.publication_state = 'retiring'
+              AND NEW.retiring_at >= OLD.receipt_created_at
+              AND NEW.retired_at IS NULL
+            )
+            OR (
+              OLD.publication_state = 'retiring'
+              AND NEW.publication_state = 'retired'
+              AND NEW.retiring_at IS OLD.retiring_at
+              AND NEW.retired_at >= OLD.retiring_at
+            )
+          )
+        BEGIN
+          SELECT RAISE(
+            ABORT,
+            'preview publication material is immutable; preview publication '
+            || 'cannot be resurrected'
+          );
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_preview_publication_delete_guard
+        BEFORE DELETE ON preview_publications
+        FOR EACH ROW
+        BEGIN
+          SELECT RAISE(
+            ABORT,
+            'preview publication cannot be deleted or resurrected'
+          );
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    PreviewAccessReceiptModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_preview_access_update_guard
+        BEFORE UPDATE ON preview_access_receipts
+        FOR EACH ROW
+        BEGIN
+          SELECT RAISE(ABORT, 'preview access receipts are append-only');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION pilot_validate_preview_publication_insert()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, public
+        AS $$
+        BEGIN
+          IF NEW.publication_state <> 'reserved'
+             OR NEW.receipt_schema_version IS NOT NULL
+             OR NEW.checksum_sha256 IS NOT NULL
+             OR NEW.size_bytes IS NOT NULL
+             OR NEW.media_type IS NOT NULL
+             OR NEW.etag IS NOT NULL
+             OR NEW.version_id IS NOT NULL
+             OR NEW.server_side_encryption IS NOT NULL
+             OR NEW.kms_key_id IS NOT NULL
+             OR NEW.receipt_sha256 IS NOT NULL
+             OR NEW.receipt_created_at IS NOT NULL
+             OR NEW.retiring_at IS NOT NULL
+             OR NEW.retired_at IS NOT NULL
+             OR NEW.intent_expires_at >
+                NEW.intent_created_at + interval '1 hour'
+             OR NEW.object_key <> (
+               NEW.site_id || '/' || NEW.event_id || '/' ||
+               NEW.evidence_id || '/' || NEW.sha256 || '.mp4'
+             )
+             OR NOT EXISTS (
+               SELECT 1
+                 FROM public.candidate_events AS candidate
+                 JOIN public.cameras AS camera
+                   ON camera.camera_id = candidate.camera_id
+                 JOIN public.candidate_event_provenance AS provenance
+                   ON provenance.event_id = candidate.event_id
+                 JOIN public.active_pilot_configurations AS active
+                   ON active.site_id = provenance.site_id
+                 JOIN public.site_config_revisions AS config
+                   ON config.site_id = active.site_id
+                  AND config.config_revision_id = active.config_revision_id
+                 JOIN public.runtime_writer_authorities AS writer
+                   ON writer.site_id = active.site_id
+                 JOIN public.camera_epoch_authorities AS epoch
+                   ON epoch.camera_id = candidate.camera_id
+                WHERE candidate.event_id = NEW.event_id
+                  AND candidate.camera_id = NEW.camera_id
+                  AND candidate.evidence_status = 'pending'
+                  AND candidate.review_status = 'candidate'
+                  AND candidate.transition_history = 'observation>candidate'
+                  AND camera.site_id = NEW.site_id
+                  AND provenance.site_id = NEW.site_id
+                  AND provenance.runtime_session_id = NEW.runtime_session_id
+                  AND provenance.runtime_writer_generation =
+                      NEW.runtime_writer_generation
+                  AND provenance.configuration_activation_generation =
+                      NEW.configuration_activation_generation
+                  AND provenance.source_epoch = NEW.source_epoch
+                  AND provenance.rule_revision_sha256 =
+                      NEW.rule_revision_sha256
+                  AND provenance.site_config_sha256 =
+                      NEW.configuration_sha256
+                  AND provenance.body_sha256 = NEW.candidate_body_sha256
+                  AND active.activation_generation =
+                      NEW.configuration_activation_generation
+                  AND active.ruleset_revision_id =
+                      provenance.ruleset_revision_id
+                  AND config.config_sha256 = NEW.configuration_sha256
+                  AND writer.runtime_session_id = NEW.runtime_session_id
+                  AND writer.writer_generation =
+                      NEW.runtime_writer_generation
+                  AND writer.configuration_activation_generation =
+                      NEW.configuration_activation_generation
+                  AND epoch.site_id = NEW.site_id
+                  AND epoch.source_epoch = NEW.source_epoch
+                  AND epoch.runtime_session_id = NEW.runtime_session_id
+                  AND epoch.writer_generation =
+                      NEW.runtime_writer_generation
+                  AND epoch.configuration_activation_generation =
+                      NEW.configuration_activation_generation
+             ) THEN
+            RAISE EXCEPTION USING
+              ERRCODE = '23514',
+              MESSAGE =
+                'preview reservation lacks exact current candidate authority';
+          END IF;
+          RETURN NEW;
+        END;
+        $$
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_preview_publication_insert_guard
+        BEFORE INSERT ON preview_publications
+        FOR EACH ROW
+        EXECUTE FUNCTION pilot_validate_preview_publication_insert()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION pilot_guard_preview_publication_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, public
+        AS $$
+        BEGIN
+          IF TG_OP = 'DELETE' THEN
+            RAISE EXCEPTION USING
+              ERRCODE = '23514',
+              MESSAGE = 'preview publication cannot be deleted or resurrected';
+          END IF;
+          IF ROW(
+            OLD.event_id, OLD.site_id, OLD.camera_id, OLD.evidence_id,
+            OLD.intent_schema_version, OLD.object_key, OLD.sha256,
+            OLD.configuration_sha256, OLD.runtime_session_id,
+            OLD.runtime_writer_generation,
+            OLD.configuration_activation_generation, OLD.source_epoch,
+            OLD.rule_revision_sha256, OLD.candidate_body_sha256,
+            OLD.intent_created_at, OLD.intent_expires_at
+          ) IS DISTINCT FROM ROW(
+            NEW.event_id, NEW.site_id, NEW.camera_id, NEW.evidence_id,
+            NEW.intent_schema_version, NEW.object_key, NEW.sha256,
+            NEW.configuration_sha256, NEW.runtime_session_id,
+            NEW.runtime_writer_generation,
+            NEW.configuration_activation_generation, NEW.source_epoch,
+            NEW.rule_revision_sha256, NEW.candidate_body_sha256,
+            NEW.intent_created_at, NEW.intent_expires_at
+          ) THEN
+            RAISE EXCEPTION USING
+              ERRCODE = '23514',
+              MESSAGE = 'preview publication material is immutable';
+          END IF;
+          IF OLD.publication_state <> 'reserved'
+             AND ROW(
+               OLD.receipt_schema_version, OLD.checksum_sha256,
+               OLD.size_bytes, OLD.media_type, OLD.etag, OLD.version_id,
+               OLD.server_side_encryption, OLD.kms_key_id,
+               OLD.receipt_sha256, OLD.receipt_created_at
+             ) IS DISTINCT FROM ROW(
+               NEW.receipt_schema_version, NEW.checksum_sha256,
+               NEW.size_bytes, NEW.media_type, NEW.etag, NEW.version_id,
+               NEW.server_side_encryption, NEW.kms_key_id,
+               NEW.receipt_sha256, NEW.receipt_created_at
+             ) THEN
+            RAISE EXCEPTION USING
+              ERRCODE = '23514',
+              MESSAGE = 'preview publication material is immutable';
+          END IF;
+          IF NOT (
+            (
+              OLD.publication_state = 'reserved'
+              AND NEW.publication_state = 'ready'
+              AND NEW.receipt_schema_version = 'preview-object-receipt.v1'
+              AND NEW.checksum_sha256 IS NOT NULL
+              AND NEW.size_bytes BETWEEN 1 AND 16777216
+              AND NEW.media_type = 'video/mp4'
+              AND NEW.etag IS NOT NULL
+              AND NEW.version_id IS NOT NULL
+              AND NEW.server_side_encryption IS NOT NULL
+              AND NEW.receipt_sha256 IS NOT NULL
+              AND NEW.receipt_created_at IS NOT DISTINCT FROM
+                  OLD.intent_created_at
+              AND NEW.retiring_at IS NULL
+              AND NEW.retired_at IS NULL
+            )
+            OR (
+              OLD.publication_state = 'reserved'
+              AND NEW.publication_state = 'retired'
+              AND NEW.receipt_schema_version IS NULL
+              AND NEW.checksum_sha256 IS NULL
+              AND NEW.size_bytes IS NULL
+              AND NEW.media_type IS NULL
+              AND NEW.etag IS NULL
+              AND NEW.version_id IS NULL
+              AND NEW.server_side_encryption IS NULL
+              AND NEW.kms_key_id IS NULL
+              AND NEW.receipt_sha256 IS NULL
+              AND NEW.receipt_created_at IS NULL
+              AND NEW.retiring_at IS NULL
+              AND NEW.retired_at >= OLD.intent_expires_at
+            )
+            OR (
+              OLD.publication_state = 'ready'
+              AND NEW.publication_state = 'retiring'
+              AND NEW.retiring_at >= OLD.receipt_created_at
+              AND NEW.retired_at IS NULL
+            )
+            OR (
+              OLD.publication_state = 'retiring'
+              AND NEW.publication_state = 'retired'
+              AND NEW.retiring_at IS NOT DISTINCT FROM OLD.retiring_at
+              AND NEW.retired_at >= OLD.retiring_at
+            )
+          ) THEN
+            RAISE EXCEPTION USING
+              ERRCODE = '23514',
+              MESSAGE = 'preview publication cannot be resurrected';
+          END IF;
+          RETURN NEW;
+        END;
+        $$
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_preview_publication_mutation_guard
+        BEFORE UPDATE OR DELETE ON preview_publications
+        FOR EACH ROW
+        EXECUTE FUNCTION pilot_guard_preview_publication_mutation()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    PreviewAccessReceiptModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION pilot_guard_preview_access_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, public
+        AS $$
+        BEGIN
+          IF TG_OP = 'UPDATE' THEN
+            RAISE EXCEPTION USING
+              ERRCODE = '23514',
+              MESSAGE = 'preview access receipts are append-only';
+          END IF;
+          RETURN OLD;
+        END;
+        $$
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    PreviewAccessReceiptModel.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_preview_access_update_guard
+        BEFORE UPDATE ON preview_access_receipts
+        FOR EACH ROW
+        EXECUTE FUNCTION pilot_guard_preview_access_mutation()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    PreviewAccessReceiptModel.__table__,
+    "after_drop",
+    DDL(
+        "DROP FUNCTION IF EXISTS pilot_guard_preview_access_mutation()"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_drop",
+    DDL(
+        "DROP FUNCTION IF EXISTS pilot_guard_preview_publication_mutation()"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    PreviewPublicationModel.__table__,
+    "after_drop",
+    DDL(
+        "DROP FUNCTION IF EXISTS pilot_validate_preview_publication_insert()"
+    ).execute_if(dialect="postgresql"),
+)
 
 
 class AuditArchiveReceiptModel(Base):

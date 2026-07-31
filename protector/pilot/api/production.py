@@ -12,6 +12,9 @@ from pathlib import Path
 from sqlalchemy import select
 
 from protector.pilot.api.app import create_app
+from protector.pilot.api.preview_production import (
+    create_configured_preview_provider,
+)
 from protector.pilot.metrics import (
     HealthProbeSnapshot,
     PilotHealthService,
@@ -19,7 +22,12 @@ from protector.pilot.metrics import (
     PilotTelemetryState,
 )
 from protector.pilot.notifications.base import EvidenceLinkSigner
-from protector.pilot.storage.db import SessionFactory, create_engine, create_session_factory
+from protector.pilot.storage.db import (
+    SessionFactory,
+    create_engine,
+    create_session_factory,
+    require_sqlalchemy_database_role,
+)
 from protector.pilot.storage.models import (
     CameraHealthSampleModel,
     CameraModel,
@@ -164,11 +172,15 @@ def refresh_camera_metrics(
         )
 
 
-def _read_secret(name: str) -> str:
+def _read_secret_value(name: str, *, required: bool) -> str | None:
     path = _SECRETS_ROOT / name
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        if not required:
+            return None
+        raise RuntimeError("required API secret is unavailable") from exc
     except OSError as exc:
         raise RuntimeError("required API secret is unavailable") from exc
     try:
@@ -185,6 +197,16 @@ def _read_secret(name: str) -> str:
     if not value:
         raise RuntimeError("required API secret is invalid")
     return value
+
+
+def _read_secret(name: str) -> str:
+    value = _read_secret_value(name, required=True)
+    assert value is not None
+    return value
+
+
+def _read_optional_secret(name: str) -> str | None:
+    return _read_secret_value(name, required=False)
 
 
 def create_production_app() -> object:
@@ -211,6 +233,14 @@ def create_production_app() -> object:
         raise RuntimeError("PILOT_PUBLIC_ORIGIN is required")
 
     engine = create_engine(_read_secret("database_url"))
+    try:
+        require_sqlalchemy_database_role(
+            engine,
+            expected_role="kuzet_api",
+        )
+    except BaseException:
+        engine.dispose()
+        raise
     session_factory = create_session_factory(engine)
     repository = PilotRepository(
         session_factory,
@@ -308,17 +338,35 @@ def create_production_app() -> object:
             now=datetime.now(UTC),
         )
 
+    runtime_machine_token = _read_secret("runtime_machine_token")
+    notification_machine_token = _read_optional_secret("notification_machine_token")
+    monitoring_machine_token = _read_secret("monitoring_machine_token")
+    evidence_link_signing_secret = _read_secret("evidence_link_signing_secret")
+    if evidence_link_signing_secret in {
+        runtime_machine_token,
+        monitoring_machine_token,
+        notification_machine_token,
+    }:
+        raise RuntimeError("evidence link signing secret must not be a machine token")
     signer = build_evidence_link_signer(
-        encoded_secret=_read_secret("evidence_link_secret"),
+        encoded_secret=evidence_link_signing_secret,
         application_origin=public_origin,
         ttl_seconds=link_ttl_seconds,
+    )
+    preview_provider = create_configured_preview_provider(
+        repository=repository,
+        site_id=site_id,
+        clock=lambda: datetime.now(UTC),
     )
     return create_app(
         repository=repository,
         session_secret=_read_secret("session_secret"),
         totp_encryption_key=_read_secret("totp_encryption_key"),
-        machine_token=_read_secret("machine_token"),
+        runtime_machine_token=runtime_machine_token,
+        notification_machine_token=notification_machine_token,
+        monitoring_machine_token=monitoring_machine_token,
         pilot_site_id=site_id,
+        evidence_preview_provider=preview_provider,
         evidence_link_signer=signer,
         evidence_link_now=lambda: datetime.now(UTC),
         metrics=metrics,

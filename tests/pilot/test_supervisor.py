@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -288,3 +289,276 @@ def test_decoded_frame_heartbeat_updates_camera_health_without_inventing_a_perso
     assert health.scheduled_samples == 0
     assert health.dropped_samples == 0
     assert supervisor.drain_observations() == []
+
+
+def test_observation_budget_is_global_and_batch_drains_are_ordered_and_finite() -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks, queue_size=2)
+
+    first = supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=1,
+    )
+    second = supervisor.accept_sample(
+        camera_id="camera-b",
+        source_time=clocks.wall(),
+        monotonic_seq=1,
+    )
+    third = supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=clocks.wall() + timedelta(milliseconds=1),
+        monotonic_seq=2,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert third is not None
+    status = supervisor.observation_queue_status()
+    assert status.capacity == 2
+    assert status.depth == 2
+    assert status.dropped_total == 1
+    assert supervisor.health_for("camera-a").dropped_samples == 1
+
+    assert supervisor.drain_observations(max_items=1) == [second]
+    assert supervisor.observation_queue_status().depth == 1
+    assert supervisor.drain_observations(max_items=1) == [third]
+    assert supervisor.drain_observations(max_items=1) == []
+
+
+@pytest.mark.parametrize("max_items", (0, -1, True))
+def test_observation_batch_bound_must_be_a_positive_integer(max_items: object) -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks)
+
+    with pytest.raises(ValueError, match="max_items"):
+        supervisor.drain_observations(max_items=max_items)  # type: ignore[arg-type]
+
+
+def test_event_cursors_are_one_per_online_camera_and_keep_source_epochs() -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks)
+    first = supervisor.accept_sample(
+        camera_id="camera-b",
+        source_time=clocks.wall(),
+        monotonic_seq=1,
+    )
+    assert first is not None
+    assert supervisor.drain_observations(max_items=1) == [first]
+    clocks.advance(0.5)
+    assert supervisor.record_frame(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=1,
+    )
+    assert supervisor.complete_frame(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=1,
+    )
+
+    cursors = supervisor.event_cursors()
+
+    assert [cursor.camera_id for cursor in cursors] == [
+        "camera-a",
+        "camera-b",
+    ]
+    assert cursors[0].source_time == clocks.wall()
+    assert cursors[1].stream_epoch == first.stream_epoch
+
+    supervisor.disconnect("camera-b")
+    assert [cursor.camera_id for cursor in supervisor.event_cursors()] == [
+        "camera-a"
+    ]
+
+
+def test_atomic_event_batch_fences_only_the_camera_with_pending_observations() -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks, queue_size=2)
+    source_time = clocks.wall()
+    assert supervisor.record_frame(
+        camera_id="camera-a",
+        source_time=source_time,
+        monotonic_seq=1,
+    )
+    for sequence in (1, 2):
+        assert supervisor.accept_sample(
+            camera_id="camera-a",
+            source_time=source_time,
+            monotonic_seq=sequence,
+            complete_event_frame=False,
+        )
+    assert supervisor.complete_frame(
+        camera_id="camera-a",
+        source_time=source_time,
+        monotonic_seq=1,
+    )
+    assert supervisor.record_frame(
+        camera_id="camera-b",
+        source_time=source_time,
+        monotonic_seq=1,
+    )
+    assert supervisor.complete_frame(
+        camera_id="camera-b",
+        source_time=source_time,
+        monotonic_seq=1,
+    )
+
+    first = supervisor.drain_event_batch(max_items=1)
+
+    assert len(first.observations) == 1
+    assert [cursor.camera_id for cursor in first.cursors] == ["camera-b"]
+    assert first.cursors[0].observation_sequence == 0
+
+    second = supervisor.drain_event_batch(max_items=1)
+
+    assert len(second.observations) == 1
+    assert [cursor.camera_id for cursor in second.cursors] == [
+        "camera-a",
+        "camera-b",
+    ]
+    assert second.cursors[0].observation_sequence == 2
+
+
+def test_leaky_drop_fences_current_epoch_and_recovery_never_returns_stale_cursor() -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks, queue_size=1)
+    source_time = clocks.wall()
+    assert supervisor.record_frame(
+        camera_id="camera-a",
+        source_time=source_time,
+        monotonic_seq=1,
+    )
+    assert supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=source_time,
+        monotonic_seq=1,
+        complete_event_frame=False,
+    )
+    assert supervisor.complete_frame(
+        camera_id="camera-a",
+        source_time=source_time,
+        monotonic_seq=1,
+    )
+    clocks.advance(1.0)
+    assert supervisor.record_frame(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=2,
+    )
+    assert supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=2,
+        complete_event_frame=False,
+    )
+    assert supervisor.complete_frame(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=2,
+    )
+
+    drained = supervisor.drain_event_batch(max_items=1)
+
+    assert len(drained.observations) == 1
+    assert drained.cursors == ()
+
+    supervisor.disconnect("camera-a")
+    clocks.advance(1.0)
+    supervisor.advance()
+    supervisor.recover("camera-a")
+    assert supervisor.record_frame(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=3,
+    )
+    assert supervisor.complete_frame(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=3,
+    )
+
+    recovered = supervisor.drain_event_batch(max_items=1)
+
+    assert len(recovered.cursors) == 1
+    assert recovered.cursors[0].stream_epoch == supervisor.health_for(
+        "camera-a"
+    ).stream_epoch
+    assert recovered.cursors[0].source_time == clocks.wall()
+    assert recovered.cursors[0].observation_sequence == 2
+
+
+def test_epoch_change_hides_old_safe_cursor_until_new_frontier_is_ordered() -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks, queue_size=2)
+    first = supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=1,
+    )
+    assert first is not None
+    initial = supervisor.drain_event_batch(max_items=1)
+    assert [cursor.stream_epoch for cursor in initial.cursors] == [
+        first.stream_epoch
+    ]
+
+    supervisor.disconnect("camera-a")
+    clocks.advance(1.0)
+    supervisor.advance()
+    supervisor.recover("camera-a")
+    assert supervisor.record_frame(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=2,
+    )
+
+    assert supervisor.drain_event_batch(max_items=1).cursors == ()
+
+    second = supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=2,
+        complete_event_frame=False,
+    )
+    assert second is not None
+    assert supervisor.complete_frame(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=2,
+    )
+    recovered = supervisor.drain_event_batch(max_items=1)
+
+    assert len(recovered.cursors) == 1
+    assert recovered.cursors[0].stream_epoch == second.stream_epoch
+    assert recovered.cursors[0].stream_epoch != first.stream_epoch
+
+
+def test_recovery_epoch_change_serializes_with_atomic_event_drain() -> None:
+    clocks = Clocks()
+    supervisor = _supervisor(clocks)
+    assert supervisor.accept_sample(
+        camera_id="camera-a",
+        source_time=clocks.wall(),
+        monotonic_seq=1,
+    )
+    supervisor.disconnect("camera-a")
+    entered = threading.Event()
+    recovered = threading.Event()
+
+    def recover() -> None:
+        entered.set()
+        supervisor.recover("camera-a")
+        recovered.set()
+
+    with supervisor._queue_lock:
+        thread = threading.Thread(target=recover)
+        thread.start()
+        assert entered.wait(timeout=1.0)
+        assert recovered.wait(timeout=0.05) is False
+        supervisor.drain_event_batch(max_items=1)
+
+    thread.join(timeout=1.0)
+
+    assert thread.is_alive() is False
+    assert recovered.is_set()
+    assert supervisor.health_for("camera-a").tracker_generation == 1

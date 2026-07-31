@@ -21,7 +21,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, Callable, Literal
 
-import yaml
 from pydantic import Field, ValidationError, field_serializer, field_validator
 
 from protector.pilot.config import FrozenModel, NonEmptyString, SiteConfig
@@ -38,11 +37,15 @@ from protector.pilot.gates import (
     SiteMatrixSceneV1,
     validate_credential_free_reference,
 )
+from protector.pilot.trusted_yaml import StrictYAMLError, load_strict_yaml
 
 _HEX = frozenset("0123456789abcdef")
 _L4_ARCHITECTURE = PILOT_TARGET_GPU_ARCHITECTURE
 _L4_COMPUTE_CAPABILITY = PILOT_TARGET_COMPUTE_CAPABILITY
 _DEEPSTREAM_91_TENSORRT = PILOT_TENSORRT_VERSION
+_MAX_MODEL_REGISTRY_YAML_BYTES = 512 * 1024
+_MAX_MODEL_REGISTRY_YAML_NODES = 20_000
+_MAX_MODEL_REGISTRY_YAML_DEPTH = 64
 
 
 def _digest(value: str, *, field_name: str) -> str:
@@ -363,11 +366,20 @@ class EngineBuildError(RuntimeError):
 
 def load_model_entry(path: Path) -> ModelRegistryEntryV1:
     try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+        with path.open("rb") as manifest_file:
+            encoded = manifest_file.read(_MAX_MODEL_REGISTRY_YAML_BYTES + 1)
+    except OSError as exc:
         raise ValueError(f"unable to read model registry entry: {path}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("model registry entry must be a YAML mapping")
+    try:
+        payload = load_strict_yaml(
+            encoded,
+            max_bytes=_MAX_MODEL_REGISTRY_YAML_BYTES,
+            max_nodes=_MAX_MODEL_REGISTRY_YAML_NODES,
+            max_depth=_MAX_MODEL_REGISTRY_YAML_DEPTH,
+            require_mapping=True,
+        )
+    except StrictYAMLError as exc:
+        raise ValueError(f"model registry entry is invalid: {path}") from exc
     return ModelRegistryEntryV1.model_validate(payload)
 
 

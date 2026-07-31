@@ -37,7 +37,9 @@ class ApiContext:
     passwords: PasswordService
     totp: TotpService
     throttle: LoginThrottle
-    machine_token: str = field(repr=False)
+    runtime_machine_token: str = field(repr=False)
+    notification_machine_token: str | None = field(repr=False)
+    monitoring_machine_token: str = field(repr=False)
     evidence_preview_provider: Any | None = field(default=None, repr=False)
     pilot_site_id: str | None = None
     evidence_link_signer: EvidenceLinkSigner | None = field(default=None, repr=False)
@@ -155,20 +157,72 @@ def require_idempotency_key(
     return normalized
 
 
-def require_machine_auth(
+def get_machine_credential(
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-    context: Annotated[ApiContext, Depends(get_context)] = None,  # type: ignore[assignment]
-) -> None:
+) -> str:
     scheme, separator, credential = (authorization or "").partition(" ")
     if (
         separator != " "
         or scheme.casefold() != "bearer"
         or not credential
-        or not machine_token_matches(credential, context.machine_token)
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="machine authentication required"
         )
+    return credential
+
+
+def authorize_machine_role(
+    *,
+    credential: str,
+    context: ApiContext,
+    role: str,
+) -> None:
+    expected = {
+        "runtime": context.runtime_machine_token,
+        "notification": context.notification_machine_token,
+        "monitoring": context.monitoring_machine_token,
+    }.get(role)
+    if expected is None or not machine_token_matches(credential, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="machine authentication required",
+        )
+
+
+def require_runtime_machine_auth(
+    credential: Annotated[str, Depends(get_machine_credential)],
+    context: Annotated[ApiContext, Depends(get_context)],
+) -> None:
+    authorize_machine_role(
+        credential=credential,
+        context=context,
+        role="runtime",
+    )
+
+
+def require_monitoring_machine_auth(
+    credential: Annotated[str, Depends(get_machine_credential)],
+    context: Annotated[ApiContext, Depends(get_context)],
+) -> None:
+    authorize_machine_role(
+        credential=credential,
+        context=context,
+        role="monitoring",
+    )
+
+
+def require_machine_auth(
+    credential: Annotated[str, Depends(get_machine_credential)],
+    context: Annotated[ApiContext, Depends(get_context)],
+) -> None:
+    """Legacy runtime-role dependency retained for tests and demo callers."""
+
+    authorize_machine_role(
+        credential=credential,
+        context=context,
+        role="runtime",
+    )
 
 
 _CREDENTIAL_KEY_MARKERS = frozenset(

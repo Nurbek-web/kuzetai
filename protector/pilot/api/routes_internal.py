@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from protector.pilot.api.dependencies import (
     ApiContext,
     PilotSiteConfigurationError,
+    authorize_machine_role,
     get_context,
-    require_machine_auth,
+    get_machine_credential,
+    require_runtime_machine_auth,
     resolve_pilot_site_id,
 )
 from protector.pilot.domain import ObservationV1
@@ -28,12 +31,17 @@ router = APIRouter(prefix="/api/internal", tags=["internal"])
 @router.post(
     "/observations",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_machine_auth)],
+    dependencies=[Depends(require_runtime_machine_auth)],
 )
 def ingest_observation(
     observation: ObservationV1,
     context: Annotated[ApiContext, Depends(get_context)],
 ) -> dict[str, str]:
+    if context.telemetry is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "legacy_observation_ingest_disabled"},
+        )
     if not observation.is_fresh:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -78,7 +86,7 @@ class HealthSampleRequest(BaseModel):
 @router.post(
     "/health",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_machine_auth)],
+    dependencies=[Depends(require_runtime_machine_auth)],
 )
 def ingest_health(
     sample: HealthSampleRequest,
@@ -167,6 +175,35 @@ def _persist_health_samples_in_session(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "stale_health_sample"},
             )
+    if session.get_bind().dialect.name == "postgresql":
+        row_ids: list[int] = []
+        for sample in samples:
+            row_id = session.scalar(
+                text(
+                    """
+                    SELECT public.pilot_upsert_camera_health_sample(
+                        :site_id,
+                        CAST(:sample AS jsonb)
+                    )
+                    """
+                ),
+                {
+                    "site_id": site_id,
+                    "sample": json.dumps(
+                        sample.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+            )
+            if type(row_id) is not int or row_id <= 0:
+                raise RuntimeError(
+                    "camera health upsert returned an invalid identity"
+                )
+            row_ids.append(row_id)
+        for sample in samples:
+            cameras_by_id[sample.camera_id].state = sample.state
+        return tuple(row_ids)
     rows = [CameraHealthSampleModel(**sample.model_dump()) for sample in samples]
     session.add_all(rows)
     for sample in samples:
@@ -374,12 +411,17 @@ class TelemetryRequest(BaseModel):
 @router.post(
     "/telemetry",
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_machine_auth)],
 )
 def ingest_telemetry(
     payload: TelemetryRequest,
     context: Annotated[ApiContext, Depends(get_context)],
+    credential: Annotated[str, Depends(get_machine_credential)],
 ) -> dict[str, str]:
+    authorize_machine_role(
+        credential=credential,
+        context=context,
+        role="notification" if payload.publisher == "notifications" else "runtime",
+    )
     if context.metrics is None or context.telemetry is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

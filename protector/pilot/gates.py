@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -626,6 +627,72 @@ class ConditionalModelGateResultV1(ModelGateResultV1):
 
     @property
     def decision_sha256(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+class OperationalGateDecisionEnvelopeV2(FrozenModel):
+    """Authorizing gate result bound to exact reviewed workload/runtime evidence."""
+
+    schema_version: Literal["operational-gate-decision.v2"] = (
+        "operational-gate-decision.v2"
+    )
+    decision: ConditionalModelGateResultV1
+    site_config_sha256: str
+    target_site_report_sha256: str
+    measured_capacity_report_sha256: str
+    frozen_workload_sha256: str
+    engine_sha256: str
+    runtime_manifest_sha256: str
+    required_effective_throughput_hz: float
+    measured_effective_throughput_hz: float
+    minimum_headroom_ratio: Literal[0.25] = 0.25
+
+    @field_validator(
+        "site_config_sha256",
+        "target_site_report_sha256",
+        "measured_capacity_report_sha256",
+        "frozen_workload_sha256",
+        "engine_sha256",
+        "runtime_manifest_sha256",
+    )
+    @classmethod
+    def evidence_digests_are_canonical(cls, value: str, info: object) -> str:
+        return _digest(value, field_name=getattr(info, "field_name", "digest"))
+
+    @field_validator(
+        "required_effective_throughput_hz",
+        "measured_effective_throughput_hz",
+        mode="before",
+    )
+    @classmethod
+    def throughput_is_strict_finite_positive(cls, value: object) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0.0
+        ):
+            raise ValueError("throughput must be a finite positive number")
+        return float(value)
+
+    @model_validator(mode="after")
+    def measured_capacity_has_required_headroom(
+        self,
+    ) -> OperationalGateDecisionEnvelopeV2:
+        required = self.required_effective_throughput_hz * (
+            1.0 + self.minimum_headroom_ratio
+        )
+        if self.measured_effective_throughput_hz < required:
+            raise ValueError("measured effective throughput lacks required 25% headroom")
+        return self
+
+    @property
+    def authority_sha256(self) -> str:
         encoded = json.dumps(
             self.model_dump(mode="json"),
             sort_keys=True,

@@ -1214,4 +1214,4 @@ def test_notification_delivery_migration_adds_claim_state_and_index(tmp_path: Pa
 
     assert {"lease_token", "lease_expires_at"} <= columns
     assert "ix_notification_outbox_claim" in indexes
-    assert current_revision == "0005_auth_lifecycle"
+    assert current_revision == "0006_event_provenance"

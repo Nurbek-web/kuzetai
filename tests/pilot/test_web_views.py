@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
@@ -11,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event as sqlalchemy_event
 
+import protector.pilot.api.web as web_module
 from protector.pilot.api.app import create_app
 from protector.pilot.api.auth import PasswordService, SessionUser, TotpService
 from protector.pilot.api.web import EvidencePreview
@@ -41,15 +43,27 @@ EVENT_REVIEWED = UUID("10000000-0000-0000-0000-000000000003")
 EVENT_FOREIGN = UUID("10000000-0000-0000-0000-000000000004")
 
 
-@dataclass(frozen=True)
+@dataclass
 class StubEvidenceProvider:
     payload: bytes = b"safe-preview-bytes"
     media_type: str = "video/mp4"
     error: Exception | None = None
+    calls: list[tuple[str, UUID, str, int]] = field(default_factory=list)
 
-    def get_preview(self, event_id: UUID, *, max_bytes: int) -> EvidencePreview | None:
-        assert event_id == EVENT_READY
+    def get_preview(
+        self,
+        *,
+        site_id: str,
+        event_id: UUID,
+        actor_id: str,
+        max_bytes: int,
+    ) -> EvidencePreview | None:
+        self.calls.append((site_id, event_id, actor_id, max_bytes))
+        assert site_id == "site-1"
+        assert actor_id == "viewer-1"
         assert max_bytes == 16 * 1024 * 1024
+        if event_id != EVENT_READY:
+            return None
         if self.error is not None:
             raise self.error
         return EvidencePreview(content=self.payload, media_type=self.media_type)
@@ -756,7 +770,8 @@ def test_ready_evidence_fails_closed_without_provider_and_never_discloses_refere
 def test_evidence_preview_is_same_origin_authenticated_bounded_and_no_store(
     tmp_path: Path,
 ) -> None:
-    context = _make_context(tmp_path, evidence_provider=StubEvidenceProvider())
+    provider = StubEvidenceProvider()
+    context = _make_context(tmp_path, evidence_provider=provider)
 
     unauthenticated = context.client.get(
         f"/pilot/evidence/{EVENT_READY}",
@@ -773,6 +788,76 @@ def test_evidence_preview_is_same_origin_authenticated_bounded_and_no_store(
     assert response.headers["x-content-type-options"] == "nosniff"
     assert OBJECT_KEY_SECRET not in str(response.headers) + response.text
     assert SOURCE_REFERENCE_SECRET not in str(response.headers) + response.text
+    assert provider.calls == [
+        ("site-1", EVENT_READY, "viewer-1", 16 * 1024 * 1024)
+    ]
+
+
+def test_preview_response_capacity_is_aggregate_bounded(
+    tmp_path: Path,
+) -> None:
+    provider = StubEvidenceProvider()
+    context = _make_context(tmp_path, evidence_provider=provider)
+    context.authenticate("viewer")
+    acquired = [
+        web_module._PREVIEW_RESPONSE_SLOTS.acquire(blocking=False)
+        for _ in range(web_module._MAX_CONCURRENT_PREVIEW_RESPONSES)
+    ]
+    assert all(acquired)
+    try:
+        response = context.client.get(
+            f"/pilot/evidence/{EVENT_READY}",
+        )
+    finally:
+        for _ in acquired:
+            web_module._PREVIEW_RESPONSE_SLOTS.release()
+
+    assert response.status_code == 503
+    assert provider.calls == []
+
+
+def test_preview_response_capacity_releases_on_client_send_failure() -> None:
+    released = 0
+
+    def release() -> None:
+        nonlocal released
+        released += 1
+
+    response = web_module._CapacityBoundResponse(
+        content=b"bounded",
+        media_type="video/mp4",
+        release_capacity=release,
+    )
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.disconnect"}
+
+    async def send(_message: dict[str, object]) -> None:
+        raise RuntimeError("client disconnected")
+
+    with pytest.raises(RuntimeError, match="client disconnected"):
+        asyncio.run(
+            response(
+                {
+                    "type": "http",
+                    "http_version": "1.1",
+                    "method": "GET",
+                    "path": "/pilot/evidence/test",
+                    "raw_path": b"/pilot/evidence/test",
+                    "root_path": "",
+                    "scheme": "https",
+                    "query_string": b"",
+                    "headers": [],
+                    "client": ("127.0.0.1", 12345),
+                    "server": ("localhost", 443),
+                    "state": {},
+                },
+                receive,
+                send,
+            )
+        )
+
+    assert released == 1
 
 
 @pytest.mark.parametrize(

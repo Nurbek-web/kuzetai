@@ -22,11 +22,17 @@ from sqlalchemy.exc import (
     ProgrammingError,
 )
 
-from protector.pilot.domain import CandidateEventV1
+from protector.pilot.domain import CandidateEventV1, ProvenancedCandidateEventV2
 
-JournalKind = Literal["candidate_event", "evidence", "evidence_intent"]
+JournalKind = Literal[
+    "candidate_event",
+    "provenanced_candidate_event",
+    "evidence",
+    "evidence_intent",
+]
 SUPPORTED_JOURNAL_SCHEMA_VERSIONS: dict[JournalKind, str] = {
     "candidate_event": "candidate-event.v1",
+    "provenanced_candidate_event": "provenanced-candidate-event.v2",
     "evidence": "evidence-work.v1",
     "evidence_intent": "evidence-intent.v1",
 }
@@ -223,7 +229,12 @@ class SQLiteWALJournal:
             CREATE TABLE IF NOT EXISTS journal_items (
                 item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL CHECK (
-                    kind IN ('candidate_event', 'evidence', 'evidence_intent')
+                    kind IN (
+                        'candidate_event',
+                        'provenanced_candidate_event',
+                        'evidence',
+                        'evidence_intent'
+                    )
                 ),
                 schema_version TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL UNIQUE,
@@ -235,7 +246,7 @@ class SQLiteWALJournal:
         table_sql = self._connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_items'"
         ).fetchone()[0]
-        needs_kind_migration = "evidence_intent" not in str(table_sql)
+        needs_kind_migration = "provenanced_candidate_event" not in str(table_sql)
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS journal_quarantine (
@@ -347,7 +358,12 @@ class SQLiteWALJournal:
                     CREATE TABLE journal_items_v2 (
                         item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         kind TEXT NOT NULL CHECK (
-                            kind IN ('candidate_event', 'evidence', 'evidence_intent')
+                            kind IN (
+                                'candidate_event',
+                                'provenanced_candidate_event',
+                                'evidence',
+                                'evidence_intent'
+                            )
                         ),
                         schema_version TEXT NOT NULL,
                         idempotency_key TEXT NOT NULL UNIQUE,
@@ -458,6 +474,22 @@ class SQLiteWALJournal:
             schema_version=event.schema_version,
             idempotency_key=event.dedupe_key,
             payload=event.model_dump(mode="json"),
+        )
+
+    def enqueue_provenanced_event(
+        self,
+        envelope: ProvenancedCandidateEventV2,
+    ) -> JournalItem:
+        """Durably retain the exact production candidate envelope."""
+        if type(envelope) is not ProvenancedCandidateEventV2:
+            raise TypeError(
+                "production candidate journal requires an exact provenance envelope"
+            )
+        return self.enqueue(
+            kind="provenanced_candidate_event",
+            schema_version=envelope.schema_version,
+            idempotency_key=envelope.event.dedupe_key,
+            payload=envelope.model_dump(mode="json"),
         )
 
     def seed_pending_evidence_work(
@@ -745,7 +777,7 @@ class SQLiteWALJournal:
                 SELECT item_id, kind, schema_version, idempotency_key,
                        payload_json, created_at
                 FROM journal_items
-                WHERE kind = 'candidate_event'
+                WHERE kind IN ('candidate_event', 'provenanced_candidate_event')
                 ORDER BY item_id
                 """
             ).fetchall()
@@ -758,7 +790,14 @@ class SQLiteWALJournal:
         missing: list[JournalItem] = []
         for row in rows:
             try:
-                event = CandidateEventV1.model_validate_json(row["payload_json"])
+                if row["kind"] == "provenanced_candidate_event":
+                    event = ProvenancedCandidateEventV2.model_validate_json(
+                        row["payload_json"]
+                    ).event
+                else:
+                    event = CandidateEventV1.model_validate_json(
+                        row["payload_json"]
+                    )
             except (TypeError, ValueError):
                 continue
             if str(event.event_id) not in pending_ids:

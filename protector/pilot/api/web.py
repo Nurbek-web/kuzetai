@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Literal, Protocol
+from threading import BoundedSemaphore
+from typing import Annotated, Any, Callable, Literal, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -38,9 +39,37 @@ MAX_EVENT_ROWS = 50
 MAX_PREVIEW_BYTES = 16 * 1024 * 1024
 EXPECTED_PILOT_CAMERA_COUNT = 20
 ALLOWED_PREVIEW_MEDIA_TYPES = frozenset(("video/mp4",))
+_MAX_CONCURRENT_PREVIEW_RESPONSES = 4
+_PREVIEW_RESPONSE_SLOTS = BoundedSemaphore(
+    value=_MAX_CONCURRENT_PREVIEW_RESPONSES,
+)
 
 templates = Jinja2Templates(directory=WEB_ROOT / "templates")
 router = APIRouter(prefix="/pilot", tags=["operator-console"])
+
+
+class _CapacityBoundResponse(Response):
+    """Release one aggregate response slot even when the client disconnects."""
+
+    def __init__(
+        self,
+        *,
+        release_capacity: Callable[[], None],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._release_capacity = release_capacity
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[..., Any],
+        send: Callable[..., Any],
+    ) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release_capacity()
 
 
 def _utc_iso(value: datetime | None) -> str:
@@ -65,7 +94,14 @@ class EvidencePreview:
 class EvidencePreviewProvider(Protocol):
     """Resolve an opaque event identity to bounded evidence bytes."""
 
-    def get_preview(self, event_id: UUID, *, max_bytes: int) -> EvidencePreview | None: ...
+    def get_preview(
+        self,
+        *,
+        site_id: str,
+        event_id: UUID,
+        actor_id: str,
+        max_bytes: int,
+    ) -> EvidencePreview | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,10 +434,12 @@ def evidence_preview(
     current: Annotated[ServerSession, Depends(get_current_session)],
     context: Annotated[ApiContext, Depends(get_context)],
 ) -> Response:
-    del current
     provider = context.evidence_preview_provider
     if provider is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="preview unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="preview unavailable",
+        )
     try:
         pilot_site_id = resolve_pilot_site_id(context)
     except PilotSiteConfigurationError as exc:
@@ -409,44 +447,49 @@ def evidence_preview(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="preview unavailable",
         ) from exc
-    with context.repository.session_factory() as database_session:
-        evidence_is_ready = database_session.scalar(
-            select(EvidenceModel.evidence_id)
-            .join(
-                CandidateEventModel,
-                CandidateEventModel.event_id == EvidenceModel.event_id,
-            )
-            .join(CameraModel, CameraModel.camera_id == CandidateEventModel.camera_id)
-            .where(
-                CandidateEventModel.event_id == str(event_id),
-                CameraModel.site_id == pilot_site_id,
-                CandidateEventModel.evidence_status == "ready",
-                EvidenceModel.status == "ready",
-            )
-            .limit(1)
+    if not _PREVIEW_RESPONSE_SLOTS.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="preview capacity is busy",
         )
-    if evidence_is_ready is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="preview unavailable")
+    response_owns_slot = False
     try:
-        preview = provider.get_preview(event_id, max_bytes=MAX_PREVIEW_BYTES)
+        preview = provider.get_preview(
+            site_id=pilot_site_id,
+            event_id=event_id,
+            actor_id=current.user.user_id,
+            max_bytes=MAX_PREVIEW_BYTES,
+        )
+        if preview is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="preview unavailable",
+            )
+        if (
+            not isinstance(preview.content, bytes)
+            or not preview.content
+            or len(preview.content) > MAX_PREVIEW_BYTES
+            or preview.media_type not in ALLOWED_PREVIEW_MEDIA_TYPES
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="invalid preview response",
+            )
+        response = _CapacityBoundResponse(
+            content=preview.content,
+            media_type=preview.media_type,
+            headers={"Cache-Control": "no-store"},
+            release_capacity=_PREVIEW_RESPONSE_SLOTS.release,
+        )
+        response_owns_slot = True
+        return response
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="preview provider failed",
         ) from exc
-    if (
-        preview is None
-        or not isinstance(preview.content, bytes)
-        or not preview.content
-        or len(preview.content) > MAX_PREVIEW_BYTES
-        or preview.media_type not in ALLOWED_PREVIEW_MEDIA_TYPES
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="invalid preview response",
-        )
-    return Response(
-        content=preview.content,
-        media_type=preview.media_type,
-        headers={"Cache-Control": "no-store"},
-    )
+    finally:
+        if not response_owns_slot:
+            _PREVIEW_RESPONSE_SLOTS.release()

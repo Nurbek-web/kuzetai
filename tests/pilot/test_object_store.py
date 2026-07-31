@@ -46,10 +46,35 @@ NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 
 
 class FakeS3Client:
-    def __init__(self) -> None:
+    def __init__(self, *, evidence_prefix: str = "pilot-evidence") -> None:
         self.objects: dict[tuple[str, str], dict[str, Any]] = {}
         self.calls: list[tuple[str, str]] = []
+        self.deleted_versions: list[tuple[str, str, str]] = []
         self.fail_put_once = False
+        self._version_ordinal = 0
+        self.versioning_status = "Enabled"
+        self.lifecycle: dict[str, Any] = {
+            "Rules": [
+                {
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": f"{evidence_prefix}/"},
+                    "Expiration": {"Days": 30},
+                    "NoncurrentVersionExpiration": {"NoncurrentDays": 1},
+                }
+            ]
+        }
+
+    def get_bucket_versioning(self, *, Bucket: str) -> dict[str, str]:
+        assert Bucket == "evidence"
+        return {"Status": self.versioning_status}
+
+    def get_bucket_lifecycle_configuration(
+        self,
+        *,
+        Bucket: str,
+    ) -> dict[str, Any]:
+        assert Bucket == "evidence"
+        return self.lifecycle
 
     def head_object(
         self,
@@ -57,16 +82,20 @@ class FakeS3Client:
         Bucket: str,
         Key: str,
         ChecksumMode: str,
+        VersionId: str | None = None,
     ) -> dict[str, Any]:
         assert ChecksumMode == "ENABLED"
         try:
             stored = self.objects[(Bucket, Key)]
         except KeyError as exc:
             raise KeyError(Key) from exc
+        if VersionId is not None and stored.get("VersionId") != VersionId:
+            raise KeyError(VersionId)
         head = {
             "ContentLength": len(stored["Body"]),
             "ChecksumSHA256": stored["ChecksumSHA256"],
             "ServerSideEncryption": stored["ServerSideEncryption"],
+            "VersionId": stored.get("VersionId", "manual-version"),
         }
         if "SSEKMSKeyId" in stored:
             head["SSEKMSKeyId"] = stored["SSEKMSKeyId"]
@@ -95,16 +124,29 @@ class FakeS3Client:
         assert IfNoneMatch == "*"
         assert ChecksumAlgorithm == "SHA256"
         assert ChecksumSHA256 == base64.b64encode(hashlib.sha256(Body).digest()).decode()
+        self._version_ordinal += 1
         self.objects[(Bucket, Key)] = {
             "Body": bytes(Body),
             "ChecksumSHA256": ChecksumSHA256,
             "ServerSideEncryption": ServerSideEncryption,
             "LastModified": NOW,
+            "VersionId": f"version-{self._version_ordinal}",
             **kwargs,
         }
 
-    def delete_object(self, *, Bucket: str, Key: str) -> None:
+    def delete_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        VersionId: str | None = None,
+    ) -> None:
         self.calls.append(("delete", Key))
+        if VersionId is not None:
+            stored = self.objects.get((Bucket, Key))
+            if stored is not None and stored.get("VersionId") != VersionId:
+                raise AssertionError("wrong exact version deleted")
+            self.deleted_versions.append((Bucket, Key, VersionId))
         self.objects.pop((Bucket, Key), None)
 
     def list_objects_v2(self, *, Bucket: str, Prefix: str = "") -> dict[str, Any]:
@@ -114,6 +156,29 @@ class FakeS3Client:
                 for (bucket, key), value in self.objects.items()
                 if bucket == Bucket and key.startswith(Prefix)
             ],
+            "IsTruncated": False,
+        }
+
+    def list_object_versions(
+        self,
+        *,
+        Bucket: str,
+        Prefix: str,
+        MaxKeys: int,
+    ) -> dict[str, Any]:
+        assert MaxKeys == 100
+        return {
+            "Versions": [
+                {
+                    "Key": key,
+                    "VersionId": value["VersionId"],
+                }
+                for (bucket, key), value in self.objects.items()
+                if bucket == Bucket
+                and key == Prefix
+                and "VersionId" in value
+            ],
+            "DeleteMarkers": [],
             "IsTruncated": False,
         }
 
@@ -290,6 +355,102 @@ def test_s3_requires_kz_https_boundary_and_never_accepts_credentials() -> None:
             _s3_store(client, endpoint=endpoint)
 
 
+def test_s3_attests_exact_bounded_version_lifecycle() -> None:
+    client = FakeS3Client()
+    client.lifecycle["Rules"].append(
+        {
+            "Status": "Enabled",
+            "Filter": {"Prefix": "pilot-evidence/previews/"},
+            "Expiration": {"Days": 30},
+            "NoncurrentVersionExpiration": {"NoncurrentDays": 1},
+        }
+    )
+    store = _s3_store(client)
+
+    store.attest_bounded_lifecycle(retention_days=30)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (("versioning_status", "Suspended"), "versioning"),
+        (("prefix", "other-prefix/"), "lifecycle"),
+        (("expiration", 29), "lifecycle"),
+        (("expiration", 31), "lifecycle"),
+        (("noncurrent", 2), "lifecycle"),
+        (("newer_noncurrent", 1), "lifecycle"),
+        (("filter_extra", "pilot"), "lifecycle"),
+        (("expiration_extra", True), "lifecycle"),
+    ),
+)
+def test_s3_rejects_unbounded_or_drifted_version_lifecycle(
+    mutation: tuple[str, object],
+    message: str,
+) -> None:
+    client = FakeS3Client()
+    field, value = mutation
+    if field == "versioning_status":
+        client.versioning_status = str(value)
+    elif field == "prefix":
+        client.lifecycle["Rules"][0]["Filter"]["Prefix"] = value
+    elif field == "expiration":
+        client.lifecycle["Rules"][0]["Expiration"]["Days"] = value
+    elif field == "newer_noncurrent":
+        client.lifecycle["Rules"][0]["NoncurrentVersionExpiration"][
+            "NewerNoncurrentVersions"
+        ] = value
+    elif field == "filter_extra":
+        client.lifecycle["Rules"][0]["Filter"]["Tag"] = {
+            "Key": "scope",
+            "Value": value,
+        }
+    elif field == "expiration_extra":
+        client.lifecycle["Rules"][0]["Expiration"][
+            "ExpiredObjectDeleteMarker"
+        ] = value
+    else:
+        client.lifecycle["Rules"][0]["NoncurrentVersionExpiration"][
+            "NoncurrentDays"
+        ] = value
+
+    with pytest.raises(ObjectIntegrityError, match=message):
+        _s3_store(client).attest_bounded_lifecycle(retention_days=30)
+
+
+@pytest.mark.parametrize(
+    "overlapping_rule",
+    (
+        {
+            "Status": "Enabled",
+            "Expiration": {"Days": 1},
+        },
+        {
+            "Status": "Enabled",
+            "Filter": {"Prefix": "pilot-evidence/"},
+            "Expiration": {"Days": 1},
+        },
+        {
+            "Status": "Enabled",
+            "Filter": {"Prefix": "pilot-evidence/events/"},
+            "Expiration": {"Days": 1},
+        },
+        {
+            "Status": "Enabled",
+            "Filter": {"Tag": {"Key": "scope", "Value": "narrowed"}},
+            "Expiration": {"Days": 1},
+        },
+    ),
+)
+def test_s3_rejects_any_ambiguous_or_overlapping_lifecycle_rule(
+    overlapping_rule: dict[str, object],
+) -> None:
+    client = FakeS3Client()
+    client.lifecycle["Rules"].append(overlapping_rule)
+
+    with pytest.raises(ObjectIntegrityError, match="lifecycle"):
+        _s3_store(client).attest_bounded_lifecycle(retention_days=30)
+
+
 def test_s3_publish_verifies_digest_promotes_then_cleans_incomplete_key(
     tmp_path: Path,
 ) -> None:
@@ -307,6 +468,50 @@ def test_s3_publish_verifies_digest_promotes_then_cleans_incomplete_key(
     assert client.objects[("evidence", remote_key)]["Body"] == source.read_bytes()
     assert client.objects[("evidence", remote_key)]["ServerSideEncryption"] == "AES256"
     assert [operation for operation, _ in client.calls] == ["put"]
+
+
+def test_s3_delete_resolves_deletes_and_verifies_the_exact_version(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"encoded-browser-evidence")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    client = FakeS3Client()
+    store = _s3_store(client)
+    key = "events/camera-01/evidence.mp4"
+    store.publish(source, key, sha256=digest)
+    remote_key = f"pilot-evidence/{key}"
+    version_id = client.objects[("evidence", remote_key)]["VersionId"]
+
+    store.delete_exact(key, sha256=digest)
+    store.delete_exact(key, sha256=digest)
+
+    assert client.deleted_versions == [
+        ("evidence", remote_key, version_id),
+    ]
+    assert ("evidence", remote_key) not in client.objects
+
+
+def test_s3_exact_delete_rejects_a_different_version_checksum(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"encoded-browser-evidence")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    client = FakeS3Client()
+    store = _s3_store(client)
+    key = "events/camera-01/evidence.mp4"
+    store.publish(source, key, sha256=digest)
+    remote_key = f"pilot-evidence/{key}"
+    client.objects[("evidence", remote_key)]["ChecksumSHA256"] = (
+        base64.b64encode(hashlib.sha256(b"foreign-version").digest()).decode()
+    )
+
+    with pytest.raises(ObjectIntegrityError, match="does not match"):
+        store.delete_exact(key, sha256=digest)
+
+    assert not client.deleted_versions
+    assert ("evidence", remote_key) in client.objects
 
 
 def test_s3_interrupted_upload_is_cleaned_and_retry_is_idempotent(tmp_path: Path) -> None:
@@ -446,6 +651,7 @@ def test_s3_retention_deletes_expired_final_objects_not_incomplete(tmp_path: Pat
         "ChecksumSHA256": "",
         "ServerSideEncryption": "AES256",
         "LastModified": NOW - timedelta(days=2),
+        "VersionId": "legacy-incomplete-version",
     }
     client.objects[("evidence", "unrelated/customer-data.bin")] = {
         "Body": b"must-stay",
@@ -629,6 +835,37 @@ def test_publisher_marks_failed_upload_visible_but_never_ready(tmp_path: Path) -
         row = session.scalar(select(EvidenceModel))
         assert row is not None
         assert row.status == "failed"
+
+
+def test_publisher_rechecks_storage_policy_before_every_remote_write(
+    tmp_path: Path,
+) -> None:
+    repository = _repository()
+    event = _event()
+    repository.add_event(event)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"encoded-browser-evidence")
+    evidence = _evidence(event, clip)
+    client = FakeS3Client()
+    checks = 0
+
+    def drifted_policy() -> None:
+        nonlocal checks
+        checks += 1
+        raise ObjectIntegrityError("evidence lifecycle drifted")
+
+    publisher = EvidencePublisher(
+        store=_s3_store(client),
+        repository=repository,
+        storage_policy_check=drifted_policy,
+    )
+
+    with pytest.raises(ObjectIntegrityError, match="lifecycle drifted"):
+        publisher.publish(clip, evidence)
+
+    assert checks == 1
+    assert client.calls == []
+    assert repository.get_event(event.event_id).evidence_status == "failed"
 
 
 def test_upload_success_and_database_finalization_are_atomic_and_retryable(
@@ -2116,23 +2353,29 @@ def test_production_builder_uses_validated_site_storage_policy_and_injected_cred
             max_evidence_object_bytes=123_456,
             server_side_encryption="AES256",
             kms_key_id=None,
+            retention=SimpleNamespace(evidence_retention_days=30),
         )
     )
+    def journal_processor(_item: object) -> None:
+        return None
 
+    client = FakeS3Client(evidence_prefix="configured-evidence")
     services = build_s3_evidence_delivery(
         site=site,  # type: ignore[arg-type]
-        client=FakeS3Client(),
+        client=client,
         repository=repository,
         journal=journal,
         ring=ring,
         max_nvenc_jobs=1,
         codec_tool=SimpleNamespace(nvenc_available=False),  # type: ignore[arg-type]
         media_probe=SimpleNamespace(),  # type: ignore[arg-type]
+        journal_processor=journal_processor,
     )
 
     assert services.store.evidence_prefix == "configured-evidence"
     assert services.store.max_object_bytes == 123_456
     assert services.coordinator._ring is ring
+    assert services.replay_worker._processor is journal_processor
     assert services.replay_worker.status.depth == 0
 
 

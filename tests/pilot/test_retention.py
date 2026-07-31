@@ -17,6 +17,7 @@ from alembic.config import Config
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
+from protector.pilot import retention as retention_module
 from protector.pilot import retention_service
 from protector.pilot.audit_archive import EncryptedAuditArchiveStore
 from protector.pilot.config import load_site_config
@@ -46,12 +47,14 @@ REPO_ROOT = Path(__file__).parents[2]
 class RecordingStore:
     def __init__(self, *, fail_keys: set[str] | None = None) -> None:
         self.deleted: list[str] = []
+        self.deleted_identities: list[tuple[str, str]] = []
         self.fail_keys = fail_keys or set()
 
-    def delete(self, key: str) -> None:
+    def delete_exact(self, key: str, *, sha256: str) -> None:
         if key in self.fail_keys:
             raise ObjectPublishError("generic retention failure")
         self.deleted.append(key)
+        self.deleted_identities.append((key, sha256))
 
 
 class RecordingAuditArchiveStore:
@@ -75,6 +78,148 @@ class RecordingAuditArchiveStore:
                 f"encrypted_sha256={encrypted_sha256}\n"
                 "signing_key_id=audit-signing-key-1\n"
             ),
+        )
+
+
+class _ClockSession:
+    def __init__(self, *, dialect_name: str, observed: datetime) -> None:
+        self._bind = type(
+            "_Bind",
+            (),
+            {"dialect": type("_Dialect", (), {"name": dialect_name})()},
+        )()
+        self.observed = observed
+        self.statements: list[str] = []
+
+    def get_bind(self) -> object:
+        return self._bind
+
+    def scalar(self, statement: object) -> datetime:
+        self.statements.append(str(statement))
+        return self.observed
+
+
+def test_postgres_retention_uses_server_time_within_bounded_host_skew() -> None:
+    database_now = NOW + timedelta(minutes=4, seconds=59)
+    session = _ClockSession(
+        dialect_name="postgresql",
+        observed=database_now,
+    )
+
+    observed = retention_module._database_bounded_now(
+        session,
+        host_now=NOW,
+        label="retention clock",
+    )
+
+    assert observed == database_now
+    assert session.statements == ["SELECT CURRENT_TIMESTAMP"]
+
+
+def test_postgres_retention_rejects_future_poisoned_host_before_selection() -> None:
+    session = _ClockSession(
+        dialect_name="postgresql",
+        observed=NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="differs from database"):
+        retention_module._database_bounded_now(
+            session,
+            host_now=NOW + timedelta(hours=1),
+            label="retention clock",
+        )
+
+    assert session.statements == ["SELECT CURRENT_TIMESTAMP"]
+
+
+class _FetchOne:
+    def __init__(self, row: tuple[object, ...]) -> None:
+        self._row = row
+
+    def fetchone(self) -> tuple[object, ...]:
+        return self._row
+
+
+class _LeaseConnection:
+    def __init__(self, *rows: tuple[object, ...]) -> None:
+        self.rows = list(rows)
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def execute(
+        self,
+        statement: str,
+        parameters: tuple[object, ...],
+    ) -> _FetchOne:
+        self.calls.append((statement, parameters))
+        return _FetchOne(self.rows.pop(0))
+
+
+def test_retention_lease_is_bound_to_backend_and_exact_advisory_key() -> None:
+    connection = _LeaseConnection(
+        (321, -1),
+        (True,),
+        (321, True),
+    )
+
+    lease = retention_service._acquire_retention_lease(
+        connection,
+        site_id="site-1",
+    )
+    retention_service._require_retention_lease(
+        connection,
+        lease=lease,
+    )
+
+    assert lease.backend_pid == 321
+    assert lease.class_id == 0xFFFFFFFF
+    assert lease.object_id == 0xFFFFFFFF
+    assert "pg_locks" in connection.calls[-1][0]
+    assert connection.calls[-1][1] == (
+        321,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+    )
+
+
+@pytest.mark.parametrize("observed", ((322, True), (321, False)))
+def test_retention_lease_fails_closed_after_restart_or_lock_loss(
+    observed: tuple[object, ...],
+) -> None:
+    connection = _LeaseConnection(
+        (321, 42),
+        (True,),
+        observed,
+    )
+    lease = retention_service._acquire_retention_lease(
+        connection,
+        site_id="site-1",
+    )
+
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        retention_service._require_retention_lease(
+            connection,
+            lease=lease,
+        )
+
+
+@pytest.mark.parametrize(
+    ("archive_prefix", "evidence_prefix"),
+    (
+        ("archive/site-1", "archive/site-1/nested/site-1"),
+        ("evidence/site-1/nested/site-1", "evidence/site-1"),
+        ("same/site-1", "same/site-1"),
+        ("archive/other-site", "evidence/site-1"),
+    ),
+)
+def test_retention_rejects_equal_nested_or_unscoped_storage_prefixes(
+    archive_prefix: str,
+    evidence_prefix: str,
+) -> None:
+    with pytest.raises(RuntimeError, match="separate and site scoped"):
+        retention_service._require_separate_site_scoped_prefixes(
+            archive_prefix=archive_prefix,
+            evidence_prefix=evidence_prefix,
+            site_id="site-1",
         )
 
 
@@ -199,6 +344,10 @@ def test_retention_is_bounded_site_scoped_exact_cutoff_and_idempotent(tmp_path: 
     assert first.deleted == second.deleted == 1
     assert third.scanned == third.deleted == third.failed == 0
     assert set(store.deleted) == {old_one[1], old_two[1]}
+    assert set(store.deleted_identities) == {
+        (old_one[1], "b" * 64),
+        (old_two[1], "b" * 64),
+    }
     assert exact[1] not in store.deleted
     assert foreign[1] not in store.deleted
     with repository.session_factory() as session:
@@ -1785,14 +1934,14 @@ def test_deployment_and_backup_artifacts_are_hardened_and_secret_free() -> None:
         "role-bootstrap",
         "migrate",
         "role-grants",
-            "provision",
-            "api",
-            "acceptance-controller",
-            "notifications",
+        "provision",
+        "api",
         "retention",
         "tls-proxy",
         "prometheus",
     }
+    assert "acceptance-controller" not in parsed["services"]
+    assert "notifications" not in parsed["services"]
     assert all(
         service.get("pids_limit", 0) > 0 for service in parsed["services"].values()
     )
@@ -1884,6 +2033,7 @@ def _resolved_retention_command() -> list[str]:
         "--archive-prefix": "audit/site-1",
         "--site-id": "site-1",
         "--site-config-sha256": "a" * 64,
+        "--object-store-region": "kz-almaty-1",
     }
     resolved: list[str] = []
     for item in compose["services"]["retention"]["command"]:

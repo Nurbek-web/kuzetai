@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import yaml
 from sqlalchemy import select
 
 from protector.pilot.capacity_acceptance import require_measured_primary_capacity
@@ -18,13 +18,25 @@ from protector.pilot.gates import (
     MeasuredCapacityReportV1,
 )
 from protector.pilot.runtime.deepstream import RuntimeModelManifestV1
+from protector.pilot.rules import (
+    VerifiedCameraRulesetRevision,
+    VerifiedModelGateDecision,
+    VerifiedSiteConfigRevision,
+)
 from protector.pilot.storage.db import SessionFactory
 from protector.pilot.storage.models import CameraModel, ModelArtifactModel, SiteModel
+from protector.pilot.storage.repositories import PilotRepository
 from protector.pilot.trusted_artifacts import (
     VerifiedDetachedArtifact,
     read_regular_bounded,
     verify_detached_artifact,
 )
+from protector.pilot.trusted_yaml import StrictYAMLError, load_strict_yaml
+
+_MAX_SITE_CONFIG_YAML_BYTES = 1024 * 1024
+_MAX_REVIEWED_AUTHORITY_YAML_BYTES = 8 * 1024 * 1024
+_MAX_REVIEWED_YAML_NODES = 100_000
+_MAX_REVIEWED_YAML_DEPTH = 96
 
 
 class ProvisioningError(RuntimeError):
@@ -63,6 +75,27 @@ def _artifact_values(manifest: RuntimeModelManifestV1) -> dict[str, object]:
     }
 
 
+def _load_reviewed_mapping(
+    payload: bytes,
+    *,
+    max_bytes: int,
+    label: str,
+) -> dict[str, Any]:
+    """Parse one reviewed provisioning input under finite syntax limits."""
+    try:
+        parsed = load_strict_yaml(
+            payload,
+            max_bytes=max_bytes,
+            max_nodes=_MAX_REVIEWED_YAML_NODES,
+            max_depth=_MAX_REVIEWED_YAML_DEPTH,
+            require_mapping=True,
+        )
+    except StrictYAMLError as exc:
+        raise ValueError(f"{label} YAML is invalid") from exc
+    assert isinstance(parsed, dict)
+    return parsed
+
+
 def load_reviewed_inputs(
     *,
     site_id: str,
@@ -88,12 +121,12 @@ def load_reviewed_inputs(
     try:
         site_payload = read_regular_bounded(
             site_config_path,
-            max_bytes=1024 * 1024,
+            max_bytes=_MAX_SITE_CONFIG_YAML_BYTES,
             label="site configuration",
         )
         runtime_payload = read_regular_bounded(
             runtime_manifest_path,
-            max_bytes=8 * 1024 * 1024,
+            max_bytes=_MAX_REVIEWED_AUTHORITY_YAML_BYTES,
             label="runtime manifest",
         )
         if hashlib.sha256(site_payload).hexdigest() != site_config_sha256:
@@ -109,16 +142,30 @@ def load_reviewed_inputs(
             signature_path=measured_capacity_signature_path,
             trusted_public_key_path=capacity_authority_public_key_path,
             expected_payload_sha256=measured_capacity_sha256,
-            max_payload_bytes=8 * 1024 * 1024,
+            max_payload_bytes=_MAX_REVIEWED_AUTHORITY_YAML_BYTES,
             label="measured capacity report",
         )
-        site_config = SiteConfig.model_validate(yaml.safe_load(site_payload))
-        raw_manifest = yaml.safe_load(runtime_payload)
+        site_config = SiteConfig.model_validate(
+            _load_reviewed_mapping(
+                site_payload,
+                max_bytes=_MAX_SITE_CONFIG_YAML_BYTES,
+                label="site configuration",
+            )
+        )
+        raw_manifest = _load_reviewed_mapping(
+            runtime_payload,
+            max_bytes=_MAX_REVIEWED_AUTHORITY_YAML_BYTES,
+            label="runtime manifest",
+        )
         manifest = RuntimeModelManifestV1.model_validate(raw_manifest)
         capacity_report = MeasuredCapacityReportV1.model_validate(
-            yaml.safe_load(verified_capacity.payload)
+            _load_reviewed_mapping(
+                verified_capacity.payload,
+                max_bytes=_MAX_REVIEWED_AUTHORITY_YAML_BYTES,
+                label="measured capacity report",
+            )
         )
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, ValueError) as exc:
         raise ProvisioningError("runtime manifest is invalid") from exc
     if manifest.site_id != site_id:
         raise ProvisioningError("runtime manifest site does not match provisioning site")
@@ -260,3 +307,22 @@ def provision_reviewed_pilot(
                 raise ProvisioningError(
                     "database model artifact does not match runtime manifest"
                 )
+
+
+def provision_reviewed_configuration_revisions(
+    *,
+    session_factory: SessionFactory,
+    site_revision: VerifiedSiteConfigRevision,
+    ruleset_revision: VerifiedCameraRulesetRevision,
+    gate_decisions: tuple[VerifiedModelGateDecision, ...],
+) -> None:
+    """Add signed site/rule revisions; activation remains a separate audited step."""
+
+    try:
+        PilotRepository(session_factory).provision_reviewed_configuration(
+            site_revision=site_revision,
+            ruleset_revision=ruleset_revision,
+            gate_decisions=gate_decisions,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProvisioningError(str(exc)) from exc

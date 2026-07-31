@@ -20,6 +20,7 @@ from protector.pilot.domain import (
     GateMode,
     NormalisedBoundingBox,
     ObservationV1,
+    ProvenancedCandidateEventV2,
 )
 from protector.pilot.storage.journal import (
     JournalFullError,
@@ -378,6 +379,7 @@ class EventEngine:
         zone_rules: tuple[ZoneRule, ...] = (),
         line_rules: tuple[LineRule, ...] = (),
         limits: EngineLimits | None = None,
+        initial_evidence_status: Literal["unavailable", "pending"] = "unavailable",
     ) -> None:
         self.module_rules = module_rules
         self.zone_rules = zone_rules
@@ -385,7 +387,12 @@ class EventEngine:
         rule_ids = [rule.rule_id for rule in (*module_rules, *zone_rules, *line_rules)]
         if len(rule_ids) != len(set(rule_ids)):
             raise ValueError("event rule IDs must be unique")
+        if initial_evidence_status not in ("unavailable", "pending"):
+            raise ValueError(
+                "initial evidence status must be unavailable or pending"
+            )
         self.limits = limits or EngineLimits()
+        self._initial_evidence_status = initial_evidence_status
         self._seen_ids: OrderedDict[UUID, datetime] = OrderedDict()
         self._seen_dedupe: OrderedDict[str, datetime] = OrderedDict()
         self._active_epochs: dict[str, UUID] = {}
@@ -417,6 +424,10 @@ class EventEngine:
                 pending_events=len(self._pending),
                 ordering_streams=len(self._last_samples),
             )
+
+    @property
+    def initial_evidence_status(self) -> Literal["unavailable", "pending"]:
+        return self._initial_evidence_status
 
     def ingest(self, observation: ObservationV1) -> EngineIngestResult:
         with self._lock:
@@ -810,7 +821,7 @@ class EventEngine:
             reason=aggregate.rule.reason,
             model_artifact_id=aggregate.model_artifact_id,
             gate_mode=aggregate.rule.gate_mode,
-            evidence_status="unavailable",
+            evidence_status=self._initial_evidence_status,
             review_status="candidate",
         )
         self._cooldowns[key] = aggregate.last_seen_at + timedelta(
@@ -1099,6 +1110,9 @@ class SiteEventService:
         mark_evidence_pending: Callable[[UUID], CandidateEventV1],
         mark_evidence_failed: Callable[[UUID], CandidateEventV1],
         evidence_policy: EvidencePolicy,
+        candidate_envelope_factory: (
+            Callable[[CandidateTrigger], ProvenancedCandidateEventV2] | None
+        ) = None,
         pending_recovery_backoff_seconds: float = 1.0,
         monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
@@ -1118,6 +1132,11 @@ class SiteEventService:
         self._mark_evidence_pending = mark_evidence_pending
         self._mark_evidence_failed = mark_evidence_failed
         self._evidence_policy = evidence_policy
+        if candidate_envelope_factory is not None and not callable(
+            candidate_envelope_factory
+        ):
+            raise TypeError("candidate envelope factory must be callable")
+        self._candidate_envelope_factory = candidate_envelope_factory
         self._reasons: OrderedDict[str, None] = OrderedDict()
         self._state_lock = threading.RLock()
         self._journal_lock = threading.Lock()
@@ -1155,17 +1174,11 @@ class SiteEventService:
             quarantine_depth = -1
         if pending_quarantine_depth > 0:
             self._degrade("pending_evidence_recovery_quarantined")
-        with self._state_lock:
-            reasons = list(self._reasons)
-        if replay_degraded and "journal_replay_degraded" not in reasons:
-            reasons.append("journal_replay_degraded")
         try:
             depth = int(self._journal.depth())
         except Exception:
             depth = -1
             self._degrade("journal_depth_failed")
-            with self._state_lock:
-                reasons = list(self._reasons)
         with self._state_lock:
             processing_claims = len(self._processing)
             pending_evidence_memory_work = len(self._pending_work)
@@ -1180,6 +1193,10 @@ class SiteEventService:
         except Exception:
             pending_evidence_work = -1
             self._degrade("pending_evidence_depth_failed")
+        with self._state_lock:
+            reasons = list(self._reasons)
+        if replay_degraded and "journal_replay_degraded" not in reasons:
+            reasons.append("journal_replay_degraded")
         next_retry = (
             None
             if retry_at is None
@@ -1254,7 +1271,7 @@ class SiteEventService:
                 seed = None
                 seed_persisted = False
                 self._degrade("pending_evidence_seed_invalid")
-            if not self._journal_candidate(original_trigger.event):
+            if not self._journal_candidate(original_trigger):
                 if seed_persisted:
                     self._schedule_pending_evidence_recovery()
                 if claim == "claimed":
@@ -1525,13 +1542,25 @@ class SiteEventService:
             return replace(work.trigger, event=candidate)
         raise RuntimeError("stream epoch changed before evidence became durable")
 
-    def _journal_candidate(self, event: CandidateEventV1) -> bool:
+    def _journal_candidate(self, trigger: CandidateTrigger) -> bool:
         """Durably retain one-shot candidate metadata before evidence admission."""
         try:
             # Serialisation bounds actual journal writers without retaining a
             # per-caller queue or holding the service state lock across I/O.
             with self._journal_lock:
-                self._journal.enqueue_event(event)
+                if self._candidate_envelope_factory is None:
+                    self._journal.enqueue_event(trigger.event)
+                else:
+                    envelope = self._candidate_envelope_factory(trigger)
+                    if type(envelope) is not ProvenancedCandidateEventV2:
+                        raise TypeError(
+                            "candidate envelope factory returned an invalid contract"
+                        )
+                    if envelope.event != trigger.event:
+                        raise ValueError(
+                            "candidate envelope changed the engine event"
+                        )
+                    self._journal.enqueue_provenanced_event(envelope)
             return True
         except JournalFullError:
             self._degrade("candidate_journal_full")
@@ -1717,7 +1746,7 @@ class SiteEventService:
                     except _RetryablePendingEvidenceError as exc:
                         if not isinstance(exc.__cause__, KeyError):
                             raise
-                        if not self._journal_candidate(seed.trigger.event):
+                        if not self._journal_candidate(seed.trigger):
                             raise
                         try:
                             self._run_candidate_safe_replay(startup=False)
@@ -1770,7 +1799,10 @@ class SiteEventService:
                             reservation_id=seed.reservation_id,
                         )
                         continue
-                    if candidate.evidence_status != "unavailable":
+                    if candidate.evidence_status not in (
+                        "unavailable",
+                        "pending",
+                    ):
                         raise ValueError(
                             "pending evidence seed candidate state is inconsistent"
                         )

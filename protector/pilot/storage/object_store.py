@@ -37,6 +37,15 @@ from protector.pilot.storage.repositories import EvidenceInput, EvidenceIntent, 
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EvidenceIdentity = EvidenceInput | EvidenceIntent
+_EXACT_LIFECYCLE_RULE_KEYS = frozenset(
+    {
+        "ID",
+        "Status",
+        "Filter",
+        "Expiration",
+        "NoncurrentVersionExpiration",
+    }
+)
 
 
 class ObjectPublishError(RuntimeError):
@@ -80,6 +89,107 @@ def _validate_digest(digest: str) -> str:
     if not _SHA256_PATTERN.fullmatch(digest):
         raise ValueError("sha256 must be 64 lowercase hexadecimal characters")
     return digest
+
+
+def _lifecycle_rule_prefix(rule: dict[str, Any]) -> str | None:
+    """Return a provable prefix, or None for a global/ambiguous filter."""
+
+    filter_value = rule.get("Filter")
+    if isinstance(filter_value, dict):
+        prefix = filter_value.get("Prefix")
+        if isinstance(prefix, str):
+            return prefix
+        and_value = filter_value.get("And")
+        if isinstance(and_value, dict) and isinstance(
+            and_value.get("Prefix"),
+            str,
+        ):
+            return and_value["Prefix"]
+        return None
+    legacy_prefix = rule.get("Prefix")
+    return legacy_prefix if isinstance(legacy_prefix, str) else None
+
+
+def _has_exact_bounded_lifecycle(
+    lifecycle: dict[str, Any],
+    *,
+    expected_prefix: str,
+    expiration_days: int,
+    noncurrent_days: int,
+) -> bool:
+    rules = lifecycle.get("Rules")
+    if not isinstance(rules, (list, tuple)):
+        return False
+    exact_index: int | None = None
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict) or rule.get("Status") != "Enabled":
+            continue
+        filter_value = rule.get("Filter")
+        expiration = rule.get("Expiration")
+        noncurrent = rule.get("NoncurrentVersionExpiration")
+        exact = (
+            set(rule).issubset(_EXACT_LIFECYCLE_RULE_KEYS)
+            and isinstance(filter_value, dict)
+            and set(filter_value) == {"Prefix"}
+            and filter_value.get("Prefix") == expected_prefix
+            and isinstance(expiration, dict)
+            and set(expiration) == {"Days"}
+            and type(expiration.get("Days")) is int
+            and expiration["Days"] == expiration_days
+            and isinstance(noncurrent, dict)
+            and set(noncurrent) == {"NoncurrentDays"}
+            and type(noncurrent.get("NoncurrentDays")) is int
+            and noncurrent["NoncurrentDays"] == noncurrent_days
+            and (
+                "ID" not in rule
+                or (
+                    isinstance(rule["ID"], str)
+                    and 1 <= len(rule["ID"]) <= 255
+                )
+            )
+        )
+        if exact:
+            if exact_index is not None:
+                return False
+            exact_index = index
+    if exact_index is None:
+        return False
+    for index, rule in enumerate(rules):
+        if (
+            index == exact_index
+            or not isinstance(rule, dict)
+            or rule.get("Status") != "Enabled"
+        ):
+            continue
+        prefix = _lifecycle_rule_prefix(rule)
+        overlaps = (
+            prefix is None
+            or expected_prefix.startswith(prefix)
+            or prefix.startswith(expected_prefix)
+        )
+        if not overlaps:
+            continue
+        if not set(rule).issubset(
+            _EXACT_LIFECYCLE_RULE_KEYS | {"Prefix"}
+        ):
+            return False
+        expiration = rule.get("Expiration")
+        if expiration is not None and (
+            not isinstance(expiration, dict)
+            or set(expiration) != {"Days"}
+            or type(expiration.get("Days")) is not int
+            or expiration["Days"] < expiration_days
+        ):
+            return False
+        noncurrent = rule.get("NoncurrentVersionExpiration")
+        if noncurrent is not None and (
+            not isinstance(noncurrent, dict)
+            or set(noncurrent) != {"NoncurrentDays"}
+            or type(noncurrent.get("NoncurrentDays")) is not int
+            or noncurrent["NoncurrentDays"] < noncurrent_days
+        ):
+            return False
+    return True
 
 
 def _sha256_file(path: Path) -> str:
@@ -172,6 +282,8 @@ class EvidenceObjectStore(Protocol):
 
     def delete(self, key: str) -> None: ...
 
+    def delete_exact(self, key: str, *, sha256: str) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class EncryptedVolumeAttestation:
@@ -242,6 +354,48 @@ class S3CompatibleObjectStore:
         self.server_side_encryption = server_side_encryption
         self.kms_key_id = kms_key_id
 
+    def attest_bounded_lifecycle(self, *, retention_days: int) -> None:
+        """Require exact current and noncurrent cleanup for versioned evidence."""
+
+        if (
+            not isinstance(retention_days, int)
+            or isinstance(retention_days, bool)
+            or not 1 <= retention_days <= 365
+        ):
+            raise ValueError("evidence retention must be between 1 and 365 days")
+        try:
+            versioning = self._client.get_bucket_versioning(
+                Bucket=self.bucket,
+            )
+            lifecycle = self._client.get_bucket_lifecycle_configuration(
+                Bucket=self.bucket,
+            )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise ObjectPublishError(
+                "evidence lifecycle policy could not be verified"
+            ) from exc
+        if (
+            not isinstance(versioning, dict)
+            or versioning.get("Status") != "Enabled"
+            or not isinstance(lifecycle, dict)
+        ):
+            raise ObjectIntegrityError(
+                "evidence storage versioning is not enabled"
+            )
+        expected_prefix = f"{self.evidence_prefix}/"
+        if _has_exact_bounded_lifecycle(
+            lifecycle,
+            expected_prefix=expected_prefix,
+            expiration_days=retention_days,
+            noncurrent_days=1,
+        ):
+            return
+        raise ObjectIntegrityError(
+            "evidence prefix lacks an exact bounded version lifecycle policy"
+        )
+
     def publish(
         self,
         source: EvidenceSource,
@@ -305,15 +459,140 @@ class S3CompatibleObjectStore:
         return self._validated_object(key, sha256, size_bytes, head)
 
     def delete(self, key: str) -> None:
+        remote_key = self._remote_key(validate_object_key(key))
+        self._delete_exact_remote(
+            remote_key,
+            error_message="S3 evidence delete failed",
+        )
+
+    def delete_exact(self, key: str, *, sha256: str) -> None:
+        """Delete only the unique bounded version matching the DB checksum."""
+
+        key = validate_object_key(key)
+        sha256 = _validate_digest(sha256)
+        remote_key = self._remote_key(key)
         try:
-            self._client.delete_object(
+            response = self._client.list_object_versions(
                 Bucket=self.bucket,
-                Key=self._remote_key(validate_object_key(key)),
+                Prefix=remote_key,
+                MaxKeys=100,
             )
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
-            raise ObjectPublishError("S3 evidence delete failed") from exc
+            raise ObjectPublishError(
+                "S3 evidence version identity could not be resolved"
+            ) from exc
+        if (
+            not isinstance(response, dict)
+            or response.get("IsTruncated") is not False
+            or not isinstance(response.get("Versions", ()), (list, tuple))
+        ):
+            raise ObjectIntegrityError(
+                "S3 evidence version listing exceeded its finite bound"
+            )
+        exact_versions = [
+            item
+            for item in response.get("Versions", ())
+            if isinstance(item, dict) and item.get("Key") == remote_key
+        ]
+        matching: list[str] = []
+        for item in exact_versions:
+            version_id = item.get("VersionId")
+            if (
+                not isinstance(version_id, str)
+                or not version_id
+                or len(version_id) > 1024
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in version_id
+                )
+            ):
+                raise ObjectIntegrityError(
+                    "S3 evidence version identity is invalid"
+                )
+            head = self._head(remote_key, version_id=version_id)
+            if head is None:
+                continue
+            size = head.get("ContentLength")
+            if (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or not 0 < size <= self.max_object_bytes
+            ):
+                raise ObjectIntegrityError(
+                    "S3 evidence version size is outside the configured bound"
+                )
+            try:
+                self._validated_object(key, sha256, size, head)
+            except ObjectIntegrityError:
+                continue
+            matching.append(version_id)
+        if not matching:
+            if exact_versions:
+                raise ObjectIntegrityError(
+                    "S3 evidence versions do not match the database checksum"
+                )
+            return
+        if len(matching) != 1:
+            raise ObjectIntegrityError(
+                "S3 evidence checksum resolves to multiple object versions"
+            )
+        self._delete_version(
+            remote_key,
+            version_id=matching[0],
+            error_message="S3 evidence exact version delete failed",
+        )
+
+    def _delete_exact_remote(
+        self,
+        remote_key: str,
+        *,
+        error_message: str,
+    ) -> None:
+        head = self._head(remote_key)
+        if head is None:
+            return
+        version_id = head.get("VersionId")
+        if (
+            not isinstance(version_id, str)
+            or not version_id
+            or len(version_id) > 1024
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in version_id
+            )
+        ):
+            raise ObjectIntegrityError(
+                "S3 evidence version identity is unavailable"
+            )
+        self._delete_version(
+            remote_key,
+            version_id=version_id,
+            error_message=error_message,
+        )
+
+    def _delete_version(
+        self,
+        remote_key: str,
+        *,
+        version_id: str,
+        error_message: str,
+    ) -> None:
+        try:
+            self._client.delete_object(
+                Bucket=self.bucket,
+                Key=remote_key,
+                VersionId=version_id,
+            )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise ObjectPublishError(error_message) from exc
+        if self._head(remote_key, version_id=version_id) is not None:
+            raise ObjectPublishError(
+                "S3 evidence exact version remained after deletion"
+            )
 
     def delete_older_than(self, cutoff: datetime) -> tuple[str, ...]:
         cutoff = _require_aware_utc(cutoff)
@@ -358,19 +637,30 @@ class S3CompatibleObjectStore:
                 raise ObjectPublishError("truncated S3 listing omitted continuation token")
         return tuple(sorted(deleted))
 
-    def _head(self, key: str) -> dict[str, Any] | None:
+    def _head(
+        self,
+        key: str,
+        *,
+        version_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        arguments: dict[str, Any] = {
+            "Bucket": self.bucket,
+            "Key": key,
+            "ChecksumMode": "ENABLED",
+        }
+        if version_id is not None:
+            arguments["VersionId"] = version_id
         try:
-            return self._client.head_object(
-                Bucket=self.bucket,
-                Key=key,
-                ChecksumMode="ENABLED",
-            )
+            result = self._client.head_object(**arguments)
         except BaseException as exc:
             if isinstance(exc, KeyError) or self._is_not_found(exc):
                 return None
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             raise ObjectPublishError("S3 object metadata lookup failed") from exc
+        if not isinstance(result, dict):
+            raise ObjectIntegrityError("S3 object metadata response is invalid")
+        return result
 
     @staticmethod
     def _is_not_found(exc: BaseException) -> bool:
@@ -379,7 +669,7 @@ class S3CompatibleObjectStore:
             return False
         error = response.get("Error", {})
         code = str(error.get("Code", ""))
-        return code in {"404", "NoSuchKey", "NotFound"}
+        return code in {"404", "NoSuchKey", "NoSuchVersion", "NotFound"}
 
     @staticmethod
     def _is_precondition_failed(exc: BaseException) -> bool:
@@ -412,12 +702,10 @@ class S3CompatibleObjectStore:
         return f"{self.evidence_prefix}/{key}"
 
     def _delete_remote(self, remote_key: str) -> None:
-        try:
-            self._client.delete_object(Bucket=self.bucket, Key=remote_key)
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
-            raise ObjectPublishError("S3 evidence retention delete failed") from exc
+        self._delete_exact_remote(
+            remote_key,
+            error_message="S3 evidence retention delete failed",
+        )
 
 
 class EncryptedLocalObjectStore:
@@ -622,6 +910,40 @@ class EncryptedLocalObjectStore:
             if parent_descriptor >= 0:
                 os.close(parent_descriptor)
 
+    def delete_exact(self, key: str, *, sha256: str) -> None:
+        key = validate_object_key(key)
+        sha256 = _validate_digest(sha256)
+        parent_descriptor = -1
+        try:
+            parent_descriptor, final_name = self._open_parent(
+                key,
+                create=False,
+            )
+            payload = self._read_existing(
+                parent_descriptor,
+                final_name,
+                max_bytes=self.max_object_bytes,
+            )
+            if payload is None:
+                return
+            if hashlib.sha256(payload).hexdigest() != sha256:
+                raise ObjectIntegrityError(
+                    "local evidence object does not match the database checksum"
+                )
+            os.unlink(final_name, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+        except FileNotFoundError:
+            return
+        except ObjectPublishError:
+            raise
+        except OSError as exc:
+            raise ObjectPublishError(
+                "local exact evidence delete failed"
+            ) from exc
+        finally:
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+
     def delete_older_than(self, cutoff: datetime) -> tuple[str, ...]:
         cutoff = _require_aware_utc(cutoff)
         deleted: list[str] = []
@@ -721,10 +1043,16 @@ class EvidencePublisher:
         store: EvidenceObjectStore,
         repository: PilotRepository,
         journal: SQLiteWALJournal | None = None,
+        storage_policy_check: Callable[[], None] | None = None,
     ) -> None:
+        if storage_policy_check is not None and not callable(
+            storage_policy_check
+        ):
+            raise TypeError("storage policy check must be callable")
         self._store = store
         self._repository = repository
         self._journal = journal
+        self._storage_policy_check = storage_policy_check
 
     def publish(
         self,
@@ -734,6 +1062,8 @@ class EvidencePublisher:
         if evidence.status not in ("pending", "failed"):
             raise ValueError("evidence publication must begin from pending or failed")
         try:
+            if self._storage_policy_check is not None:
+                self._storage_policy_check()
             stored = self._store.publish(source, evidence.object_key, sha256=evidence.sha256)
         except ObjectPublishError as primary:
             self._raise_after_failed_transition(primary, evidence)
@@ -766,6 +1096,8 @@ class EvidencePublisher:
         *,
         size_bytes: int,
     ) -> StoredObject | None:
+        if self._storage_policy_check is not None:
+            self._storage_policy_check()
         return self._store.verify(
             evidence.object_key,
             sha256=evidence.sha256,
@@ -2155,6 +2487,7 @@ def build_s3_evidence_delivery(
     preview_ttl: timedelta = timedelta(minutes=5),
     preview_max_items: int = 64,
     preview_max_bytes: int | None = None,
+    journal_processor: Callable[[Any], None] | None = None,
 ) -> EvidenceDeliveryServices:
     """Construct the configured non-secret evidence policy around injected credentials."""
     storage = site.storage
@@ -2168,10 +2501,16 @@ def build_s3_evidence_delivery(
         server_side_encryption=storage.server_side_encryption,
         kms_key_id=storage.kms_key_id,
     )
+    store.attest_bounded_lifecycle(
+        retention_days=storage.retention.evidence_retention_days,
+    )
     publisher = EvidencePublisher(
         store=store,
         repository=repository,
         journal=journal,
+        storage_policy_check=lambda: store.attest_bounded_lifecycle(
+            retention_days=storage.retention.evidence_retention_days,
+        ),
     )
     assembler = ClipAssembler(
         codec_tool or FfmpegCodecTool(),
@@ -2201,7 +2540,11 @@ def build_s3_evidence_delivery(
     )
     replay_worker = EvidenceJournalReplayWorker(
         journal=journal,
-        processor=repository.persist_journal_item,
+        processor=(
+            repository.persist_journal_item
+            if journal_processor is None
+            else journal_processor
+        ),
         batch_size=journal_replay_batch_size,
         retry_backoff_seconds=journal_retry_backoff_seconds,
     )

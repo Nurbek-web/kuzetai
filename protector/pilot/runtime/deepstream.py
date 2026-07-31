@@ -49,7 +49,11 @@ from protector.pilot.runtime.evidence import (
     SplitMuxEvidenceSinkFactory,
 )
 from protector.pilot.runtime.source_probe import CorrelatedNtpV1, SourceProbeLease
-from protector.pilot.runtime.supervisor import CameraHealth, CameraSupervisor
+from protector.pilot.runtime.supervisor import (
+    CameraHealth,
+    CameraSupervisor,
+    EventDrainBatch,
+)
 from protector.pilot.telemetry import (
     AsyncRuntimeTelemetryPublisher,
     AuthenticatedTelemetryClient,
@@ -58,6 +62,7 @@ from protector.pilot.telemetry import (
     read_machine_token,
 )
 from protector.pilot.trusted_artifacts import verify_detached_artifact
+from protector.pilot.trusted_yaml import StrictYAMLError, load_strict_yaml
 
 DEEPSTREAM_IMAGE = (
     "nvcr.io/nvidia/deepstream:9.1-samples-multiarch"
@@ -68,10 +73,16 @@ DEEPSTREAM_X86_CUDA = "13.2"
 GPU_MEMORY_TYPE = "nvbuf-mem-cuda-device"
 PYDS_REPLACEMENT_ISSUE = "PILOT-DS-001: replace isolated pyds probe with Service Maker API"
 NVTRACKER_CONFIG_PATH = Path("/app/deploy/pilot/deepstream/nvtracker.yml")
+_GST_NULL_STATE_TIMEOUT_SECONDS = 10
 _OBJECT_SEQUENCE_BITS = 16
 _MAX_OBJECTS_PER_FRAME = 1 << _OBJECT_SEQUENCE_BITS
 _MAX_METADATA_OWNER_ENTRIES = 4_096
 _AMBIGUOUS_METADATA_OWNER = object()
+_MAX_NVTRACKER_YAML_BYTES = 128 * 1024
+_MAX_TARGET_SITE_YAML_BYTES = 1024 * 1024
+_MAX_TARGET_AUTHORITY_YAML_BYTES = 8 * 1024 * 1024
+_MAX_TARGET_YAML_NODES = 100_000
+_MAX_TARGET_YAML_DEPTH = 96
 _NVTRACKER_PROPERTIES = (
     "tracker-width",
     "tracker-height",
@@ -453,7 +464,12 @@ class MetadataPublisher:
         self._supervisor = supervisor
         self._model_artifact_id = model_artifact_id
 
-    def publish(self, metadata: FrameMetadataV1) -> Any:
+    def publish(
+        self,
+        metadata: FrameMetadataV1,
+        *,
+        complete_event_frame: bool = True,
+    ) -> Any:
         return self._supervisor.accept_sample(
             camera_id=metadata.camera_id,
             source_time=metadata.source_time,
@@ -465,6 +481,7 @@ class MetadataPublisher:
             bbox=metadata.bbox,
             track_id=metadata.track_id,
             model_artifact_id=self._model_artifact_id,
+            complete_event_frame=complete_event_frame,
         )
 
     def record_frame(self, *, camera_id: str, source_time: datetime, monotonic_seq: int) -> bool:
@@ -474,6 +491,52 @@ class MetadataPublisher:
             source_time=source_time,
             monotonic_seq=monotonic_seq,
         )
+
+    def publish_frame(
+        self,
+        *,
+        camera_id: str,
+        source_time: datetime,
+        monotonic_seq: int,
+        metadata: tuple[FrameMetadataV1, ...],
+    ) -> tuple[Any, ...] | None:
+        """Publish one complete frame before exposing its event watermark."""
+
+        if (
+            not isinstance(metadata, tuple)
+            or len(metadata) > _MAX_OBJECTS_PER_FRAME
+            or any(
+                type(item) is not FrameMetadataV1
+                or item.camera_id != camera_id
+                or item.source_time != source_time
+                for item in metadata
+            )
+        ):
+            raise GraphContractError("frame metadata batch is invalid")
+        if not self.record_frame(
+            camera_id=camera_id,
+            source_time=source_time,
+            monotonic_seq=monotonic_seq,
+        ):
+            return None
+        published = tuple(
+            observation
+            for item in metadata
+            if (
+                observation := self.publish(
+                    item,
+                    complete_event_frame=False,
+                )
+            )
+            is not None
+        )
+        if not self._supervisor.complete_frame(
+            camera_id=camera_id,
+            source_time=source_time,
+            monotonic_seq=monotonic_seq,
+        ):
+            return None
+        return published
 
 
 def resolve_rtsp_locations(site: SiteConfig) -> dict[str, str]:
@@ -630,11 +693,19 @@ def metadata_observation_sequence(frame_number: int, object_ordinal: int) -> int
 def configure_nvtracker(tracker: Any, config_path: Path) -> None:
     """Apply DS 9.1 Gst-nvtracker properties from the shared NvDCF YAML."""
     try:
-        import yaml
-
-        raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        with config_path.open("rb") as config_file:
+            payload = config_file.read(_MAX_NVTRACKER_YAML_BYTES + 1)
+        raw_config = load_strict_yaml(
+            payload,
+            max_bytes=_MAX_NVTRACKER_YAML_BYTES,
+            max_nodes=2_000,
+            max_depth=16,
+            require_mapping=True,
+        )
         settings = raw_config["tracker"]
         values = {name: settings[name] for name in _NVTRACKER_PROPERTIES}
+    except StrictYAMLError as exc:
+        raise GraphContractError("invalid NvDCF tracker configuration") from exc
     except (KeyError, OSError, TypeError, ValueError) as exc:
         raise GraphContractError("invalid NvDCF tracker configuration") from exc
     for name, value in values.items():
@@ -724,8 +795,44 @@ class SourceRecoveryCoordinator:
 
 
 def stop_pipeline(pipeline: Any, gst: Any) -> None:
-    """Use the class-level NULL enum, never a state enum instance from a pipeline."""
-    pipeline.set_state(gst.State.NULL)
+    """Reach Gst NULL synchronously or verify one bounded async transition."""
+
+    state_change_return = getattr(gst, "StateChangeReturn", None)
+    success = getattr(state_change_return, "SUCCESS", None)
+    failure = getattr(state_change_return, "FAILURE", None)
+    asynchronous = getattr(state_change_return, "ASYNC", None)
+    if (
+        state_change_return is None
+        or success is None
+        or failure is None
+        or asynchronous is None
+    ):
+        raise RuntimeError("Gst NULL transition authority is unavailable")
+    result = pipeline.set_state(gst.State.NULL)
+    if result == failure:
+        raise RuntimeError("DeepStream pipeline failed to enter Gst NULL")
+    if result == success:
+        return
+    if result != asynchronous:
+        raise RuntimeError("DeepStream pipeline Gst NULL transition is unverified")
+    second = getattr(gst, "SECOND", None)
+    get_state = getattr(pipeline, "get_state", None)
+    if type(second) is not int or second < 1 or not callable(get_state):
+        raise RuntimeError(
+            "DeepStream pipeline async Gst NULL transition is unverified"
+        )
+    try:
+        completed, current, _pending = get_state(
+            _GST_NULL_STATE_TIMEOUT_SECONDS * second
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "DeepStream pipeline async Gst NULL transition is unverified"
+        ) from exc
+    if completed != success or current != gst.State.NULL:
+        raise RuntimeError(
+            "DeepStream pipeline did not complete its Gst NULL transition"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -758,6 +865,19 @@ class NativeProbeLeaseFactory(Protocol):
     """Issue one authoritative primitive-only lease for a source generation."""
 
     def acquire(self, camera_id: str, source_id: int) -> SourceProbeLease: ...
+
+
+class AcceptanceWorkCompletion(Protocol):
+    """Record one real post-shared-analytics frame, including zero detections."""
+
+    def __call__(
+        self,
+        *,
+        camera_id: str,
+        source_index: int,
+        module: Literal["person"],
+        detection_count: int,
+    ) -> object: ...
 
 
 class _TransactionalSourceProbeLease:
@@ -963,8 +1083,14 @@ class DeepStreamDataPlane:
         runtime_session_seed_factory: Callable[[], UUID | str] = uuid4,
         telemetry_publisher_factory: Callable[[str], RuntimeTelemetrySink] | None = None,
         native_probe_lease_factory: NativeProbeLeaseFactory | None = None,
+        acceptance_work_completion: AcceptanceWorkCompletion | None = None,
+        analytics_publication_gate: Callable[[], bool] | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
+        if acceptance_work_completion is not None and analytics_publication_gate is None:
+            raise GraphContractError(
+                "acceptance work accounting requires an explicit publication gate"
+            )
         self._manifest = runtime_manifest
         self._runtime_info = runtime_info
         self._binding_loader = binding_loader
@@ -973,11 +1099,14 @@ class DeepStreamDataPlane:
         self._runtime_session_seed_factory = runtime_session_seed_factory
         self._telemetry_publisher_factory = telemetry_publisher_factory
         self._native_probe_lease_factory = native_probe_lease_factory
+        self._acceptance_work_completion = acceptance_work_completion
+        self._analytics_publication_gate = analytics_publication_gate or (lambda: True)
         self._monotonic_ns = monotonic_ns
         self._telemetry_publisher: RuntimeTelemetrySink | None = None
         self._graph: DeepStreamGraphSpec | None = None
         self._pipeline: Any | None = None
         self._supervisor: CameraSupervisor | None = None
+        self._draining_supervisor: CameraSupervisor | None = None
         self._bindings: _NvidiaBindings | None = None
         self._recovery: SourceRecoveryCoordinator | None = None
         self._locations: dict[str, str] = {}
@@ -1004,7 +1133,10 @@ class DeepStreamDataPlane:
         ] = OrderedDict()
 
     def start(self, site: SiteConfig) -> None:
-        if self._pipeline is not None:
+        if (
+            self._pipeline is not None
+            or self._draining_supervisor is not None
+        ):
             raise RuntimeError("DeepStream data plane is already running")
         self._retry_pending_evidence_disable()
         graph = DeepStreamGraphSpec.from_site(site)
@@ -1084,8 +1216,19 @@ class DeepStreamDataPlane:
                 )
             self._supervisor.recover(camera_id)
 
-    def stop(self) -> None:
+    def stop(self, *, preserve_observations: bool = False) -> None:
+        if type(preserve_observations) is not bool:
+            raise TypeError("preserve_observations must be a boolean")
         cleanup_error: BaseException | None = None
+        supervisor = self._supervisor
+        if self._pipeline is not None:
+            if self._bindings is None:
+                raise RuntimeError(
+                    "DeepStream pipeline Gst NULL authority is unavailable"
+                )
+            # Do not release telemetry, source leases, evidence writers, or
+            # graph references until the target pipeline is verifiably inert.
+            stop_pipeline(self._pipeline, self._bindings.gst)
 
         def cleanup(action: Callable[[], None]) -> None:
             nonlocal cleanup_error
@@ -1116,16 +1259,19 @@ class DeepStreamDataPlane:
             )
         if self._telemetry_publisher is not None:
             cleanup(self._telemetry_publisher.close)
-        if self._pipeline is not None and self._bindings is not None:
-            cleanup(lambda: stop_pipeline(self._pipeline, self._bindings.gst))
         for generation in generations:
             cleanup(lambda generation=generation: self._discard_generation_source_block(generation))
         if self._graph is not None and hasattr(self._evidence_sink_factory, "disable"):
             for source in self._graph.sources:
                 self._queue_evidence_disable(source.camera_id)
         cleanup(self._retry_pending_evidence_disable)
-        if self._supervisor is not None:
-            cleanup(self._supervisor.clear_observations)
+        if supervisor is not None and not preserve_observations:
+            cleanup(supervisor.clear_observations)
+        if (
+            not preserve_observations
+            and self._draining_supervisor is not None
+        ):
+            cleanup(self._draining_supervisor.clear_observations)
         for generation in (
             *self._staged_source_generations.values(),
             *self._retired_source_generations.values(),
@@ -1167,6 +1313,10 @@ class DeepStreamDataPlane:
         with self._metadata_owner_lock:
             self._metadata_owners.clear()
         self._supervisor = None
+        if preserve_observations and supervisor is not None:
+            self._draining_supervisor = supervisor
+        elif not preserve_observations:
+            self._draining_supervisor = None
         if cleanup_error is not None:
             raise cleanup_error
 
@@ -1193,9 +1343,49 @@ class DeepStreamDataPlane:
         """Count failed control-plane publications without leaking provider details."""
         return self._telemetry_failures
 
-    def drain_observations(self) -> list[Any]:
+    def drain_observations(
+        self,
+        *,
+        max_items: int | None = None,
+    ) -> list[Any]:
         """Deliver bounded metadata observations; decoded GPU surfaces never leave the graph."""
-        return [] if self._supervisor is None else self._supervisor.drain_observations()
+        supervisor = self._supervisor or self._draining_supervisor
+        return (
+            []
+            if supervisor is None
+            else supervisor.drain_observations(max_items=max_items)
+        )
+
+    def drain_event_batch(self, *, max_items: int) -> Any:
+        """Atomically deliver metadata and its non-overtaking frame cursors."""
+
+        supervisor = self._supervisor or self._draining_supervisor
+        if supervisor is None:
+            return EventDrainBatch(
+                observations=(),
+                cursors=(),
+                settled_observation_sequences=(),
+            )
+        return supervisor.drain_event_batch(max_items=max_items)
+
+    def event_cursors(self) -> tuple[Any, ...]:
+        """Expose one bounded per-camera cursor to the off-callback event worker."""
+
+        supervisor = self._supervisor or self._draining_supervisor
+        return () if supervisor is None else supervisor.event_cursors()
+
+    def finish_observation_drain(self) -> None:
+        """Release a detached supervisor only after its worker has stopped."""
+
+        if self._pipeline is not None or self._supervisor is not None:
+            raise RuntimeError(
+                "observation drain cannot finish while the graph is active"
+            )
+        supervisor = self._draining_supervisor
+        if supervisor is None:
+            return
+        supervisor.clear_observations()
+        self._draining_supervisor = None
 
     def _advance_recovery(self) -> bool:
         if self._recovery is not None:
@@ -2198,20 +2388,9 @@ class DeepStreamDataPlane:
                 stream_epoch=stream_epoch,
             ):
                 return
-            if not self._metadata_publisher.record_frame(
-                camera_id=camera_id,
-                source_time=source_time,
-                monotonic_seq=frame_number,
-            ):
-                if self._recovery is not None:
-                    self._recovery.handle_camera_failure(
-                        camera_id,
-                        "invalid_frame_heartbeat",
-                        force=True,
-                    )
-                return
             object_node = frame_meta.obj_meta_list
             object_ordinal = 0
+            accepted_metadata: list[FrameMetadataV1] = []
             while object_node is not None:
                 try:
                     object_meta = pyds.NvDsObjectMeta.cast(object_node.data)
@@ -2239,7 +2418,7 @@ class DeepStreamDataPlane:
                     )
                     if not (left < right and top < bottom):
                         raise ValueError("invalid normalised bbox")
-                    self._metadata_publisher.publish(
+                    accepted_metadata.append(
                         FrameMetadataV1(
                             camera_id=camera_id,
                             source_time=source_time,
@@ -2265,6 +2444,37 @@ class DeepStreamDataPlane:
                     self._invalid_metadata_count += 1
                 object_ordinal += 1
                 object_node = self._next_metadata_node(object_node)
+            if self._acceptance_work_completion is not None:
+                try:
+                    self._acceptance_work_completion(
+                        camera_id=camera_id,
+                        source_index=source_id,
+                        module="person",
+                        detection_count=len(accepted_metadata),
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    self._invalid_metadata_count += 1
+                    return
+            try:
+                publication_enabled = self._analytics_publication_gate()
+            except BaseException:
+                publication_enabled = False
+            published = self._metadata_publisher.publish_frame(
+                camera_id=camera_id,
+                source_time=source_time,
+                monotonic_seq=frame_number,
+                metadata=(
+                    tuple(accepted_metadata)
+                    if publication_enabled is True
+                    else ()
+                ),
+            )
+            if published is None and self._recovery is not None:
+                self._recovery.handle_camera_failure(
+                    camera_id,
+                    "invalid_frame_heartbeat",
+                    force=True,
+                )
 
     def _authorize_generation(
         self,
@@ -2953,8 +3163,36 @@ def _run_main_loop_with_graceful_signals(
     return 1 if runtime.failed_reason is not None else 0
 
 
+def _load_target_reviewed_mapping(
+    payload: bytes,
+    *,
+    max_bytes: int,
+    label: str,
+) -> Mapping[str, Any]:
+    """Parse one digest-bound target input without ambiguous YAML features."""
+    try:
+        parsed = load_strict_yaml(
+            payload,
+            max_bytes=max_bytes,
+            max_nodes=_MAX_TARGET_YAML_NODES,
+            max_depth=_MAX_TARGET_YAML_DEPTH,
+            require_mapping=True,
+        )
+    except StrictYAMLError as exc:
+        raise GraphContractError(f"{label} YAML is invalid") from exc
+    assert isinstance(parsed, Mapping)
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run only with signed target inputs; bare image invocation exits non-zero."""
+    # Imported only after this module's graph contracts are initialized.  The
+    # acceptance work planner imports those contracts and must not form a
+    # module-initialization cycle through the child runtime composition.
+    from protector.pilot.runtime.acceptance_runtime import (
+        TargetAcceptanceRuntimeV3,
+    )
+
     parser = argparse.ArgumentParser(description="Run the Kuzet shared DeepStream data plane")
     parser.add_argument("--site-config", type=Path, required=True)
     parser.add_argument("--site-config-sha256", required=True)
@@ -2971,10 +3209,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-launch-nonce", required=True)
     parser.add_argument("--control-plane-url", required=True)
     parser.add_argument("--machine-token-file", type=Path, required=True)
+    parser.add_argument("--acceptance-channel", type=Path, required=True)
+    parser.add_argument("--acceptance-source-secrets-root", type=Path, required=True)
+    parser.add_argument("--acceptance-native-projection", type=Path, required=True)
+    parser.add_argument("--acceptance-work-projection", type=Path, required=True)
     arguments = parser.parse_args(argv)
+    acceptance_runtime: TargetAcceptanceRuntimeV3 | None = None
+    runtime: DeepStreamDataPlane | None = None
     try:
-        import yaml
-
         if re.fullmatch(r"[a-f0-9]{32}", arguments.runtime_launch_nonce) is None:
             raise ValueError("runtime launch nonce is invalid")
         site_payload = _read_reviewed_file(
@@ -2995,10 +3237,26 @@ def main(argv: list[str] | None = None) -> int:
             max_payload_bytes=8 * 1024 * 1024,
             label="measured capacity report",
         )
-        site = SiteConfig.model_validate(yaml.safe_load(site_payload))
-        runtime_manifest = RuntimeModelManifestV1.model_validate(yaml.safe_load(runtime_payload))
+        site = SiteConfig.model_validate(
+            _load_target_reviewed_mapping(
+                site_payload,
+                max_bytes=_MAX_TARGET_SITE_YAML_BYTES,
+                label="site configuration",
+            )
+        )
+        runtime_manifest = RuntimeModelManifestV1.model_validate(
+            _load_target_reviewed_mapping(
+                runtime_payload,
+                max_bytes=_MAX_TARGET_AUTHORITY_YAML_BYTES,
+                label="runtime manifest",
+            )
+        )
         measured_capacity = MeasuredCapacityReportV1.model_validate(
-            yaml.safe_load(verified_capacity.payload)
+            _load_target_reviewed_mapping(
+                verified_capacity.payload,
+                max_bytes=_MAX_TARGET_AUTHORITY_YAML_BYTES,
+                label="measured capacity report",
+            )
         )
         require_measured_primary_capacity(
             site_config=site,
@@ -3014,6 +3272,14 @@ def main(argv: list[str] | None = None) -> int:
             base_url=arguments.control_plane_url,
             machine_token=read_machine_token(arguments.machine_token_file),
         )
+        acceptance_runtime = TargetAcceptanceRuntimeV3(
+            channel_path=arguments.acceptance_channel,
+            native_source_secrets_root=(
+                arguments.acceptance_source_secrets_root
+            ),
+            native_projection_path=arguments.acceptance_native_projection,
+            work_projection_path=arguments.acceptance_work_projection,
+        )
         runtime = DeepStreamDataPlane(
             runtime_manifest=runtime_manifest,
             runtime_info=_target_runtime_info,
@@ -3028,6 +3294,13 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             ),
             runtime_session_seed_factory=lambda: f"{arguments.runtime_launch_nonce}.{uuid4().hex}",
+            native_probe_lease_factory=(
+                acceptance_runtime.native_source_authority
+            ),
+            acceptance_work_completion=acceptance_runtime.work_completion,
+            analytics_publication_gate=(
+                acceptance_runtime.analytics_publication_enabled
+            ),
         )
         runtime.start(site)
     except (
@@ -3037,11 +3310,52 @@ def main(argv: list[str] | None = None) -> int:
         subprocess.CalledProcessError,
         ValueError,
     ) as exc:
+        failures: list[BaseException] = [exc]
+        if runtime is not None:
+            try:
+                runtime.stop()
+            except BaseException as cleanup:
+                failures.append(cleanup)
+        if acceptance_runtime is not None:
+            try:
+                acceptance_runtime.close()
+            except BaseException as cleanup:
+                failures.append(cleanup)
+        if len(failures) > 1:
+            raise BaseExceptionGroup(
+                "DeepStream startup and acceptance cleanup both failed",
+                failures,
+            ) from exc
         parser.error(str(exc))
+    assert runtime is not None
+    assert acceptance_runtime is not None
     assert runtime._bindings is not None
-    loop = runtime._bindings.glib.MainLoop()
-    runtime._fatal_callback = loop.quit
-    return _run_main_loop_with_graceful_signals(runtime, loop)
+    try:
+        loop = runtime._bindings.glib.MainLoop()
+        runtime._fatal_callback = loop.quit
+        acceptance_runtime.start(runtime._bindings.glib, fatal_callback=loop.quit)
+        result = _run_main_loop_with_graceful_signals(runtime, loop)
+        if acceptance_runtime.failed is not None:
+            result = 1
+    except BaseException as primary:
+        failures = [primary]
+        try:
+            runtime.stop()
+        except BaseException as cleanup:
+            failures.append(cleanup)
+        try:
+            acceptance_runtime.close()
+        except BaseException as cleanup:
+            failures.append(cleanup)
+        if len(failures) == 1:
+            raise
+        raise BaseExceptionGroup(
+            "DeepStream execution and acceptance cleanup both failed",
+            failures,
+        ) from primary
+    else:
+        acceptance_runtime.close()
+        return result
 
 
 if __name__ == "__main__":  # pragma: no cover - target process entrypoint.
