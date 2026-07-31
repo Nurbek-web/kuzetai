@@ -1,8 +1,9 @@
 # Controlled-pilot operator runbook
 
-Status: **PENDING target acceptance**. This runbook is for a controlled pilot,
-not production-ready. The deployment must remain fail-closed until
-the Ready-to-Start and target acceptance records are complete.
+Status: **PENDING implementation review and target acceptance**. This runbook
+is for a controlled pilot, not production-ready. The deployment must remain
+fail-closed until the Ready-to-Start and target acceptance records are
+complete.
 
 ## Safety boundary
 
@@ -44,8 +45,11 @@ audit journal or evidence. See [incident response](incident_response.md).
    Delivery does not replace the confirmation audit record.
 4. If evidence is unavailable, keep the event in **evidence pending** or reject
    it according to site policy. Never confirm solely from a model score.
-5. Export an evidence package only through the audited export flow. Record its
-   digest, recipient, lawful purpose, and expiry.
+5. This package does not provide a general evidence-export workflow. Use the
+   customer NVR/customer-controlled procedure unless a separately reviewed,
+   audited bounded export is installed. For any approved export, record its
+   digest, recipient, lawful purpose, approval, and expiry; never export
+   continuous raw video from Kuzet storage.
 
 ## Degraded states
 
@@ -81,11 +85,50 @@ Never silently redirect an accepted camera ID to a new RTSP source.
 
 ## Operator drill and escalation
 
-Before handover, every named operator must demonstrate confirmed, rejected,
-source-outage, evidence-pending, and notification-failure scenarios. Record the
-trainer, operator, time, outcome, and remediation. Site security remains
-responsible for real-world escalation under customer policy; technical support
-handles runtime health and evidence integrity.
+Before handover, every named operator must complete every drill below on the
+reviewed training site. Use synthetic candidate identities and bounded
+evidence; never stage an actual emergency or send an unapproved notification.
+The required source-outage, evidence-pending, and notification-failure
+scenarios are recorded as separate drill receipts.
+
+| Drill | Required action and evidence | Pass condition |
+|---|---|---|
+| confirmed candidate | Compare source time/camera/evidence with the customer NVR, confirm once, and inspect review/audit/outbox state. | One attributed review; at most one eligible outbox row; no autonomous action. |
+| rejected candidate | Reject with a bounded reason and retry the same idempotency key. | One attributed rejection; no notification eligibility. |
+| source outage and return | Disconnect one reviewed replay/source, observe degraded state, restore it, and retain the other 19 camera states. | No cross-camera state change; recovery time is measured, not assumed. |
+| evidence pending/failure | Hold or fail bounded evidence publication and attempt review. | Operator does not confirm from model confidence alone; failure remains visible and audited. |
+| notification failure | Use a confirmed synthetic candidate with the connector failure fixture. | Durable failed/dead-letter evidence and the approved human fallback; no fabricated delivery. |
+| storage-policy drift | Suspend versioning/lifecycle or deny a conditional-create probe in the isolated storage test fixture. | Runtime/retention fails closed; no overwrite or broad delete occurs. |
+| role-membership drift | Add a forbidden test membership only in the disposable PostgreSQL drill and rerun role bootstrap/probes. | Drift is detected; service identity cannot `SET ROLE`; the disposable role is restored before teardown. |
+| retention backlog | Use the signed batch-plus-one retention fixture from the deployment runbook. | Per-cycle evidence is new, signed, and non-overwriting; evidence/audit/registered-preview classes stay within bounds. Orphan and aggregate verdicts remain blocked until the bounded orphan-version instrumentation exists. |
+
+For each drill record the campaign/configuration digest, trainer, named
+operator, UTC start/end, synthetic fixture digest, expected and observed
+result, audit IDs, remediation, and trainer/operator signatures. Site security
+remains responsible for real-world escalation under customer policy;
+technical support handles runtime health and evidence integrity.
+
+## Per-shift checks
+
+At shift start and after any deployment or policy change:
+
+1. Match source commit, rendered Compose digest, active configuration digest,
+   migration revision, model/engine hashes, and image digests to the handover
+   manifest.
+2. Confirm the exact database login identity and the archived zero-membership/
+   non-ownership probe for `kuzet_api`, `kuzet_runtime`, and
+   `kuzet_retention`.
+3. Confirm object versioning remains enabled, exact lifecycle mappings match
+   the reviewed digests, and the conditional-create policy plus positive and
+   negative S3 probes are current.
+4. Inspect evidence, preview, and audit-retention arrival versus drain,
+   backlog depth, and oldest eligible age. Inspect orphan-version evidence as
+   a separate class and the signed audit/cycle receipt-root quota and campaign
+   forecast. A missing measurement, increasing backlog, failed batch, forecast
+   breach, orphan instrumentation blocker, or policy drift is a degraded state
+   and blocks activation.
+5. Confirm only approved overlays and egress networks are present. Telegram
+   remains absent unless both customer and network approvals are signed.
 
 ## Support roster
 

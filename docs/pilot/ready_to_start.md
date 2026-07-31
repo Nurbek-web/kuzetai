@@ -1,8 +1,10 @@
 # Kuzet AI controlled-pilot Ready-to-Start gate
 
-Status: **PENDING — NOT READY**. Missing any mandatory checkbox keeps the pilot
-fail-closed. This record does not claim that an L4 or any 20-camera workload has
-passed.
+Status: **PENDING EXTERNAL NVIDIA/SITE EXECUTION — NOT READY**. Missing any
+mandatory checkbox keeps the pilot fail-closed. This record does not claim
+that an L4 or any 20-camera workload has passed. The retained-runtime
+continuation contract is implemented and reviewed locally; the exact commands
+below are target execution contracts, not evidence that either gate ran.
 
 ## Mandatory signed inputs
 
@@ -59,8 +61,12 @@ export PILOT_ACCEPTANCE_ADAPTER_PATH=/opt/kuzet/bin/acceptance-adapter
 export PILOT_ACCEPTANCE_ADAPTER_SHA256=REPLACE_WITH_REVIEWED_64_HEX
 export PILOT_ACCEPTANCE_ADAPTER_POLICY_PATH=/opt/kuzet/reviewed/acceptance-adapter-policy.json
 export PILOT_ACCEPTANCE_ADAPTER_POLICY_SHA256=REPLACE_WITH_REVIEWED_64_HEX
-export PILOT_ACCEPTANCE_STATE_PATH=/srv/kuzet/acceptance-authority
+export PILOT_ACCEPTANCE_ROOT=/srv/kuzet/acceptance/8h
+export PILOT_ACCEPTANCE_STATE_PATH=/srv/kuzet/acceptance-authority/8h
 export PILOT_ACCEPTANCE_PROOF_PATH=/srv/kuzet/acceptance-proofs/8h
+export PILOT_ACCEPTANCE_SNAPSHOT_PATH="${PILOT_ACCEPTANCE_ROOT}/snapshot"
+export PILOT_ACCEPTANCE_CHANNEL_PATH="${PILOT_ACCEPTANCE_ROOT}/channel"
+export PILOT_ACCEPTANCE_CAPTURE_PATH="${PILOT_ACCEPTANCE_ROOT}/capture"
 export PILOT_ACCEPTANCE_PORT=8765
 ```
 
@@ -69,12 +75,26 @@ Compose sets
 and mounts the SQLite main, WAL, and SHM files individually. The image supplies
 the root-owned, non-writable namespace around those three writable file
 mounts. It separately sets
-`PILOT_ACCEPTANCE_PROOF_DIR=/var/lib/kuzet/acceptance-proofs` and binds the
+`PILOT_ACCEPTANCE_PROOF_DIR=/var/lib/kuzet/acceptance-proof` and binds the
 gate-specific host proof directory named by `PILOT_ACCEPTANCE_PROOF_PATH`.
-Before startup, provision the exact triplet and private proof directory on
-backed-up local storage:
+The snapshot, channel, and capture stores are likewise the exact host
+directories named by `PILOT_ACCEPTANCE_SNAPSHOT_PATH`,
+`PILOT_ACCEPTANCE_CHANNEL_PATH`, and `PILOT_ACCEPTANCE_CAPTURE_PATH`. The
+runner must later pass these same five host paths; it does not instantiate a
+second V3 authority. Before startup, provision the exact triplet and four
+private controller directories on backed-up local storage:
 
 ```bash
+sudo install -d -o root -g root -m 0755 \
+  /srv/kuzet/acceptance \
+  /srv/kuzet/acceptance-authority \
+  /srv/kuzet/acceptance-proofs
+sudo install -d -o 10001 -g 10001 -m 0700 \
+  "${PILOT_ACCEPTANCE_ROOT}" \
+  "${PILOT_ACCEPTANCE_PROOF_PATH}" \
+  "${PILOT_ACCEPTANCE_SNAPSHOT_PATH}" \
+  "${PILOT_ACCEPTANCE_CHANNEL_PATH}" \
+  "${PILOT_ACCEPTANCE_CAPTURE_PATH}"
 sudo install -d -o 10001 -g 10001 -m 0700 \
   "${PILOT_ACCEPTANCE_STATE_PATH}"
 sudo -u '#10001' env JOURNAL_PATH="${PILOT_ACCEPTANCE_STATE_PATH}/authority.sqlite3" \
@@ -94,9 +114,11 @@ sudo install -o 10001 -g 10001 -m 0600 /dev/null \
 sudo chmod 0600 "${PILOT_ACCEPTANCE_STATE_PATH}/authority.sqlite3"
 sudo chown root:root "${PILOT_ACCEPTANCE_STATE_PATH}"
 sudo chmod 0755 "${PILOT_ACCEPTANCE_STATE_PATH}"
-sudo install -d -o root -g root -m 0755 /srv/kuzet/acceptance-proofs
-sudo install -d -o 10001 -g 10001 -m 0700 \
-  "${PILOT_ACCEPTANCE_PROOF_PATH}"
+
+docker compose \
+  -f deploy/pilot/docker-compose.yml \
+  -f deploy/pilot/docker-compose.acceptance.yml \
+  up --detach --wait acceptance-controller
 ```
 
 All three files must be regular, have one hard link, and remain owned by
@@ -116,13 +138,16 @@ namespace, if any triplet member is missing or replaced, or if the persisted
 journal was created in portable mode. This boundary trusts the host/root
 provisioner and container runtime; root, same-UID host code, and injected native
 code are outside its claim.
+Repeat the complete provisioning and controller-start phase with fresh
+gate-specific roots before the 72-hour campaign. Never reuse the 8-hour
+controller journal, proof, snapshot, channel, or capture root.
 
 ### Linux/Docker journal-bind smoke — PENDING external execution
 
-This smoke cannot run on the Apple M2 development host because no Docker CLI or
-daemon is available. Run it on the target Linux host after building/pulling the
-reviewed API image. A pass is required before either endurance gate; do not
-substitute these expected results for measured output.
+This smoke was not run in the current cloud handover environment because no
+Docker CLI or daemon is available. Run it on the target Linux host after
+building/pulling the reviewed API image. A pass is required before either
+endurance gate; do not substitute these expected results for measured output.
 
 ```bash
 set -euo pipefail
@@ -320,9 +345,15 @@ files on approved Kazakhstan-resident storage, then provision a new empty
 private journal before the next acceptance campaign. Never rotate, truncate,
 or copy only the main database during an active or unfinalized gate.
 
-## Target-only 8-hour integration replay
+## Pending V3 8-hour target command
 
-Required host fixtures: the signed 20-source manifest; the pinned offline-root
+This parser-matched raw host command is **PENDING external NVIDIA/site
+execution — NOT RUN**. Run it only after every mandatory input above is signed
+and verified on the reviewed Linux/NVIDIA host. A documented command, parser
+check, fake, or portable replay is not an 8-hour result.
+
+The reviewed command requires these host fixtures: the signed
+20-source manifest; the pinned offline-root
 fingerprint and public key; the signed trust policy; all five role public keys;
 lawful captured corpus or host-readable direct-source secret references; the
 reviewed runtime, site, capacity, and mount-contract artifacts; every frozen
@@ -333,11 +364,62 @@ key; and fresh absolute collector-state and output paths. The commands below
 run on the Linux host, so their input paths are host paths, not container-only
 `/run/...` or `/opt/kuzet/...` paths. Report generation refuses to replace any
 existing JSON, HTML, detached-signature, or verification-metadata target,
-including symlinks; use a new directory or an already-created empty directory
+including symlinks. Use a new directory or an already-created empty directory
 for every run.
 
 ```bash
-export PYTORCH_ENABLE_MPS_FALLBACK=1
+set -euo pipefail
+
+# Run from the repository checkout as the fixed runtime identity. Provision
+# the parent and lawful source secrets out of band before this command.
+test "$(id -u):$(id -g)" = "10001:10001"
+export PILOT_ACCEPTANCE_ROOT=/srv/kuzet/acceptance/8h
+export PILOT_ACCEPTANCE_STATE_PATH=/srv/kuzet/acceptance-authority/8h
+export PILOT_ACCEPTANCE_PROOF_PATH=/srv/kuzet/acceptance-proofs/8h
+export PILOT_ACCEPTANCE_SNAPSHOT_PATH="${PILOT_ACCEPTANCE_ROOT}/snapshot"
+export PILOT_ACCEPTANCE_CHANNEL_PATH="${PILOT_ACCEPTANCE_ROOT}/channel"
+export PILOT_ACCEPTANCE_CAPTURE_PATH="${PILOT_ACCEPTANCE_ROOT}/capture"
+for controller_directory in \
+  "${PILOT_ACCEPTANCE_PROOF_PATH}" \
+  "${PILOT_ACCEPTANCE_SNAPSHOT_PATH}" \
+  "${PILOT_ACCEPTANCE_CHANNEL_PATH}" \
+  "${PILOT_ACCEPTANCE_CAPTURE_PATH}"
+do
+  test "$(
+    stat -c %u:%g:%a "${controller_directory}"
+  )" = "10001:10001:700"
+done
+for journal_file in \
+  "${PILOT_ACCEPTANCE_STATE_PATH}/authority.sqlite3" \
+  "${PILOT_ACCEPTANCE_STATE_PATH}/authority.sqlite3-wal" \
+  "${PILOT_ACCEPTANCE_STATE_PATH}/authority.sqlite3-shm"
+do
+  test "$(
+    stat -c %u:%g:%a:%h "${journal_file}"
+  )" = "10001:10001:600:1"
+done
+export PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_1=REPLACE_WITH_UNIQUE_32_LOWER_HEX
+export PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_2=REPLACE_WITH_UNIQUE_32_LOWER_HEX
+export PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_3=REPLACE_WITH_UNIQUE_32_LOWER_HEX
+test "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_1" != \
+  "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_2"
+test "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_1" != \
+  "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_3"
+test "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_2" != \
+  "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_3"
+
+for directory in \
+  source-secrets native-projection work-projection transition state \
+  adapter-work observer-work
+do
+  install -d -m 0700 "${PILOT_ACCEPTANCE_ROOT}/${directory}"
+  test "$(
+    stat -c %u:%g:%a "${PILOT_ACCEPTANCE_ROOT}/${directory}"
+  )" = "10001:10001:700"
+done
+test ! -e "${PILOT_ACCEPTANCE_ROOT}/state/collector.sqlite3"
+test ! -e "${PILOT_ACCEPTANCE_ROOT}/transition/execution.sqlite3"
+
 uv run python scripts/pilot/replay_20.py \
   --mode target \
   --acceptance-site-id "$PILOT_SITE_ID" \
@@ -385,12 +467,41 @@ uv run python scripts/pilot/replay_20.py \
   --acceptance-observer-policy-sha256 REPLACE_WITH_64_HEX \
   --acceptance-observer-work-root /srv/kuzet/acceptance/8h/observer-work \
   --collector-state /srv/kuzet/acceptance/8h/state/collector.sqlite3 \
+  --acceptance-transition-journal /srv/kuzet/acceptance/8h/transition/execution.sqlite3 \
   --control-plane-url http://127.0.0.1:8765 \
   --machine-token-file /srv/kuzet/secrets/machine_token \
   --acceptance-controller-token-file /srv/kuzet/secrets/acceptance_controller_token \
+  --acceptance-channel-dir "$PILOT_ACCEPTANCE_CHANNEL_PATH" \
+  --acceptance-source-secrets-root /srv/kuzet/acceptance/8h/source-secrets \
+  --acceptance-native-projection-dir /srv/kuzet/acceptance/8h/native-projection \
+  --acceptance-work-projection-dir /srv/kuzet/acceptance/8h/work-projection \
+  --acceptance-source-profile-attestation /srv/kuzet/reviewed/acceptance/source-profile-epoch-1.json \
+  --acceptance-source-profile-signature /srv/kuzet/reviewed/acceptance/source-profile-epoch-1.sig \
+  --acceptance-launch-nonce "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_1" \
+  --acceptance-source-profile-attestation /srv/kuzet/reviewed/acceptance/source-profile-epoch-2.json \
+  --acceptance-source-profile-signature /srv/kuzet/reviewed/acceptance/source-profile-epoch-2.sig \
+  --acceptance-launch-nonce "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_2" \
+  --acceptance-source-profile-attestation /srv/kuzet/reviewed/acceptance/source-profile-epoch-3.json \
+  --acceptance-source-profile-signature /srv/kuzet/reviewed/acceptance/source-profile-epoch-3.sig \
+  --acceptance-launch-nonce "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_3" \
+  --acceptance-first-runtime-epoch 1 \
+  --acceptance-module-gates-sha256 REPLACE_WITH_64_HEX \
+  --controller-image-id-sha256 REPLACE_WITH_64_HEX \
+  --controller-image-config-sha256 REPLACE_WITH_64_HEX \
+  --controller-code-sha256 REPLACE_WITH_64_HEX \
+  --acceptance-run-signing-key /srv/kuzet/secrets/run-role-private.pem \
+  --acceptance-capture-dir "$PILOT_ACCEPTANCE_CAPTURE_PATH" \
+  --acceptance-snapshot-dir "$PILOT_ACCEPTANCE_SNAPSHOT_PATH" \
+  --acceptance-v3-proof-dir "$PILOT_ACCEPTANCE_PROOF_PATH" \
+  --acceptance-v3-state "$PILOT_ACCEPTANCE_STATE_PATH/authority.sqlite3" \
+  --acceptance-operational-limits /srv/kuzet/reviewed/acceptance/operational-limits.json \
+  --acceptance-operational-evidence /srv/kuzet/reviewed/acceptance/operational-evidence.json \
+  --acceptance-repository-boundary /srv/kuzet/reviewed/acceptance/repository-boundary.json \
   --collector-interval-seconds 60 \
+  --stop-grace-seconds 30 \
   --duration-seconds 28800 \
   --out /srv/kuzet/acceptance/8h/run-record.json \
+  --out-v3-result /srv/kuzet/acceptance/8h/v3-result.json \
   --out-attestation /srv/kuzet/acceptance/8h/target-run-attestation.json \
   --out-signature /srv/kuzet/acceptance/8h/target-run-attestation.sig \
   --out-journal-proof /srv/kuzet/acceptance/8h/target-journal-proof.jsonl
@@ -443,52 +554,127 @@ uv run python scripts/pilot/acceptance_report.py verify \
   --public-key /srv/kuzet/reviewed/acceptance/report-role-public.pem
 ```
 
-The replay CLI invokes exactly one existing shared DeepStream entrypoint, with
-no shell interpolation and bounded output/time. Its machine-token collector
-binds `start`, periodic `sample`, all 16 `fault` phase commands, and `finalize`
-to the exact site, manifest, launch attestation, 20 camera IDs, per-camera
-analytic schedule, gate, canonical fault-schedule hash, and random collector
-ID. The final record's `run_id` must equal that nonce, so stale evidence is
-rejected. The authority persists every accepted request before finalization and
-derives final sample and fault evidence from that journal. The CLI refuses an
-early process exit, missing observations or fault acknowledgements, response
-mismatch, unbounded response, forced kill, or non-target final record. Child
-stdout/stderr are discarded; deployment-owned logs remain separately rotated.
-At gate completion the CLI sends `SIGTERM`; the DeepStream entrypoint translates
-it into a main-loop quit, drains/stops the runtime, and must exit with status
-zero before the authority can finalize the record.
-Fresh campaigns require four absent, distinct output paths: run record, V2
-attestation, detached signature, and journal proof. If the runner crashes after
-the controller durably commits a final V2 envelope, restart with the exact same
-collector state and output arguments. The runner authenticates the stored
+The production V3 runner invokes the reviewed shared DeepStream entrypoint
+without shell interpolation and with bounded output/time. Its machine-token
+collector binds `start`, periodic `sample`, all 16 `fault` phase commands, and
+`finalize` to the exact site, manifest, launch attestation, 20 camera IDs,
+per-camera analytic schedule, gate, canonical fault-schedule hash, and random
+collector ID. The final record's `run_id` must equal that collector ID, so
+stale evidence is rejected. The authority persists every accepted request
+before finalization and derives final sample and fault evidence from that
+journal.
+
+The first two profiles retain the reviewed C2 two-epoch lifecycle. At the
+canonical `+40s` restart fault, the continuation coordinator durably records
+the transition, retires the second runtime/channel, and at `+43s` launches the
+third signed profile/nonce/channel/epoch. Only the authenticated external
+collector may acknowledge that transition; the final V3 authority binds the
+acknowledgement, continuation capability, V2 envelope, and restart traces.
+Missing or mismatched transition evidence fails closed.
+
+The CLI refuses an early process exit, missing observations or fault
+acknowledgements, response mismatch, unbounded response, forced kill, or
+non-target final record. Child stdout/stderr are discarded; deployment-owned
+logs remain separately rotated. At gate completion the CLI sends `SIGTERM`;
+the DeepStream entrypoint translates it into a main-loop quit, drains/stops the
+runtime, and must exit with status zero before the authority can finalize the
+record.
+
+Fresh campaigns require five absent, distinct output paths: run record, V3
+result, V2 attestation, detached signature, and journal proof. Runner-owned
+collector state and the transition journal must also be absent, lexically
+distinct, and inode-distinct from the already provisioned packaged-controller
+authority journal. The controller must be healthy before the runner starts,
+and `--acceptance-v3-state` names that exact existing journal; it is not a
+runner-owned output. If the runner crashes after the controller durably commits
+a final V2 envelope, restart with the exact same controller roots, collector
+state, and output arguments. The runner authenticates the stored
 offline-root/policy binding, downloads the sealed proof, exact-compares any
 already-published output, and completes publication without relaunching the
 runtime. A partial campaign without a committed final remains fail-closed and
-requires explicit operator invalidation; never edit the SQLite journal to force
-a retry. The dedicated controller exposes `/api/internal/acceptance/start`,
-`/sample`, `/fault/prepare`, `/fault/ack`, `/finalize`, and the sealed `/proof`
-stream only at the canonical host-loopback origin. A portable Apple run uses
-`--mode portable`, is marked `test_only`, and cannot satisfy this gate.
+requires explicit operator invalidation; never edit either SQLite journal to
+force a retry.
+
+The dedicated controller exposes `/api/internal/acceptance/start`, `/sample`,
+`/fault/prepare`, `/fault/ack`, `/finalize`, and the sealed `/proof` stream
+only at the canonical host-loopback origin; final V3 authority uses
+`/api/internal/acceptance/v3/collectors/{collector_id}/finalize`. Portable-mode
+output, if separately generated for development, is marked `test_only` and
+cannot satisfy this gate. The command intentionally omits the optional
+`--acceptance-conditional-gate-decision`; fire and weapon remain shadow unless
+separately signed, bound decisions are supplied and verified.
 
 Expected artifacts: the canonical run record; the independently signed
 target-run V2 attestation and its detached run signature; the bounded canonical
-JSONL journal proof and collector journal with their start-time trust binding;
-the report JSON, self-contained
-escaped HTML, detached report signature, and verification metadata; runtime and
-API logs; graph/config/model/engine/container hashes; resource samples;
-fault/recovery traces; and the separate signed fire/weapon matrix.
+JSONL journal proof, collector journal, transition journal, V3 result,
+authority snapshots, capture, and proof with their start-time trust binding;
+the report JSON, self-contained escaped HTML, detached report signature, and
+verification metadata; runtime and API logs;
+graph/config/model/engine/container hashes; resource samples; fault/recovery
+traces; and the separate signed fire/weapon matrix.
 
-8-hour verdict: **PENDING external NVIDIA/20-source execution**.
+8-hour verdict: **PENDING external NVIDIA/20-source execution — NOT RUN**.
 
-## Target-only 72-hour final soak
+## Pending V3 72-hour target command
 
-Use the same frozen inputs, a newly provisioned private controller proof root,
-and new CLI-owned output paths:
+This parser-matched raw host command is **PENDING external NVIDIA/site
+execution — NOT RUN**. Use the same frozen inputs as the 8-hour command, a new
+campaign ID, three new signed source-profile attestations and launch nonces, a
+newly provisioned private controller proof root, and new CLI-owned output
+paths. Do not tune configuration, workload, or models between measurement and
+report generation.
 
 ```bash
+set -euo pipefail
+
+test "$(id -u):$(id -g)" = "10001:10001"
+export PILOT_ACCEPTANCE_ROOT=/srv/kuzet/acceptance/72h
+export PILOT_ACCEPTANCE_STATE_PATH=/srv/kuzet/acceptance-authority/72h
 export PILOT_ACCEPTANCE_PROOF_PATH=/srv/kuzet/acceptance-proofs/72h
-test "$(stat -c %u:%g:%a "${PILOT_ACCEPTANCE_PROOF_PATH}")" = "10001:10001:700"
-export PYTORCH_ENABLE_MPS_FALLBACK=1
+export PILOT_ACCEPTANCE_SNAPSHOT_PATH="${PILOT_ACCEPTANCE_ROOT}/snapshot"
+export PILOT_ACCEPTANCE_CHANNEL_PATH="${PILOT_ACCEPTANCE_ROOT}/channel"
+export PILOT_ACCEPTANCE_CAPTURE_PATH="${PILOT_ACCEPTANCE_ROOT}/capture"
+for controller_directory in \
+  "${PILOT_ACCEPTANCE_PROOF_PATH}" \
+  "${PILOT_ACCEPTANCE_SNAPSHOT_PATH}" \
+  "${PILOT_ACCEPTANCE_CHANNEL_PATH}" \
+  "${PILOT_ACCEPTANCE_CAPTURE_PATH}"
+do
+  test "$(
+    stat -c %u:%g:%a "${controller_directory}"
+  )" = "10001:10001:700"
+done
+for journal_file in \
+  "${PILOT_ACCEPTANCE_STATE_PATH}/authority.sqlite3" \
+  "${PILOT_ACCEPTANCE_STATE_PATH}/authority.sqlite3-wal" \
+  "${PILOT_ACCEPTANCE_STATE_PATH}/authority.sqlite3-shm"
+do
+  test "$(
+    stat -c %u:%g:%a:%h "${journal_file}"
+  )" = "10001:10001:600:1"
+done
+export PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_1=REPLACE_WITH_UNIQUE_32_LOWER_HEX
+export PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_2=REPLACE_WITH_UNIQUE_32_LOWER_HEX
+export PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_3=REPLACE_WITH_UNIQUE_32_LOWER_HEX
+test "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_1" != \
+  "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_2"
+test "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_1" != \
+  "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_3"
+test "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_2" != \
+  "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_3"
+
+for directory in \
+  source-secrets native-projection work-projection transition state \
+  adapter-work observer-work
+do
+  install -d -m 0700 "${PILOT_ACCEPTANCE_ROOT}/${directory}"
+  test "$(
+    stat -c %u:%g:%a "${PILOT_ACCEPTANCE_ROOT}/${directory}"
+  )" = "10001:10001:700"
+done
+test ! -e "${PILOT_ACCEPTANCE_ROOT}/state/collector.sqlite3"
+test ! -e "${PILOT_ACCEPTANCE_ROOT}/transition/execution.sqlite3"
+
 uv run python scripts/pilot/replay_20.py \
   --mode target \
   --acceptance-site-id "$PILOT_SITE_ID" \
@@ -536,12 +722,41 @@ uv run python scripts/pilot/replay_20.py \
   --acceptance-observer-policy-sha256 REPLACE_WITH_64_HEX \
   --acceptance-observer-work-root /srv/kuzet/acceptance/72h/observer-work \
   --collector-state /srv/kuzet/acceptance/72h/state/collector.sqlite3 \
+  --acceptance-transition-journal /srv/kuzet/acceptance/72h/transition/execution.sqlite3 \
   --control-plane-url http://127.0.0.1:8765 \
   --machine-token-file /srv/kuzet/secrets/machine_token \
   --acceptance-controller-token-file /srv/kuzet/secrets/acceptance_controller_token \
+  --acceptance-channel-dir "$PILOT_ACCEPTANCE_CHANNEL_PATH" \
+  --acceptance-source-secrets-root /srv/kuzet/acceptance/72h/source-secrets \
+  --acceptance-native-projection-dir /srv/kuzet/acceptance/72h/native-projection \
+  --acceptance-work-projection-dir /srv/kuzet/acceptance/72h/work-projection \
+  --acceptance-source-profile-attestation /srv/kuzet/reviewed/acceptance/source-profile-epoch-1.json \
+  --acceptance-source-profile-signature /srv/kuzet/reviewed/acceptance/source-profile-epoch-1.sig \
+  --acceptance-launch-nonce "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_1" \
+  --acceptance-source-profile-attestation /srv/kuzet/reviewed/acceptance/source-profile-epoch-2.json \
+  --acceptance-source-profile-signature /srv/kuzet/reviewed/acceptance/source-profile-epoch-2.sig \
+  --acceptance-launch-nonce "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_2" \
+  --acceptance-source-profile-attestation /srv/kuzet/reviewed/acceptance/source-profile-epoch-3.json \
+  --acceptance-source-profile-signature /srv/kuzet/reviewed/acceptance/source-profile-epoch-3.sig \
+  --acceptance-launch-nonce "$PILOT_ACCEPTANCE_LAUNCH_NONCE_EPOCH_3" \
+  --acceptance-first-runtime-epoch 1 \
+  --acceptance-module-gates-sha256 REPLACE_WITH_64_HEX \
+  --controller-image-id-sha256 REPLACE_WITH_64_HEX \
+  --controller-image-config-sha256 REPLACE_WITH_64_HEX \
+  --controller-code-sha256 REPLACE_WITH_64_HEX \
+  --acceptance-run-signing-key /srv/kuzet/secrets/run-role-private.pem \
+  --acceptance-capture-dir "$PILOT_ACCEPTANCE_CAPTURE_PATH" \
+  --acceptance-snapshot-dir "$PILOT_ACCEPTANCE_SNAPSHOT_PATH" \
+  --acceptance-v3-proof-dir "$PILOT_ACCEPTANCE_PROOF_PATH" \
+  --acceptance-v3-state "$PILOT_ACCEPTANCE_STATE_PATH/authority.sqlite3" \
+  --acceptance-operational-limits /srv/kuzet/reviewed/acceptance/operational-limits.json \
+  --acceptance-operational-evidence /srv/kuzet/reviewed/acceptance/operational-evidence.json \
+  --acceptance-repository-boundary /srv/kuzet/reviewed/acceptance/repository-boundary.json \
   --collector-interval-seconds 60 \
+  --stop-grace-seconds 30 \
   --duration-seconds 259200 \
   --out /srv/kuzet/acceptance/72h/run-record.json \
+  --out-v3-result /srv/kuzet/acceptance/72h/v3-result.json \
   --out-attestation /srv/kuzet/acceptance/72h/target-run-attestation.json \
   --out-signature /srv/kuzet/acceptance/72h/target-run-attestation.sig \
   --out-journal-proof /srv/kuzet/acceptance/72h/target-journal-proof.jsonl
@@ -605,6 +820,6 @@ first preview p95 at most 2 s, measured effective throughput with at least 25%
 headroom, and no crash/OOM/unbounded growth/leakage/unaudited review or
 pre-confirmation notification.
 
-72-hour verdict: **PENDING external NVIDIA/20-source execution**. No RTX 4090,
-5090, L4, or other GPU is accepted for 20 streams until this frozen workload is
-measured.
+72-hour verdict: **PENDING external NVIDIA/20-source execution — NOT RUN**. No
+RTX 4090, 5090, L4, or other GPU is accepted for 20 streams until this frozen
+workload is measured.

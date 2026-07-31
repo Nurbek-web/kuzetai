@@ -16,7 +16,9 @@ production Compose service runs one singleton batch per hour and requests the
 maximum 10,000 rows, so it can create at most 24 of these bounded roots per
 day while removing up to 240,000 per-audit primary rows. Evidence retention
 uses its separate 1,000-row batch bound on that same hourly singleton cadence;
-the larger audit batch is never passed to the evidence coordinator.
+registered preview retirement and orphan-version reconciliation each use a
+separate 1,000-row/version bound. The larger audit batch is never passed to an
+evidence or preview coordinator.
 
 This is an explicit growth policy, not a zero-growth claim. Receipt roots are
 irreducible compliance evidence and must be included in database capacity and
@@ -25,3 +27,8 @@ deleting/aggregating roots requires a separately reviewed migration and an
 external archive proof that preserves per-archive verification and repeat
 idempotency. Ordinary API and retention roles cannot update/delete receipts,
 delete staging items, or access the transaction-scoped authorization tables.
+Target acceptance must measure eligible arrival rate, each independent drain
+rate, backlog depth, and oldest eligible age before and after a
+configured-batch-plus-one fixture and over the soak. A finite batch alone is
+not proof of bounded steady state; any growing backlog, drain capacity below
+the measured arrival envelope, or unbounded oldest age blocks the pilot.
